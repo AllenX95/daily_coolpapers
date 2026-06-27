@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Markdown - {{ paper.title }}{% endblock %}
+{% block content %}
+<section class="detail-head">
+  <div>
+    <h1>{{ paper.title }}</h1>
+    <p class="muted">{{ paper.arxiv_id }}</p>
+  </div>
+  <a class="button secondary" href="{{ url_for('paper_detail', paper_id=paper.id) }}">返回详情</a>
+</section>
+<pre class="markdown-preview">{{ markdown }}</pre>
+{% endblock %}

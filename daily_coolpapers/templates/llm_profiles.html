@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}LLM 配置{% endblock %}
+{% block content %}
+<section>
+  <h1>LLM Profile</h1>
+  <form method="post" action="{{ url_for('save_llm_profile') }}" class="profile-form">
+    <div class="form-row">
+      <label>显示名称
+        <input name="name" placeholder="例如：OpenAI 摘要模型" required>
+        <span class="field-help">只用于页面识别，不会发送给模型。</span>
+      </label>
+      <label>Provider
+        <select name="provider">
+          <option value="openai_compatible">OpenAI Compatible</option>
+          <option value="anthropic">Anthropic</option>
+        </select>
+        <span class="field-help">选择接口格式：OpenAI 兼容接口或 Anthropic Messages API。</span>
+      </label>
+      <label>Base URL
+        <input name="base_url" value="https://api.openai.com/v1" required>
+        <span class="field-help">API 根地址。OpenAI 兼容格式通常以 /v1 结尾，Anthropic 通常填 https://api.anthropic.com/v1。</span>
+      </label>
+      <label>Model
+        <input name="model" placeholder="gpt-4.1 / claude-3-7-sonnet-latest" required>
+        <span class="field-help">实际调用的模型名称，必须与服务商支持的名称一致。</span>
+      </label>
+    </div>
+    <div class="form-row">
+      <label>API Key
+        <input name="api_key" type="password" placeholder="保存后本地加密">
+        <span class="field-help">密钥会加密保存；编辑已有 Profile 时留空表示保留原密钥。</span>
+      </label>
+      <label>Temperature
+        <input name="temperature" type="number" step="0.1" value="0.2">
+        <span class="field-help">生成随机性。论文评估建议 0.1-0.3，越低越稳定。</span>
+      </label>
+      <label>Max Output Tokens
+        <input name="max_output_tokens" type="number" value="2000">
+        <span class="field-help">模型最多输出多少 token。全文总结可设置更高。</span>
+      </label>
+      <label>Context Window Tokens
+        <input name="context_window_tokens" type="number" value="128000">
+        <span class="field-help">模型上下文窗口大小，用于全文 Markdown 传入前的长度检查。</span>
+      </label>
+      <label>Timeout Seconds
+        <input name="timeout_seconds" type="number" value="120">
+        <span class="field-help">单次 API 请求超时时间。全文阅读建议更长。</span>
+      </label>
+    </div>
+    <label>Custom Headers
+      <textarea name="custom_headers" rows="3" placeholder='{"Header": "Value"}'>{}</textarea>
+      <span class="field-help">额外 HTTP 请求头，必须是 JSON 对象。普通 OpenAI/Anthropic 调用通常保持 {}。</span>
+    </label>
+    <div class="form-row">
+      <label class="check"><input type="checkbox" name="enabled" value="1" checked> 启用 <span class="field-help inline">停用后不会作为默认模型使用，但已绑定 Prompt 仍会显示。</span></label>
+      <label class="check"><input type="checkbox" name="is_default_abstract" value="1"> 默认摘要模型 <span class="field-help inline">未单独绑定模型的摘要 Prompt 会使用它。</span></label>
+      <label class="check"><input type="checkbox" name="is_default_fulltext" value="1"> 默认全文模型 <span class="field-help inline">未单独绑定模型的全文 Prompt 会使用它。</span></label>
+      <button type="submit">新增 Profile</button>
+    </div>
+  </form>
+</section>
+
+<section class="help-panel">
+  <h2>参数说明</h2>
+  <dl class="definition-list">
+    <dt>Provider</dt>
+    <dd>决定请求格式。OpenAI Compatible 会请求 <code>{base_url}/chat/completions</code>；Anthropic 会请求 <code>{base_url}/messages</code>。</dd>
+    <dt>Base URL</dt>
+    <dd>API 根地址，不包含具体接口路径。示例：<code>https://api.openai.com/v1</code>、<code>https://api.anthropic.com/v1</code>。</dd>
+    <dt>Model</dt>
+    <dd>模型 ID。摘要评估可用成本较低模型，全文阅读建议选择长上下文模型。</dd>
+    <dt>Context Window Tokens</dt>
+    <dd>只用于本地估算，防止整篇 Markdown 超过模型上下文；不会自动分块。</dd>
+    <dt>Prompt 模型绑定</dt>
+    <dd>每个 Prompt 可单独绑定模型。绑定后优先使用绑定模型；未绑定时使用默认摘要模型或默认全文模型。</dd>
+  </dl>
+</section>
+
+<section>
+  <h2>Prompt 模型绑定</h2>
+  <form method="post" action="{{ url_for('save_prompt_model_bindings') }}" class="profile-form">
+    <table>
+      <thead>
+        <tr>
+          <th>Prompt</th>
+          <th>类型</th>
+          <th>默认</th>
+          <th>当前模型</th>
+          <th>选择模型</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for prompt in prompts %}
+          <tr>
+            <td>
+              <strong>{{ prompt.name }}</strong>
+              <div class="muted small">v{{ prompt.version }} · {{ "启用" if prompt.enabled else "停用" }}</div>
+            </td>
+            <td>
+              <span class="badge">{{ "摘要评估" if prompt.type == "abstract_review" else "全文阅读" }}</span>
+            </td>
+            <td>{{ "默认 Prompt" if prompt.is_default else "" }}</td>
+            <td>{{ prompt.llm_profile_name or "使用该类型默认模型" }}</td>
+            <td>
+              <select name="prompt_{{ prompt.id }}_llm_profile_id">
+                <option value="">使用该类型默认模型</option>
+                {% for profile in profiles %}
+                  <option value="{{ profile.id }}" {% if prompt.llm_profile_id == profile.id %}selected{% endif %}>
+                    {{ profile.name }} · {{ profile.model }}{% if not profile.enabled %}（停用）{% endif %}
+                  </option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+        {% else %}
+          <tr>
+            <td colspan="5" class="empty">还没有 Prompt。</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="form-row">
+      <button type="submit">保存 Prompt 模型绑定</button>
+      <a class="button secondary" href="{{ url_for('prompts') }}">编辑 Prompt 内容</a>
+    </div>
+  </form>
+</section>
+
+<section>
+  <h2>已有 Profile</h2>
+  {% for profile in profiles %}
+    <details class="editor-block">
+      <summary>
+        <strong>{{ profile.name }}</strong>
+        <span class="badge">{{ profile.provider }}</span>
+        <span class="muted">{{ profile.model }} · key {{ profile.api_key_masked }}</span>
+      </summary>
+      <form method="post" action="{{ url_for('save_llm_profile') }}" class="profile-form">
+        <input type="hidden" name="id" value="{{ profile.id }}">
+        <div class="form-row">
+          <input name="name" value="{{ profile.name }}" required>
+          <select name="provider">
+            <option value="openai_compatible" {% if profile.provider == "openai_compatible" %}selected{% endif %}>OpenAI Compatible</option>
+            <option value="anthropic" {% if profile.provider == "anthropic" %}selected{% endif %}>Anthropic</option>
+          </select>
+          <input name="base_url" value="{{ profile.base_url }}" required>
+          <input name="model" value="{{ profile.model }}" required>
+        </div>
+        <div class="form-row">
+          <label>API Key
+            <input name="api_key" type="password" placeholder="留空则保留原 API key">
+            <span class="field-help">当前：{{ profile.api_key_masked }}</span>
+          </label>
+          <label>Temperature
+            <input name="temperature" type="number" step="0.1" value="{{ profile.temperature }}">
+            <span class="field-help">建议论文评估使用 0.1-0.3。</span>
+          </label>
+          <label>Max Output Tokens
+            <input name="max_output_tokens" type="number" value="{{ profile.max_output_tokens }}">
+            <span class="field-help">控制最长输出。</span>
+          </label>
+          <label>Context Window Tokens
+            <input name="context_window_tokens" type="number" value="{{ profile.context_window_tokens }}">
+            <span class="field-help">全文分析前用来判断是否超长。</span>
+          </label>
+          <label>Timeout Seconds
+            <input name="timeout_seconds" type="number" value="{{ profile.timeout_seconds }}">
+            <span class="field-help">API 请求超时。</span>
+          </label>
+        </div>
+        <label>Custom Headers
+          <textarea name="custom_headers" rows="3">{{ profile.custom_headers }}</textarea>
+          <span class="field-help">额外 HTTP 请求头，必须是 JSON 对象。</span>
+        </label>
+        <div class="form-row">
+          <label class="check"><input type="checkbox" name="enabled" value="1" {% if profile.enabled %}checked{% endif %}> 启用</label>
+          <label class="check"><input type="checkbox" name="is_default_abstract" value="1" {% if profile.is_default_abstract %}checked{% endif %}> 默认摘要模型</label>
+          <label class="check"><input type="checkbox" name="is_default_fulltext" value="1" {% if profile.is_default_fulltext %}checked{% endif %}> 默认全文模型</label>
+          <button type="submit">保存</button>
+        </div>
+      </form>
+      <form method="post" action="{{ url_for('test_llm_profile', profile_id=profile.id) }}">
+        <button class="secondary" type="submit">测试连接</button>
+      </form>
+    </details>
+  {% else %}
+    <p class="empty">还没有 LLM Profile。请先新增一个模型配置。</p>
+  {% endfor %}
+</section>
+{% endblock %}

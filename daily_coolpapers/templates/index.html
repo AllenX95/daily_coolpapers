@@ -1,0 +1,462 @@
+{% extends "base.html" %}
+{% block title %}论文 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="toolbar">
+  <form method="get" class="filters toolbar-primary">
+    <label class="date-field">单日 <input name="date" value="{{ selected_date or '' }}" placeholder="YYYY-MM-DD / YYYYMMDD"></label>
+    <label class="date-field">开始日期 <input name="date_from" value="{{ date_from or '' }}" placeholder="YYYY-MM-DD / YYYYMMDD"></label>
+    <label class="date-field">结束日期 <input name="date_to" value="{{ date_to or '' }}" placeholder="YYYY-MM-DD / YYYYMMDD"></label>
+    <label class="select-field">类目
+      <select name="category">
+        <option value="">全部</option>
+        {% for category in categories %}
+          <option value="{{ category.category }}" {% if selected_category == category.category %}selected{% endif %}>{{ category.category }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="select-field">关注度
+      <select name="attention">
+        <option value="">全部</option>
+        {% for item in ["must_read", "read", "skim", "ignore"] %}
+          <option value="{{ item }}" {% if attention == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="select-field">排序
+      <select name="sort">
+        <option value="rank" {% if sort == "rank" %}selected{% endif %}>类目排名</option>
+        <option value="rank_desc" {% if sort == "rank_desc" %}selected{% endif %}>Rank 降序</option>
+        <option value="stars_desc" {% if sort in ["stars", "stars_desc"] %}selected{% endif %}>Stars 降序</option>
+        <option value="title" {% if sort == "title" %}selected{% endif %}>标题</option>
+        <option value="updated" {% if sort == "updated" %}selected{% endif %}>更新时间</option>
+      </select>
+    </label>
+    <button type="submit">筛选</button>
+    <a class="button secondary" href="{{ url_for('export_csv', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort) }}">导出 CSV</a>
+  </form>
+  <div class="toolbar-actions">
+    <form method="post" action="{{ url_for('run_crawl') }}">
+      <button type="submit">抓取最新 Metadata</button>
+    </form>
+    <form method="post" action="{{ url_for('run_crawl_catch_up') }}">
+      <button type="submit">补抓到最新</button>
+    </form>
+    <form method="post" action="{{ url_for('run_abstract_evaluations') }}">
+      <button type="submit">评估缺失摘要</button>
+    </form>
+    <form method="post" action="{{ url_for('shutdown') }}" onsubmit="return confirm('结束本地服务并关闭页面？');">
+      <button type="submit" class="danger-button">结束服务并退出</button>
+    </form>
+  </div>
+</section>
+
+<section
+  class="job-progress-panel"
+  id="job-progress-panel"
+  data-progress-url="{{ url_for('jobs_progress') }}"
+  data-had-active="{{ 1 if active_jobs else 0 }}"
+  {% if not progress_jobs %}hidden{% endif %}
+>
+  <div class="progress-panel-head">
+    <div>
+      <strong>任务中心</strong>
+      <div class="muted small">只跟踪当前服务队列中的排队/运行任务；最近失败任务会保留原因。</div>
+    </div>
+    <span class="muted small">每 1.5 秒自动刷新</span>
+  </div>
+  <div id="job-progress-list" class="job-progress-list">
+    {% for job in progress_jobs %}
+      <article class="job-progress-card {{ job.status }}">
+        <div class="job-card-head">
+          <div class="job-title-line">
+            <strong>{{ job_type_label(job.type) }}</strong>
+            <span class="badge {{ job.status }}">{{ job_status_label(job.status) }}</span>
+          </div>
+          <span class="job-id">#{{ job.id }}</span>
+        </div>
+        {% set message = job.error_message if job.status == "failed" and job.error_message else (job.progress_message or job_progress_label(job)) %}
+        <div class="job-message {% if job.status == 'failed' %}danger{% endif %}">{{ message }}</div>
+        {% if job.status == "pending" %}
+          <div class="queued-line"><span></span>等待 worker 接收任务</div>
+        {% else %}
+          <div class="progress-bar" aria-label="任务进度">
+            <div style="width: {{ job.progress_percent }}%"></div>
+          </div>
+        {% endif %}
+        <div class="job-meta-row">
+          <span>{{ job_progress_label(job) }}</span>
+          <span>创建 {{ job.created_at }}</span>
+          {% if job.started_at %}<span>开始 {{ job.started_at }}</span>{% endif %}
+          {% if job.finished_at %}<span>结束 {{ job.finished_at }}</span>{% endif %}
+        </div>
+        {% set details = job.progress_details or {} %}
+        {% if details.phase == "crawl" %}
+          <div class="job-detail-block">
+            <div class="crawl-progress-summary">
+              <span>成功 {{ details.summary.success }}/{{ details.summary.total }}</span>
+              <span>失败 {{ details.summary.failed }}</span>
+              <span>已保存 {{ details.summary.saved }} 篇</span>
+              <span>运行中 {{ details.summary.running }}</span>
+              <span>待处理 {{ details.summary.pending }}</span>
+            </div>
+            <div class="crawl-progress-grid">
+              {% for item in details.categories %}
+                <div class="crawl-progress-item {{ item.status }}">
+                  <div class="crawl-progress-title">
+                    <strong>{{ item.category }}</strong>
+                    <span class="badge {{ item.status }}">{{ job_status_label(item.status) }}</span>
+                  </div>
+                  <div class="small muted">
+                    {% if item.status == "success" %}
+                      {{ item.papers }} 篇 · {{ item.crawl_date }}
+                    {% elif item.status == "running" %}
+                      第 {{ item.attempt }}/{{ item.max_attempts }} 次尝试
+                    {% elif item.status == "failed" %}
+                      {{ item.error|truncate_text(160) }}
+                    {% else %}
+                      等待中
+                    {% endif %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% endif %}
+        {% if details.phase == "catch_up" %}
+          <div class="job-detail-block">
+            <div class="crawl-progress-summary">
+              <span>目标内最新 {{ details.summary.latest_reference_date or "无" }}</span>
+              <span>数据库最大 {{ details.summary.latest_db_date or "无" }}</span>
+              <span>目标最新 {{ details.summary.latest_target_date }}</span>
+              <span>日期 {{ details.summary.completed_dates }}/{{ details.summary.total_dates }}</span>
+              <span>失败 {{ details.summary.failed_dates }}</span>
+              {% if details.summary.current_date %}<span>当前 {{ details.summary.current_date }}</span>{% endif %}
+            </div>
+            <div class="crawl-progress-grid">
+              {% for item in details.dates %}
+                <div class="crawl-progress-item {{ item.status }}">
+                  <div class="crawl-progress-title">
+                    <strong>{{ item.date }}</strong>
+                    <span class="badge {{ item.status }}">{{ job_status_label(item.status) }}</span>
+                  </div>
+                  <div class="small muted">
+                    {% if item.status == "success" %}
+                      已保存 {{ item.saved }} 条类目记录
+                    {% elif item.status == "failed" %}
+                      {{ item.error|truncate_text(160) }}
+                    {% elif item.status == "running" %}
+                      抓取中
+                    {% else %}
+                      等待中
+                    {% endif %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% endif %}
+      </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="status-strip">
+  {% if use_date_range %}
+    <span>当前范围：{{ date_from or "最早" }} 至 {{ date_to or "最新" }}</span>
+  {% else %}
+    <span>当前日期：{{ selected_date or "暂无数据" }}</span>
+  {% endif %}
+  <span>论文行数：{{ papers|length }}</span>
+  {% for job in jobs[:6] %}
+    <span class="job {{ job.status }}">#{{ job.id }} {{ job_type_label(job.type) }} {{ job_status_label(job.status) }}</span>
+  {% endfor %}
+</section>
+
+<section class="table-wrap">
+  <table class="papers-table">
+    <colgroup>
+      <col class="col-category">
+      <col class="col-rank">
+      <col class="col-stars">
+      <col class="col-paper">
+      <col class="col-eval">
+      <col class="col-fulltext">
+      <col class="col-vc">
+      <col class="col-actions">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>类目</th>
+        <th><a class="sort-link" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort='rank_desc') }}">Rank ↓</a></th>
+        <th><a class="sort-link" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort='stars_desc') }}">Stars ↓</a></th>
+        <th>论文</th>
+        <th>摘要评估</th>
+        <th>全文评估</th>
+        <th>VC 视角</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for paper in papers %}
+        {% set abstract_eval = paper.latest_abstract_eval %}
+        {% set fulltext_eval = paper.latest_fulltext_eval %}
+        {% set fulltext_success = paper.latest_successful_fulltext_eval %}
+        <tr>
+          <td class="mono">
+            <div class="category-stack">
+              {% for item in paper.category_memberships %}
+                <span class="category-chip">
+                  {% if use_date_range %}<span class="category-chip-date">{{ item.crawl_date }}</span>{% endif %}
+                  <span>{{ item.category }}</span>
+                  {% if item.rank %}<span class="muted">#{{ item.rank }}</span>{% endif %}
+                  <span class="muted">S{{ item.reading_stars }}</span>
+                </span>
+              {% endfor %}
+            </div>
+          </td>
+          <td>{{ paper.rank }}</td>
+          <td>{{ paper.reading_stars }} <span class="muted">P{{ paper.pdf_clicks }}/K{{ paper.kimi_clicks }}</span></td>
+          <td class="paper-main">
+            <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
+            <div class="muted small">{{ paper.authors_list|join(", ")|truncate_text(160) }}</div>
+            <details>
+              <summary>Abstract</summary>
+              <p>{{ paper.abstract }}</p>
+            </details>
+          </td>
+          <td>
+            <div class="score">{{ latest_score(abstract_eval) }}</div>
+            <div class="badge {{ latest_attention(abstract_eval) }}">{{ latest_attention(abstract_eval) }}</div>
+            {% if abstract_eval and abstract_eval.result %}
+              <p class="small">{{ abstract_eval.result.summary_zh or abstract_eval.result.one_sentence_summary or "" }}</p>
+            {% elif abstract_eval and abstract_eval.status == "failed" %}
+              <p class="small danger">{{ abstract_eval.error_message }}</p>
+            {% endif %}
+          </td>
+          <td class="fulltext-cell">
+            {% if fulltext_success %}
+              <div class="score compact">{{ latest_score(fulltext_success) }}</div>
+              <div class="badge {{ latest_attention(fulltext_success) }}">{{ latest_attention(fulltext_success) }}</div>
+              <p class="small">{{ (fulltext_success.result.one_sentence_summary or fulltext_success.result.detailed_summary_zh or "")|truncate_text(220) }}</p>
+              <a class="small" href="{{ url_for('paper_detail', paper_id=paper.id) }}#fulltext-result">查看全文结果</a>
+              {% if fulltext_eval and fulltext_eval.status == "failed" and fulltext_eval.id != fulltext_success.id %}
+                <p class="small danger">最新任务失败：{{ fulltext_eval.error_message|truncate_text(120) }}</p>
+              {% endif %}
+            {% elif fulltext_eval and fulltext_eval.status == "failed" %}
+              <span class="badge failed">failed</span>
+              <p class="small danger">{{ fulltext_eval.error_message|truncate_text(160) }}</p>
+            {% else %}
+              <span class="muted small">未阅读全文</span>
+            {% endif %}
+          </td>
+          <td class="vc-cell">{{ vc_impact(abstract_eval)|truncate_text(220) }}</td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('evaluate_abstract', paper_id=paper.id) }}">
+              <button type="submit">摘要评估</button>
+            </form>
+            <form method="post" action="{{ url_for('evaluate_fulltext', paper_id=paper.id) }}">
+              <button type="submit">全文阅读</button>
+            </form>
+            <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">PDF</a>
+            {% if paper.abs_url %}
+              <a class="button secondary" href="{{ paper.abs_url }}" target="_blank">arXiv</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr>
+          <td colspan="8" class="empty">暂无论文。点击“抓取最新 Metadata”开始。</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+<script>
+(() => {
+  const panel = document.getElementById("job-progress-panel");
+  const list = document.getElementById("job-progress-list");
+  if (!panel || !list) return;
+  let hadActive = panel.dataset.hadActive === "1";
+
+  function text(tag, className, value) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    node.textContent = value;
+    return node;
+  }
+
+  function statusLabel(status) {
+    return {
+      pending: "排队中",
+      running: "运行中",
+      success: "已完成",
+      failed: "失败",
+    }[status] || status || "未知";
+  }
+
+  function renderJob(job) {
+    const card = document.createElement("article");
+    card.className = `job-progress-card ${job.status || ""}`;
+
+    const head = document.createElement("div");
+    head.className = "job-card-head";
+    const titleLine = document.createElement("div");
+    titleLine.className = "job-title-line";
+    titleLine.appendChild(text("strong", "", job.type_label || job.type || "任务"));
+    titleLine.appendChild(text("span", `badge ${job.status || ""}`, job.status_label || statusLabel(job.status)));
+    head.appendChild(titleLine);
+    head.appendChild(text("span", "job-id", `#${job.id}`));
+
+    const mainMessage = job.status === "failed" && job.error_message
+      ? job.error_message
+      : (job.progress_message || job.progress_label || "任务准备中");
+    const message = text("div", job.status === "failed" ? "job-message danger" : "job-message", mainMessage);
+
+    card.appendChild(head);
+    card.appendChild(message);
+    if (job.status === "pending") {
+      const queued = document.createElement("div");
+      queued.className = "queued-line";
+      queued.appendChild(document.createElement("span"));
+      queued.appendChild(document.createTextNode("等待 worker 接收任务"));
+      card.appendChild(queued);
+    } else {
+      const bar = document.createElement("div");
+      bar.className = "progress-bar";
+      const fill = document.createElement("div");
+      fill.style.width = `${job.progress_percent || 0}%`;
+      bar.appendChild(fill);
+      card.appendChild(bar);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "job-meta-row";
+    meta.appendChild(text("span", "", job.progress_label || `${job.progress_current}/${job.progress_total} · ${job.progress_percent}%`));
+    if (job.created_at) meta.appendChild(text("span", "", `创建 ${job.created_at}`));
+    if (job.started_at) meta.appendChild(text("span", "", `开始 ${job.started_at}`));
+    if (job.finished_at) meta.appendChild(text("span", "", `结束 ${job.finished_at}`));
+    card.appendChild(meta);
+
+    const detailsNode = renderDetails(job);
+    if (detailsNode) card.appendChild(detailsNode);
+    return card;
+  }
+
+  function renderDetails(job) {
+    const details = job.progress_details || {};
+    if (details.phase === "catch_up") return renderCatchUpDetails(details);
+    if (details.phase !== "crawl") return null;
+
+    const wrap = document.createElement("div");
+    wrap.className = "job-detail-block";
+    const summary = details.summary || {};
+    const summaryNode = document.createElement("div");
+    summaryNode.className = "crawl-progress-summary";
+    summaryNode.appendChild(text("span", "", `成功 ${summary.success || 0}/${summary.total || 0}`));
+    summaryNode.appendChild(text("span", "", `失败 ${summary.failed || 0}`));
+    summaryNode.appendChild(text("span", "", `已保存 ${summary.saved || 0} 篇`));
+    summaryNode.appendChild(text("span", "", `运行中 ${summary.running || 0}`));
+    summaryNode.appendChild(text("span", "", `待处理 ${summary.pending || 0}`));
+
+    const grid = document.createElement("div");
+    grid.className = "crawl-progress-grid";
+    for (const item of details.categories || []) {
+      const cell = document.createElement("div");
+      cell.className = `crawl-progress-item ${item.status || "pending"}`;
+
+      const title = document.createElement("div");
+      title.className = "crawl-progress-title";
+      const name = text("strong", "", item.category || "");
+      const badge = text("span", `badge ${item.status || "pending"}`, statusLabel(item.status || "pending"));
+      title.appendChild(name);
+      title.appendChild(badge);
+
+      let line = "等待中";
+      if (item.status === "success") {
+        line = `${item.papers || 0} 篇 · ${item.crawl_date || ""}`;
+      } else if (item.status === "running") {
+        line = `第 ${item.attempt || 0}/${item.max_attempts || 0} 次尝试`;
+      } else if (item.status === "failed") {
+        line = item.error || "抓取失败";
+      }
+      cell.appendChild(title);
+      cell.appendChild(text("div", "small muted", line.length > 160 ? `${line.slice(0, 160)}...` : line));
+      grid.appendChild(cell);
+    }
+
+    wrap.appendChild(summaryNode);
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  function renderCatchUpDetails(details) {
+    const wrap = document.createElement("div");
+    wrap.className = "job-detail-block";
+    const summary = details.summary || {};
+    const summaryNode = document.createElement("div");
+    summaryNode.className = "crawl-progress-summary";
+    summaryNode.appendChild(text("span", "", `目标内最新 ${summary.latest_reference_date || "无"}`));
+    summaryNode.appendChild(text("span", "", `数据库最大 ${summary.latest_db_date || "无"}`));
+    summaryNode.appendChild(text("span", "", `目标最新 ${summary.latest_target_date || ""}`));
+    summaryNode.appendChild(text("span", "", `日期 ${summary.completed_dates || 0}/${summary.total_dates || 0}`));
+    summaryNode.appendChild(text("span", "", `失败 ${summary.failed_dates || 0}`));
+    if (summary.current_date) summaryNode.appendChild(text("span", "", `当前 ${summary.current_date}`));
+
+    const grid = document.createElement("div");
+    grid.className = "crawl-progress-grid";
+    for (const item of details.dates || []) {
+      const cell = document.createElement("div");
+      cell.className = `crawl-progress-item ${item.status || "pending"}`;
+
+      const title = document.createElement("div");
+      title.className = "crawl-progress-title";
+      title.appendChild(text("strong", "", item.date || ""));
+      title.appendChild(text("span", `badge ${item.status || "pending"}`, statusLabel(item.status || "pending")));
+
+      let line = "等待中";
+      if (item.status === "success") {
+        line = `已保存 ${item.saved || 0} 条类目记录`;
+      } else if (item.status === "running") {
+        line = "抓取中";
+      } else if (item.status === "failed") {
+        line = item.error || "metadata 抓取失败";
+      }
+
+      cell.appendChild(title);
+      cell.appendChild(text("div", "small muted", line.length > 160 ? `${line.slice(0, 160)}...` : line));
+      grid.appendChild(cell);
+    }
+
+    wrap.appendChild(summaryNode);
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  async function refreshProgress() {
+    try {
+      const response = await fetch(panel.dataset.progressUrl, { cache: "no-store" });
+      if (!response.ok) return;
+      const data = await response.json();
+      const active = data.jobs.filter((job) => job.status === "pending" || job.status === "running");
+      if (active.length === 0) {
+        panel.hidden = true;
+        if (hadActive) window.location.reload();
+        return;
+      }
+      hadActive = true;
+      panel.hidden = false;
+      list.replaceChildren(...active.map(renderJob));
+    } catch (_error) {
+      // Keep the last visible state if the service is busy.
+    }
+  }
+
+  if (hadActive) {
+    const timer = window.setInterval(async () => {
+      await refreshProgress();
+      if (panel.hidden && !hadActive) window.clearInterval(timer);
+    }, 1500);
+  }
+})();
+</script>
+{% endblock %}

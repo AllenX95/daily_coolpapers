@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>服务正在退出</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script>
+    window.setTimeout(function () {
+      window.open("", "_self");
+      window.close();
+    }, 700);
+  </script>
+</head>
+<body>
+  <main class="shutdown-page">
+    <section class="shutdown-panel">
+      <h1>服务正在退出</h1>
+      <p>本地服务将结束运行，当前页面会尝试自动关闭。</p>
+      <p class="muted">如果浏览器阻止自动关闭，可以手动关闭这个标签页。</p>
+      <button type="button" onclick="window.close()">关闭页面</button>
+    </section>
+  </main>
+</body>
+</html>

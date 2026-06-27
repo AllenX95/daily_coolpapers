@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title }}{% endblock %}
+{% block content %}
+<section class="detail-head">
+  <div>
+    <h1>{{ paper.title }}</h1>
+    <p class="muted">{{ paper.authors_list|join(", ") }}</p>
+    <p class="muted mono">{{ paper.arxiv_id }} · {{ paper.published_at or "" }}</p>
+  </div>
+  <div class="detail-actions">
+    <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">打开 PDF</a>
+    {% if paper.abs_url %}<a class="button secondary" href="{{ paper.abs_url }}" target="_blank">打开 arXiv</a>{% endif %}
+    <a class="button secondary" href="{{ url_for('export_paper_markdown', paper_id=paper.id) }}">导出评估</a>
+  </div>
+</section>
+
+<section class="two-col">
+  <div>
+    <h2>Abstract</h2>
+    <p class="abstract">{{ paper.abstract }}</p>
+    <h2>类目记录</h2>
+    <table>
+      <thead><tr><th>日期</th><th>类目</th><th>Rank</th><th>Stars</th></tr></thead>
+      <tbody>
+        {% for item in categories %}
+          <tr><td>{{ item.crawl_date }}</td><td class="mono">{{ item.category }}</td><td>{{ item.rank }}</td><td>{{ item.reading_stars }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <aside class="side-panel">
+    <h2>操作</h2>
+    <form method="post" action="{{ url_for('evaluate_abstract', paper_id=paper.id) }}">
+      <input type="hidden" name="from_detail" value="1">
+      <label>摘要 Prompt
+        <select name="prompt_id">
+          <option value="">默认</option>
+          {% for prompt in abstract_prompts %}
+            <option value="{{ prompt.id }}">{{ prompt.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">重新摘要评估</button>
+    </form>
+    <form method="post" action="{{ url_for('evaluate_fulltext', paper_id=paper.id) }}">
+      <input type="hidden" name="from_detail" value="1">
+      <label>全文 Prompt
+        <select name="prompt_id">
+          <option value="">默认</option>
+          {% for prompt in fulltext_prompts %}
+            <option value="{{ prompt.id }}">{{ prompt.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" name="force_markdown" value="1"> 重新生成 Markdown</label>
+      <button type="submit">全文阅读</button>
+    </form>
+    <div class="cache-state">
+      <div>PDF 缓存：{{ "存在" if has_pdf else "无" }}</div>
+      <div>Markdown 缓存：{{ "存在" if has_markdown else "无" }}</div>
+      {% if has_markdown %}
+        <a class="button secondary" href="{{ url_for('view_markdown', paper_id=paper.id) }}">查看 Markdown</a>
+      {% endif %}
+    </div>
+  </aside>
+</section>
+
+<section id="fulltext-result" class="result-panel">
+  <h2>全文评估结果</h2>
+  {% set fulltext = latest_successful_fulltext_eval %}
+  {% set last_attempt = latest_fulltext_eval %}
+  {% if fulltext %}
+    {% set result = fulltext.result %}
+    <div class="result-head">
+      <div>
+        <div class="score">{{ latest_score(fulltext) }}</div>
+        <div class="badge {{ latest_attention(fulltext) }}">{{ latest_attention(fulltext) }}</div>
+      </div>
+      <div class="muted small">成功时间：{{ fulltext.created_at }} · {{ fulltext.model or "" }}</div>
+    </div>
+    {% if last_attempt and last_attempt.status == "failed" and last_attempt.id != fulltext.id %}
+      <p class="danger small">最新一次全文任务失败：{{ last_attempt.error_message }}</p>
+    {% endif %}
+    <p class="result-lead">{{ result.one_sentence_summary or "" }}</p>
+    <div class="result-grid">
+      {% if result.detailed_summary_zh %}
+        <section>
+          <h3>详细总结</h3>
+          <p>{{ result.detailed_summary_zh }}</p>
+        </section>
+      {% endif %}
+      {% if result.problem %}
+        <section>
+          <h3>问题</h3>
+          <p>{{ result.problem }}</p>
+        </section>
+      {% endif %}
+      {% if result.method %}
+        <section>
+          <h3>方法</h3>
+          <p>{{ result.method }}</p>
+        </section>
+      {% endif %}
+      {% if result.novelty_assessment %}
+        <section>
+          <h3>新颖性</h3>
+          <p>{{ result.novelty_assessment }}</p>
+        </section>
+      {% endif %}
+      {% if result.recommended_action %}
+        <section>
+          <h3>建议动作</h3>
+          <p>{{ result.recommended_action }}</p>
+        </section>
+      {% endif %}
+      {% set vc = result.vc_perspective %}
+      {% if vc %}
+        <section>
+          <h3>VC 视角</h3>
+          {% if vc.impact %}<p>{{ vc.impact }}</p>{% endif %}
+          {% if vc.market_relevance %}<p class="small muted">Market relevance：{{ vc.market_relevance }}</p>{% endif %}
+          {% if vc.commercialization_path %}<p>{{ vc.commercialization_path }}</p>{% endif %}
+          {% if vc.startup_opportunities %}
+            <h4>创业机会</h4>
+            <ul>
+              {% for item in vc.startup_opportunities %}
+                <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if vc.investment_risks %}
+            <h4>投资风险</h4>
+            <ul>
+              {% for item in vc.investment_risks %}
+                <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </section>
+      {% endif %}
+    </div>
+  {% elif last_attempt and last_attempt.status == "failed" %}
+    <p class="danger">{{ last_attempt.error_message or "全文评估失败" }}</p>
+  {% else %}
+    <p class="empty">还没有成功的全文评估。点击右侧“全文阅读”后会显示在这里。</p>
+  {% endif %}
+</section>
+
+<section id="evaluations">
+  <h2>评估历史</h2>
+  {% for evaluation in evaluations %}
+    <article class="eval-block">
+      <header>
+        <strong>{{ evaluation.evaluation_type }}</strong>
+        <span class="badge {{ evaluation.status }}">{{ evaluation.status }}</span>
+        <span class="muted">{{ evaluation.created_at }} · {{ evaluation.prompt_name or "Prompt 已删除" }} · {{ evaluation.model or "" }}</span>
+      </header>
+      {% if evaluation.result %}
+        <pre>{{ evaluation.result|json_pretty }}</pre>
+      {% else %}
+        <p class="danger">{{ evaluation.error_message or "无结构化结果" }}</p>
+        {% if evaluation.raw_output %}<pre>{{ evaluation.raw_output }}</pre>{% endif %}
+      {% endif %}
+    </article>
+  {% else %}
+    <p class="empty">暂无评估结果。</p>
+  {% endfor %}
+</section>
+{% endblock %}

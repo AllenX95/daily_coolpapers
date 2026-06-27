@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}收藏 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head">
+  <div>
+    <h1>收藏</h1>
+    <p class="muted">已完成全文评估的论文会自动汇总到这里。</p>
+  </div>
+  <form method="get" class="filters">
+    <label class="select-field">排序
+      <select name="sort">
+        <option value="evaluated_desc" {% if sort == "evaluated_desc" %}selected{% endif %}>评估时间</option>
+        <option value="score_desc" {% if sort == "score_desc" %}selected{% endif %}>全文评分</option>
+        <option value="rank" {% if sort == "rank" %}selected{% endif %}>类目排名</option>
+        <option value="title" {% if sort == "title" %}selected{% endif %}>标题</option>
+      </select>
+    </label>
+    <button type="submit">应用</button>
+  </form>
+</section>
+
+<section class="favorite-list" data-testid="fulltext-favorites">
+  {% for paper in papers %}
+    {% set result = paper.fulltext_result or {} %}
+    {% set vc = result.vc_perspective or {} %}
+    {% set latest = paper.latest_category or {} %}
+    {% set score = result.get("score") %}
+    {% set attention = result.get("attention") or "pending" %}
+    {% set market_relevance = vc.get("market_relevance") %}
+    <article class="favorite-item">
+      <header class="favorite-item-head">
+        <div>
+          <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
+          <div class="favorite-meta">
+            <span class="mono">{{ paper.arxiv_id }}</span>
+            {% if latest.category %}
+              <span>{{ latest.category }} / Rank {{ latest.rank or "-" }} / Stars {{ latest.reading_stars or 0 }}</span>
+            {% endif %}
+            <span>{{ paper.fulltext_evaluated_at }}{% if paper.fulltext_model %} / {{ paper.fulltext_model }}{% endif %}</span>
+          </div>
+        </div>
+        <div class="favorite-score">
+          <div class="score compact">{{ score if score is not none else "-" }}</div>
+          <div class="badge {{ attention }}">{{ attention }}</div>
+        </div>
+      </header>
+
+      {% if result.one_sentence_summary %}
+        <p class="result-lead">{{ result.one_sentence_summary }}</p>
+      {% endif %}
+
+      <div class="favorite-content">
+        <section>
+          <h3>全文摘要</h3>
+          <p>{{ (result.detailed_summary_zh or result.problem or paper.abstract)|truncate_text(520) }}</p>
+        </section>
+        <section>
+          <h3>VC 视角</h3>
+          <p>{{ (vc.impact or vc.commercialization_path or "暂无 VC 视角字段")|truncate_text(420) }}</p>
+          {% if market_relevance is not none %}
+            <p class="small muted">Market relevance: {{ market_relevance }}</p>
+          {% endif %}
+        </section>
+        {% if result.recommended_action %}
+          <section>
+            <h3>建议动作</h3>
+            <p>{{ result.recommended_action }}</p>
+          </section>
+        {% endif %}
+        {% if result.novelty_assessment %}
+          <section>
+            <h3>新颖性</h3>
+            <p>{{ result.novelty_assessment|truncate_text(360) }}</p>
+          </section>
+        {% endif %}
+      </div>
+
+      <footer class="favorite-footer">
+        <div class="tag-list">
+          {% for tag in result.tags or [] %}
+            <span>{{ tag }}</span>
+          {% endfor %}
+        </div>
+        <div class="favorite-actions">
+          <a class="button secondary" href="{{ url_for('paper_detail', paper_id=paper.id) }}#fulltext-result">全文结果</a>
+          <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">PDF</a>
+          {% if markdown_cached(paper.arxiv_id) %}
+            <a class="button secondary" href="{{ url_for('view_markdown', paper_id=paper.id) }}">Markdown</a>
+          {% endif %}
+          {% if paper.abs_url %}
+            <a class="button secondary" href="{{ paper.abs_url }}" target="_blank">arXiv</a>
+          {% endif %}
+        </div>
+      </footer>
+    </article>
+  {% else %}
+    <p class="empty">还没有成功完成全文评估的论文。</p>
+  {% endfor %}
+</section>
+{% endblock %}

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}设置{% endblock %}
+{% block content %}
+<section>
+  <h1>缓存与调度设置</h1>
+  <form method="post" action="{{ url_for('save_settings') }}" class="form-grid">
+    <label>PDF 保留天数 <input name="pdf_retention_days" type="number" min="0" value="{{ settings.pdf_retention_days }}"></label>
+    <label>Markdown 保留天数 <input name="markdown_retention_days" type="number" min="0" value="{{ settings.markdown_retention_days }}"></label>
+    <label>摘要评估并发数 <input name="abstract_concurrency" type="number" min="1" max="20" value="{{ settings.abstract_concurrency }}"></label>
+    <label>PDF 下载超时秒数 <input name="pdf_download_timeout_seconds" type="number" min="30" value="{{ settings.pdf_download_timeout_seconds }}"></label>
+    <label>PDF 下载重试次数 <input name="pdf_download_retries" type="number" min="0" max="5" value="{{ settings.pdf_download_retries }}"></label>
+    <label>抓取/PDF 代理 URL <input name="crawler_proxy_url" value="{{ settings.crawler_proxy_url }}" placeholder="http://127.0.0.1:7897"></label>
+    <label>每日调度时间 <input name="scheduler_daily_times" value="{{ settings.scheduler_daily_times }}"></label>
+    <label class="check"><input type="checkbox" name="cleanup_on_start" value="1" {% if settings.cleanup_on_start %}checked{% endif %}> 启动时清理缓存</label>
+    <label class="check"><input type="checkbox" name="cleanup_daily" value="1" {% if settings.cleanup_daily %}checked{% endif %}> 每日清理缓存</label>
+    <label class="check"><input type="checkbox" name="crawler_trust_env_proxy" value="1" {% if settings.crawler_trust_env_proxy %}checked{% endif %}> 抓取和 PDF 下载使用系统代理</label>
+    <label class="check"><input type="checkbox" name="llm_trust_env_proxy" value="1" {% if settings.llm_trust_env_proxy %}checked{% endif %}> LLM API 使用系统代理</label>
+    <label class="check"><input type="checkbox" name="scheduler_enabled" value="1" {% if settings.scheduler_enabled %}checked{% endif %}> 启用每日抓取</label>
+    <button type="submit">保存设置</button>
+  </form>
+  <form method="post" action="{{ url_for('run_cleanup') }}" class="inline-actions">
+    <button type="submit">立即清理缓存</button>
+  </form>
+</section>
+<section>
+  <h2>最近任务</h2>
+  <table>
+    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>创建</th><th>错误</th></tr></thead>
+    <tbody>
+      {% for job in jobs %}
+        <tr><td>#{{ job.id }}</td><td>{{ job.type }}</td><td>{{ job.status }}</td><td>{{ job.created_at }}</td><td>{{ job.error_message or "" }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

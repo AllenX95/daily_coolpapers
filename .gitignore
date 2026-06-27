@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local data and runtime files
+data/
+instance/
+cache/
+logs/
+tmp/
+.agents/
+
+# Secrets and credentials
+.env
+.env.*
+*.key
+secrets/
+credentials/

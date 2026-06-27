@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}日志{% endblock %}
+{% block content %}
+<section class="detail-head">
+  <div>
+    <h1>当前运行日志</h1>
+    <p class="muted">服务启动时会清空上次日志。</p>
+  </div>
+  <a class="button secondary" href="{{ url_for('current_log') }}" target="_blank">打开纯文本</a>
+</section>
+<pre class="log-view">{{ log_text }}</pre>
+<section>
+  <h2>任务状态</h2>
+  <table>
+    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>开始</th><th>结束</th><th>错误</th></tr></thead>
+    <tbody>
+      {% for job in jobs %}
+        <tr><td>#{{ job.id }}</td><td>{{ job.type }}</td><td>{{ job.status }}</td><td>{{ job.started_at or "" }}</td><td>{{ job.finished_at or "" }}</td><td>{{ job.error_message or "" }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
