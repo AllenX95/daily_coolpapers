@@ -2,7 +2,7 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from . import db
@@ -98,6 +98,8 @@ class JobRunner:
             return
         now = datetime.now()
         day_key = now.strftime("%Y-%m-%d")
+        cutoff = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+        self._daily_runs = {key for key in self._daily_runs if key[:10] >= cutoff}
         times = str(db.get_setting("scheduler.daily_times", "10:30,12:00"))
         wanted = {item.strip() for item in times.split(",") if item.strip()}
         current = now.strftime("%H:%M")

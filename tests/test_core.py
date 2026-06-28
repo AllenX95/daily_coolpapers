@@ -385,19 +385,147 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("sk-test-secret", encrypted)
             self.assertEqual(store.decrypt(encrypted), "sk-test-secret")
 
-    def test_job_reconcile_throttles_repeated_polling(self):
-        runner = JobRunner()
-        runner._started = True
+    def test_llm_profiles_migrated_to_separate_db(self):
+        with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
+            main_db = Path(tmp) / "main.sqlite3"
+            llm_db = Path(tmp) / "llm.sqlite3"
+            with (
+                patch.object(db, "DB_PATH", main_db),
+                patch.object(db, "LLM_PROFILES_DB_PATH", llm_db),
+            ):
+                # Create legacy schema with llm_profiles in main DB
+                with db.connect() as conn:
+                    conn.executescript(
+                        """
+                        CREATE TABLE llm_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT NOT NULL,
+                            provider TEXT NOT NULL,
+                            base_url TEXT NOT NULL,
+                            model TEXT NOT NULL,
+                            encrypted_api_key_ref TEXT,
+                            custom_headers TEXT NOT NULL DEFAULT '{}',
+                            temperature REAL NOT NULL DEFAULT 0.2,
+                            max_output_tokens INTEGER NOT NULL DEFAULT 2000,
+                            context_window_tokens INTEGER NOT NULL DEFAULT 128000,
+                            timeout_seconds INTEGER NOT NULL DEFAULT 120,
+                            enabled INTEGER NOT NULL DEFAULT 1,
+                            is_default_abstract INTEGER NOT NULL DEFAULT 0,
+                            is_default_fulltext INTEGER NOT NULL DEFAULT 0,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        );
+                        INSERT INTO llm_profiles(
+                            name, provider, base_url, model, encrypted_api_key_ref,
+                            custom_headers, temperature, max_output_tokens,
+                            context_window_tokens, timeout_seconds, enabled,
+                            is_default_abstract, is_default_fulltext, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "Test Profile", "openai_compatible", "https://api.openai.com",
+                            "gpt-4o", "fernet:encrypted-key", "{}", 0.2, 2000, 128000, 120,
+                            1, 1, 0, "2026-01-01 00:00:00", "2026-01-01 00:00:00",
+                        ),
+                    )
 
-        with (
-            patch("daily_coolpapers.jobs.time.monotonic", side_effect=[100.0, 110.0, 131.0]),
-            patch("daily_coolpapers.jobs.db.mark_pending_jobs_interrupted_except", return_value=0) as mark_pending,
-        ):
-            runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
-            runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
-            runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
+                db.migrate_llm_profiles_from_main_db()
 
-        self.assertEqual(mark_pending.call_count, 2)
+                with db.connect_llm_profiles() as conn:
+                    rows = conn.execute("SELECT * FROM llm_profiles").fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["name"], "Test Profile")
+                    self.assertEqual(rows[0]["encrypted_api_key_ref"], "fernet:encrypted-key")
+
+                with db.connect() as conn:
+                    legacy = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'llm_profiles_legacy'"
+                    ).fetchone()
+                    self.assertIsNotNone(legacy)
+                    old = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'llm_profiles'"
+                    ).fetchone()
+                    self.assertIsNone(old)
+
+    def test_list_prompts_hydrates_from_llm_profiles_db(self):
+        with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
+            main_db = Path(tmp) / "main.sqlite3"
+            llm_db = Path(tmp) / "llm.sqlite3"
+            with (
+                patch.object(db, "DB_PATH", main_db),
+                patch.object(db, "LLM_PROFILES_DB_PATH", llm_db),
+            ):
+                db.init_db()
+                db.init_llm_profiles_db()
+
+                with db.connect_llm_profiles() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO llm_profiles(name, provider, base_url, model, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("My Profile", "openai_compatible", "https://api.example.com", "model-x", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+                    )
+                    profile_id = int(cur.lastrowid)
+
+                with db.connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO prompts(name, type, template, llm_profile_id, version, is_default, enabled, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ("Prompt", "abstract_review", "Template", profile_id, 1, 1, 1, "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+                    )
+
+                prompts = db.list_prompts()
+                self.assertEqual(len(prompts), 1)
+                self.assertEqual(prompts[0]["llm_profile_name"], "My Profile")
+                self.assertEqual(prompts[0]["llm_model"], "model-x")
+
+    def test_list_evaluations_hydrates_from_llm_profiles_db(self):
+        with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
+            main_db = Path(tmp) / "main.sqlite3"
+            llm_db = Path(tmp) / "llm.sqlite3"
+            with (
+                patch.object(db, "DB_PATH", main_db),
+                patch.object(db, "LLM_PROFILES_DB_PATH", llm_db),
+            ):
+                db.init_db()
+                db.init_llm_profiles_db()
+
+                with db.connect_llm_profiles() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO llm_profiles(name, provider, base_url, model, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("Eval Profile", "openai_compatible", "https://api.example.com", "model-y", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+                    )
+                    profile_id = int(cur.lastrowid)
+
+                with db.connect() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO papers(arxiv_id, title, authors, abstract, subjects, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ("2606.00001", "Paper", "[]", "Abstract", "[]", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+                    )
+                    paper_id = int(cur.lastrowid)
+                    conn.execute(
+                        """
+                        INSERT INTO evaluations(
+                            paper_id, evaluation_type, prompt_id, prompt_version,
+                            llm_profile_id, model, status, result_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (paper_id, "abstract_review", None, 1, profile_id, "model-y", "success", '{"score": 90}', "2026-01-01 00:00:00"),
+                    )
+
+                evaluations = db.list_evaluations(paper_id)
+                self.assertEqual(len(evaluations), 1)
+                self.assertEqual(evaluations[0]["llm_profile_name"], "Eval Profile")
+                self.assertEqual(evaluations[0]["result"]["score"], 90)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,8 @@ def create_app() -> Flask:
     ensure_directories()
     setup_logging(clear_on_start=True)
     db.init_db()
+    db.init_llm_profiles_db()
+    db.migrate_llm_profiles_from_main_db()
     db.mark_unfinished_jobs_interrupted()
     app = Flask(__name__)
     app.secret_key = _flask_secret()

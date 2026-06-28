@@ -10,6 +10,7 @@ MARKDOWN_CACHE_DIR = CACHE_DIR / "markdown"
 LOG_DIR = BASE_DIR / "logs"
 CURRENT_LOG = LOG_DIR / "current.log"
 DB_PATH = DATA_DIR / "daily_coolpapers.sqlite3"
+LLM_PROFILES_DB_PATH = INSTANCE_DIR / "llm_profiles.sqlite3"
 
 DEFAULT_SETTINGS = {
     "crawler.default_top_n": 30,

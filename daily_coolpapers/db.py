@@ -4,7 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import DB_PATH, DEFAULT_CATEGORIES, DEFAULT_SETTINGS, ensure_directories
+from .config import DB_PATH, DEFAULT_CATEGORIES, DEFAULT_SETTINGS, LLM_PROFILES_DB_PATH, ensure_directories
 from .default_prompts import DEFAULT_ABSTRACT_PROMPT, DEFAULT_FULLTEXT_PROMPT
 
 
@@ -36,6 +36,18 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def connect_llm_profiles(path: Path | None = None) -> sqlite3.Connection:
+    ensure_directories()
+    conn = sqlite3.connect(path or LLM_PROFILES_DB_PATH, timeout=30, factory=ClosingConnection)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        conn.execute("PRAGMA journal_mode = DELETE")
+    return conn
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -53,6 +65,70 @@ def init_db() -> None:
             if path.exists():
                 path.unlink()
         _init_db_once()
+
+
+def init_llm_profiles_db() -> None:
+    with connect_llm_profiles() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS llm_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model TEXT NOT NULL,
+                encrypted_api_key_ref TEXT,
+                custom_headers TEXT NOT NULL DEFAULT '{}',
+                temperature REAL NOT NULL DEFAULT 0.2,
+                max_output_tokens INTEGER NOT NULL DEFAULT 2000,
+                context_window_tokens INTEGER NOT NULL DEFAULT 128000,
+                timeout_seconds INTEGER NOT NULL DEFAULT 120,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                is_default_abstract INTEGER NOT NULL DEFAULT 0,
+                is_default_fulltext INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_llm_profiles_enabled_default_abstract
+            ON llm_profiles(enabled, is_default_abstract);
+
+            CREATE INDEX IF NOT EXISTS idx_llm_profiles_enabled_default_fulltext
+            ON llm_profiles(enabled, is_default_fulltext);
+            """
+        )
+
+
+def migrate_llm_profiles_from_main_db() -> None:
+    with connect() as main_conn:
+        row = main_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'llm_profiles'"
+        ).fetchone()
+        if not row:
+            return
+
+        profiles = main_conn.execute("SELECT * FROM llm_profiles").fetchall()
+
+    init_llm_profiles_db()
+
+    if profiles:
+        columns = [
+            "id", "name", "provider", "base_url", "model",
+            "encrypted_api_key_ref", "custom_headers", "temperature",
+            "max_output_tokens", "context_window_tokens", "timeout_seconds",
+            "enabled", "is_default_abstract", "is_default_fulltext",
+            "created_at", "updated_at",
+        ]
+        placeholders = ",".join("?" for _ in columns)
+        with connect_llm_profiles() as llm_conn:
+            for profile in profiles:
+                llm_conn.execute(
+                    f"INSERT INTO llm_profiles({','.join(columns)}) VALUES ({placeholders})",
+                    tuple(profile[col] for col in columns),
+                )
+
+    with connect() as main_conn:
+        main_conn.execute("ALTER TABLE llm_profiles RENAME TO llm_profiles_legacy")
 
 
 def _init_db_once() -> None:
@@ -98,31 +174,12 @@ def _init_db_once() -> None:
                 UNIQUE(paper_id, category, crawl_date)
             );
 
-            CREATE TABLE IF NOT EXISTS llm_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                model TEXT NOT NULL,
-                encrypted_api_key_ref TEXT,
-                custom_headers TEXT NOT NULL DEFAULT '{}',
-                temperature REAL NOT NULL DEFAULT 0.2,
-                max_output_tokens INTEGER NOT NULL DEFAULT 2000,
-                context_window_tokens INTEGER NOT NULL DEFAULT 128000,
-                timeout_seconds INTEGER NOT NULL DEFAULT 120,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                is_default_abstract INTEGER NOT NULL DEFAULT 0,
-                is_default_fulltext INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS prompts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 type TEXT NOT NULL,
                 template TEXT NOT NULL,
-                llm_profile_id INTEGER REFERENCES llm_profiles(id) ON DELETE SET NULL,
+                llm_profile_id INTEGER,
                 version INTEGER NOT NULL DEFAULT 1,
                 is_default INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -136,7 +193,7 @@ def _init_db_once() -> None:
                 evaluation_type TEXT NOT NULL,
                 prompt_id INTEGER REFERENCES prompts(id) ON DELETE SET NULL,
                 prompt_version INTEGER,
-                llm_profile_id INTEGER REFERENCES llm_profiles(id) ON DELETE SET NULL,
+                llm_profile_id INTEGER,
                 model TEXT,
                 status TEXT NOT NULL,
                 result_json TEXT,
@@ -838,20 +895,20 @@ def list_llm_profiles(enabled_only: bool = False) -> list[dict[str, Any]]:
     if enabled_only:
         sql += " WHERE enabled = 1"
     sql += " ORDER BY enabled DESC, name"
-    with connect() as conn:
+    with connect_llm_profiles() as conn:
         return [dict(row) for row in conn.execute(sql).fetchall()]
 
 
 def get_llm_profile(profile_id: int | None) -> dict[str, Any] | None:
     if not profile_id:
         return None
-    with connect() as conn:
+    with connect_llm_profiles() as conn:
         return row_to_dict(conn.execute("SELECT * FROM llm_profiles WHERE id = ?", (profile_id,)).fetchone())
 
 
 def get_default_llm_profile(eval_type: str) -> dict[str, Any] | None:
     flag = "is_default_fulltext" if eval_type == "fulltext_review" else "is_default_abstract"
-    with connect() as conn:
+    with connect_llm_profiles() as conn:
         row = conn.execute(
             f"SELECT * FROM llm_profiles WHERE enabled = 1 AND {flag} = 1 ORDER BY id LIMIT 1"
         ).fetchone()
@@ -866,7 +923,7 @@ def save_llm_profile(data: dict[str, Any]) -> int:
     enabled = 1 if data.get("enabled") else 0
     default_abstract = 1 if data.get("is_default_abstract") else 0
     default_fulltext = 1 if data.get("is_default_fulltext") else 0
-    with connect() as conn:
+    with connect_llm_profiles() as conn:
         if default_abstract:
             conn.execute("UPDATE llm_profiles SET is_default_abstract = 0")
         if default_fulltext:
@@ -933,21 +990,34 @@ def save_llm_profile(data: dict[str, Any]) -> int:
 
 
 def list_prompts(prompt_type: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
-    sql = """
-        SELECT p.*, l.name AS llm_profile_name, l.model AS llm_model
-        FROM prompts p
-        LEFT JOIN llm_profiles l ON l.id = p.llm_profile_id
-        WHERE 1=1
-    """
+    sql = "SELECT * FROM prompts WHERE 1=1"
     params: list[Any] = []
     if prompt_type:
-        sql += " AND p.type = ?"
+        sql += " AND type = ?"
         params.append(prompt_type)
     if enabled_only:
-        sql += " AND p.enabled = 1"
-    sql += " ORDER BY p.type, p.is_default DESC, p.name"
+        sql += " AND enabled = 1"
+    sql += " ORDER BY type, is_default DESC, name"
     with connect() as conn:
-        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+        prompts = [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    profile_ids = _unique_ints(p.get("llm_profile_id") for p in prompts if p.get("llm_profile_id"))
+    profiles: dict[int, sqlite3.Row] = {}
+    if profile_ids:
+        with connect_llm_profiles() as conn:
+            for chunk in _chunks(profile_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT id, name, model FROM llm_profiles WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                profiles.update({row["id"]: row for row in rows})
+
+    for prompt in prompts:
+        profile = profiles.get(prompt.get("llm_profile_id"))
+        prompt["llm_profile_name"] = profile["name"] if profile else None
+        prompt["llm_model"] = profile["model"] if profile else None
+    return prompts
 
 
 def get_prompt(prompt_id: int | None) -> dict[str, Any] | None:
@@ -1159,18 +1229,32 @@ def list_evaluations(paper_id: int) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT e.*, p.name AS prompt_name, l.name AS llm_profile_name
+            SELECT e.*, p.name AS prompt_name
             FROM evaluations e
             LEFT JOIN prompts p ON p.id = e.prompt_id
-            LEFT JOIN llm_profiles l ON l.id = e.llm_profile_id
             WHERE e.paper_id = ?
             ORDER BY e.created_at DESC, e.id DESC
             """,
             (paper_id,),
         ).fetchall()
     items = [dict(row) for row in rows]
+
+    profile_ids = _unique_ints(item.get("llm_profile_id") for item in items if item.get("llm_profile_id"))
+    profiles: dict[int, sqlite3.Row] = {}
+    if profile_ids:
+        with connect_llm_profiles() as conn:
+            for chunk in _chunks(profile_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT id, name FROM llm_profiles WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                profiles.update({row["id"]: row for row in rows})
+
     for item in items:
         item["result"] = loads_json(item.get("result_json"), {})
+        profile = profiles.get(item.get("llm_profile_id"))
+        item["llm_profile_name"] = profile["name"] if profile else None
     return items
 
 
