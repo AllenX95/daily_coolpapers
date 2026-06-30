@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -259,6 +260,9 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_jobs_recent
         ON jobs(created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_recent
+        ON jobs(status, created_at DESC, id DESC);
         """
     )
 
@@ -506,15 +510,101 @@ def get_latest_crawl_date_on_or_before(max_date: str) -> str | None:
         ).fetchone()
     return row["crawl_date"] if row and row["crawl_date"] else None
 
+PAPER_DIGEST_SORTS = {"rank", "rank_desc", "stars", "stars_desc", "title", "updated"}
+
+
+@dataclass(frozen=True)
+class PaperDigestQuery:
+    selected_date: str = ""
+    date_from: str = ""
+    date_to: str = ""
+    category: str = ""
+    attention: str = ""
+    sort: str = "rank"
+
+    @classmethod
+    def from_raw(
+        cls,
+        date_value: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        category: str | None = None,
+        attention: str | None = None,
+        sort: str | None = None,
+        latest_crawl_date: str | None = None,
+    ) -> "PaperDigestQuery":
+        start, end = _normalized_digest_date_range(date_from, date_to)
+        use_date_range = bool(start or end)
+        selected_date = "" if use_date_range else (_valid_digest_date(date_value) or latest_crawl_date or "")
+        return cls(
+            selected_date=selected_date,
+            date_from=start,
+            date_to=end,
+            category=(category or "").strip(),
+            attention=(attention or "").strip(),
+            sort=_normalized_digest_sort(sort),
+        )
+
+    @property
+    def use_date_range(self) -> bool:
+        return bool(self.date_from or self.date_to)
+
+    def url_args(self, sort: str | None = None) -> dict[str, str]:
+        return {
+            "date": self.selected_date,
+            "date_from": self.date_from,
+            "date_to": self.date_to,
+            "category": self.category,
+            "attention": self.attention,
+            "sort": _normalized_digest_sort(sort) if sort is not None else self.sort,
+        }
+
+
+def _normalized_digest_date_range(date_from: str | None, date_to: str | None) -> tuple[str, str]:
+    start = _valid_digest_date(date_from)
+    end = _valid_digest_date(date_to)
+    if start and end and start > end:
+        start, end = end, start
+    return start, end
+
+
+def _valid_digest_date(value: str | None) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.isdigit() and len(cleaned) == 8:
+        cleaned = f"{cleaned[:4]}-{cleaned[4:6]}-{cleaned[6:8]}"
+    else:
+        cleaned = cleaned.replace("/", "-").replace(".", "-")
+    try:
+        date.fromisoformat(cleaned)
+    except ValueError:
+        return ""
+    return cleaned
+
+
+def _normalized_digest_sort(value: str | None) -> str:
+    candidate = (value or "rank").strip()
+    return candidate if candidate in PAPER_DIGEST_SORTS else "rank"
+
 
 def list_paper_rows(
-    crawl_date: str | None = None,
+    crawl_date: str | PaperDigestQuery | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     category: str | None = None,
     attention: str | None = None,
     sort: str = "rank",
 ) -> list[dict[str, Any]]:
+    if isinstance(crawl_date, PaperDigestQuery):
+        query = crawl_date
+        crawl_date = query.selected_date or None
+        date_from = query.date_from or None
+        date_to = query.date_to or None
+        category = query.category or None
+        attention = query.attention or None
+        sort = query.sort
+
     use_date_range = bool(date_from or date_to)
     crawl_date = None if use_date_range else (crawl_date or get_latest_crawl_date())
     if not crawl_date and not use_date_range:
@@ -1008,7 +1098,7 @@ def list_prompts(prompt_type: str | None = None, enabled_only: bool = False) -> 
             for chunk in _chunks(profile_ids):
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
-                    f"SELECT id, name, model FROM llm_profiles WHERE id IN ({placeholders})",
+                    f"SELECT id, name, model, enabled FROM llm_profiles WHERE id IN ({placeholders})",
                     chunk,
                 ).fetchall()
                 profiles.update({row["id"]: row for row in rows})
@@ -1017,6 +1107,7 @@ def list_prompts(prompt_type: str | None = None, enabled_only: bool = False) -> 
         profile = profiles.get(prompt.get("llm_profile_id"))
         prompt["llm_profile_name"] = profile["name"] if profile else None
         prompt["llm_model"] = profile["model"] if profile else None
+        prompt["llm_profile_enabled"] = bool(profile["enabled"]) if profile else None
     return prompts
 
 
@@ -1379,6 +1470,47 @@ def hydrate_job_progress(job: dict[str, Any]) -> dict[str, Any]:
     job["progress_message"] = job.get("progress_message") or ""
     job["progress_details"] = loads_json(job.get("progress_details_json"), {})
     return job
+
+
+JOB_PROGRESS_COLUMNS = """
+    id, type, status, progress_current, progress_total, progress_message,
+    progress_details_json, error_message, started_at, finished_at, created_at
+"""
+
+
+def list_job_summaries(limit: int = 80, statuses: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    limit = max(0, int(limit))
+    if limit == 0:
+        return []
+    params: list[Any] = []
+    where = ""
+    if statuses:
+        status_list = list(statuses)
+        if not status_list:
+            return []
+        placeholders = ",".join("?" for _ in status_list)
+        where = f"WHERE status IN ({placeholders})"
+        params.extend(status_list)
+    params.append(limit)
+    with connect() as conn:
+        jobs = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT {JOB_PROGRESS_COLUMNS}
+                FROM jobs
+                {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        ]
+    return [hydrate_job_progress(job) for job in jobs]
+
+
+def list_active_job_progress(limit: int = 12) -> list[dict[str, Any]]:
+    return list_job_summaries(limit, statuses=("pending", "running"))
 
 
 def list_jobs(limit: int = 80) -> list[dict[str, Any]]:

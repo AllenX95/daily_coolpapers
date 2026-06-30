@@ -32,7 +32,7 @@
       </select>
     </label>
     <button type="submit">筛选</button>
-    <a class="button secondary" href="{{ url_for('export_csv', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort) }}">导出 CSV</a>
+    <a class="button secondary" href="{{ export_csv_url }}">导出 CSV</a>
   </form>
   <div class="toolbar-actions">
     <form method="post" action="{{ url_for('run_crawl') }}">
@@ -54,7 +54,7 @@
   class="job-progress-panel"
   id="job-progress-panel"
   data-progress-url="{{ url_for('jobs_progress') }}"
-  data-had-active="{{ 1 if active_jobs else 0 }}"
+  data-had-active="{{ 1 if has_active_jobs else 0 }}"
   {% if not progress_jobs %}hidden{% endif %}
 >
   <div class="progress-panel-head">
@@ -69,14 +69,13 @@
       <article class="job-progress-card {{ job.status }}">
         <div class="job-card-head">
           <div class="job-title-line">
-            <strong>{{ job_type_label(job.type) }}</strong>
-            <span class="badge {{ job.status }}">{{ job_status_label(job.status) }}</span>
+            <strong>{{ job.type_label }}</strong>
+            <span class="badge {{ job.status }}">{{ job.status_label }}</span>
           </div>
           <span class="job-id">#{{ job.id }}</span>
         </div>
-        {% set message = job.error_message if job.status == "failed" and job.error_message else (job.progress_message or job_progress_label(job)) %}
-        <div class="job-message {% if job.status == 'failed' %}danger{% endif %}">{{ message }}</div>
-        {% if job.status == "pending" %}
+        <div class="job-message {% if job.is_failed %}danger{% endif %}">{{ job.message }}</div>
+        {% if job.is_pending %}
           <div class="queued-line"><span></span>等待 worker 接收任务</div>
         {% else %}
           <div class="progress-bar" aria-label="任务进度">
@@ -84,75 +83,31 @@
           </div>
         {% endif %}
         <div class="job-meta-row">
-          <span>{{ job_progress_label(job) }}</span>
+          <span>{{ job.progress_label }}</span>
           <span>创建 {{ job.created_at }}</span>
           {% if job.started_at %}<span>开始 {{ job.started_at }}</span>{% endif %}
           {% if job.finished_at %}<span>结束 {{ job.finished_at }}</span>{% endif %}
         </div>
-        {% set details = job.progress_details or {} %}
-        {% if details.phase == "crawl" %}
+        {% if job.detail %}
           <div class="job-detail-block">
             <div class="crawl-progress-summary">
-              <span>成功 {{ details.summary.success }}/{{ details.summary.total }}</span>
-              <span>失败 {{ details.summary.failed }}</span>
-              <span>已保存 {{ details.summary.saved }} 篇</span>
-              <span>运行中 {{ details.summary.running }}</span>
-              <span>待处理 {{ details.summary.pending }}</span>
-            </div>
-            <div class="crawl-progress-grid">
-              {% for item in details.categories %}
-                <div class="crawl-progress-item {{ item.status }}">
-                  <div class="crawl-progress-title">
-                    <strong>{{ item.category }}</strong>
-                    <span class="badge {{ item.status }}">{{ job_status_label(item.status) }}</span>
-                  </div>
-                  <div class="small muted">
-                    {% if item.status == "success" %}
-                      {{ item.papers }} 篇 · {{ item.crawl_date }}
-                    {% elif item.status == "running" %}
-                      第 {{ item.attempt }}/{{ item.max_attempts }} 次尝试
-                    {% elif item.status == "failed" %}
-                      {{ item.error|truncate_text(160) }}
-                    {% else %}
-                      等待中
-                    {% endif %}
-                  </div>
-                </div>
+              {% for line in job.detail.summary_lines %}
+                <span>{{ line }}</span>
               {% endfor %}
             </div>
-          </div>
-        {% endif %}
-        {% if details.phase == "catch_up" %}
-          <div class="job-detail-block">
-            <div class="crawl-progress-summary">
-              <span>目标内最新 {{ details.summary.latest_reference_date or "无" }}</span>
-              <span>数据库最大 {{ details.summary.latest_db_date or "无" }}</span>
-              <span>目标最新 {{ details.summary.latest_target_date }}</span>
-              <span>日期 {{ details.summary.completed_dates }}/{{ details.summary.total_dates }}</span>
-              <span>失败 {{ details.summary.failed_dates }}</span>
-              {% if details.summary.current_date %}<span>当前 {{ details.summary.current_date }}</span>{% endif %}
-            </div>
-            <div class="crawl-progress-grid">
-              {% for item in details.dates %}
-                <div class="crawl-progress-item {{ item.status }}">
-                  <div class="crawl-progress-title">
-                    <strong>{{ item.date }}</strong>
-                    <span class="badge {{ item.status }}">{{ job_status_label(item.status) }}</span>
+            {% if job.detail.item_rows %}
+              <div class="crawl-progress-grid">
+                {% for item in job.detail.item_rows %}
+                  <div class="crawl-progress-item {{ item.status }}">
+                    <div class="crawl-progress-title">
+                      <strong>{{ item.title }}</strong>
+                      <span class="badge {{ item.status }}">{{ item.status_label }}</span>
+                    </div>
+                    <div class="small muted">{{ item.line|truncate_text(160) }}</div>
                   </div>
-                  <div class="small muted">
-                    {% if item.status == "success" %}
-                      已保存 {{ item.saved }} 条类目记录
-                    {% elif item.status == "failed" %}
-                      {{ item.error|truncate_text(160) }}
-                    {% elif item.status == "running" %}
-                      抓取中
-                    {% else %}
-                      等待中
-                    {% endif %}
-                  </div>
-                </div>
-              {% endfor %}
-            </div>
+                {% endfor %}
+              </div>
+            {% endif %}
           </div>
         {% endif %}
       </article>
@@ -168,7 +123,7 @@
   {% endif %}
   <span>论文行数：{{ papers|length }}</span>
   {% for job in jobs[:6] %}
-    <span class="job {{ job.status }}">#{{ job.id }} {{ job_type_label(job.type) }} {{ job_status_label(job.status) }}</span>
+    <span class="job {{ job.status }}">#{{ job.id }} {{ job.type_label }} {{ job.status_label }}</span>
   {% endfor %}
 </section>
 
@@ -187,8 +142,8 @@
     <thead>
       <tr>
         <th>类目</th>
-        <th><a class="sort-link" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort='rank_desc') }}">Rank ↓</a></th>
-        <th><a class="sort-link" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort='stars_desc') }}">Stars ↓</a></th>
+        <th><a class="sort-link" href="{{ rank_sort_url }}">Rank ↓</a></th>
+        <th><a class="sort-link" href="{{ stars_sort_url }}">Stars ↓</a></th>
         <th>论文</th>
         <th>摘要评估</th>
         <th>全文评估</th>
@@ -307,9 +262,7 @@
     head.appendChild(titleLine);
     head.appendChild(text("span", "job-id", `#${job.id}`));
 
-    const mainMessage = job.status === "failed" && job.error_message
-      ? job.error_message
-      : (job.progress_message || job.progress_label || "任务准备中");
+    const mainMessage = job.message || job.progress_message || job.progress_label || "任务准备中";
     const message = text("div", job.status === "failed" ? "job-message danger" : "job-message", mainMessage);
 
     card.appendChild(head);
@@ -343,95 +296,40 @@
   }
 
   function renderDetails(job) {
-    const details = job.progress_details || {};
-    if (details.phase === "catch_up") return renderCatchUpDetails(details);
-    if (details.phase !== "crawl") return null;
+    const detail = job.detail;
+    if (!detail) return null;
 
     const wrap = document.createElement("div");
     wrap.className = "job-detail-block";
-    const summary = details.summary || {};
     const summaryNode = document.createElement("div");
     summaryNode.className = "crawl-progress-summary";
-    summaryNode.appendChild(text("span", "", `成功 ${summary.success || 0}/${summary.total || 0}`));
-    summaryNode.appendChild(text("span", "", `失败 ${summary.failed || 0}`));
-    summaryNode.appendChild(text("span", "", `已保存 ${summary.saved || 0} 篇`));
-    summaryNode.appendChild(text("span", "", `运行中 ${summary.running || 0}`));
-    summaryNode.appendChild(text("span", "", `待处理 ${summary.pending || 0}`));
-
-    const grid = document.createElement("div");
-    grid.className = "crawl-progress-grid";
-    for (const item of details.categories || []) {
-      const cell = document.createElement("div");
-      cell.className = `crawl-progress-item ${item.status || "pending"}`;
-
-      const title = document.createElement("div");
-      title.className = "crawl-progress-title";
-      const name = text("strong", "", item.category || "");
-      const badge = text("span", `badge ${item.status || "pending"}`, statusLabel(item.status || "pending"));
-      title.appendChild(name);
-      title.appendChild(badge);
-
-      let line = "等待中";
-      if (item.status === "success") {
-        line = `${item.papers || 0} 篇 · ${item.crawl_date || ""}`;
-      } else if (item.status === "running") {
-        line = `第 ${item.attempt || 0}/${item.max_attempts || 0} 次尝试`;
-      } else if (item.status === "failed") {
-        line = item.error || "抓取失败";
-      }
-      cell.appendChild(title);
-      cell.appendChild(text("div", "small muted", line.length > 160 ? `${line.slice(0, 160)}...` : line));
-      grid.appendChild(cell);
+    for (const line of detail.summary_lines || []) {
+      summaryNode.appendChild(text("span", "", line));
     }
-
     wrap.appendChild(summaryNode);
-    wrap.appendChild(grid);
+
+    const rows = detail.item_rows || [];
+    if (rows.length > 0) {
+      const grid = document.createElement("div");
+      grid.className = "crawl-progress-grid";
+      for (const item of rows) {
+        const cell = document.createElement("div");
+        cell.className = `crawl-progress-item ${item.status || "pending"}`;
+
+        const title = document.createElement("div");
+        title.className = "crawl-progress-title";
+        title.appendChild(text("strong", "", item.title || ""));
+        title.appendChild(text("span", `badge ${item.status || "pending"}`, item.status_label || statusLabel(item.status || "pending")));
+
+        const line = item.line || "";
+        cell.appendChild(title);
+        cell.appendChild(text("div", "small muted", line.length > 160 ? `${line.slice(0, 160)}...` : line));
+        grid.appendChild(cell);
+      }
+      wrap.appendChild(grid);
+    }
     return wrap;
   }
-
-  function renderCatchUpDetails(details) {
-    const wrap = document.createElement("div");
-    wrap.className = "job-detail-block";
-    const summary = details.summary || {};
-    const summaryNode = document.createElement("div");
-    summaryNode.className = "crawl-progress-summary";
-    summaryNode.appendChild(text("span", "", `目标内最新 ${summary.latest_reference_date || "无"}`));
-    summaryNode.appendChild(text("span", "", `数据库最大 ${summary.latest_db_date || "无"}`));
-    summaryNode.appendChild(text("span", "", `目标最新 ${summary.latest_target_date || ""}`));
-    summaryNode.appendChild(text("span", "", `日期 ${summary.completed_dates || 0}/${summary.total_dates || 0}`));
-    summaryNode.appendChild(text("span", "", `失败 ${summary.failed_dates || 0}`));
-    if (summary.current_date) summaryNode.appendChild(text("span", "", `当前 ${summary.current_date}`));
-
-    const grid = document.createElement("div");
-    grid.className = "crawl-progress-grid";
-    for (const item of details.dates || []) {
-      const cell = document.createElement("div");
-      cell.className = `crawl-progress-item ${item.status || "pending"}`;
-
-      const title = document.createElement("div");
-      title.className = "crawl-progress-title";
-      title.appendChild(text("strong", "", item.date || ""));
-      title.appendChild(text("span", `badge ${item.status || "pending"}`, statusLabel(item.status || "pending")));
-
-      let line = "等待中";
-      if (item.status === "success") {
-        line = `已保存 ${item.saved || 0} 条类目记录`;
-      } else if (item.status === "running") {
-        line = "抓取中";
-      } else if (item.status === "failed") {
-        line = item.error || "metadata 抓取失败";
-      }
-
-      cell.appendChild(title);
-      cell.appendChild(text("div", "small muted", line.length > 160 ? `${line.slice(0, 160)}...` : line));
-      grid.appendChild(cell);
-    }
-
-    wrap.appendChild(summaryNode);
-    wrap.appendChild(grid);
-    return wrap;
-  }
-
   async function refreshProgress() {
     try {
       const response = await fetch(panel.dataset.progressUrl, { cache: "no-store" });

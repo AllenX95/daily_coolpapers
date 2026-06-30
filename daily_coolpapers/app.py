@@ -1,11 +1,8 @@
-import csv
-import io
 import json
 import logging
 import os
 import threading
 import time
-from datetime import date
 from typing import Any
 
 from flask import (
@@ -27,6 +24,14 @@ from .jobs import job_runner
 from .llm import test_profile
 from .logging_setup import setup_logging
 from .security import secret_store
+from .services import (
+    build_paper_digest_csv,
+    build_paper_evaluation_export,
+    evaluation_prompt_options,
+    evaluation_result_view,
+    paper_evaluation_result_model,
+    resolve_evaluation_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,63 +76,31 @@ def register_template_helpers(app: Flask) -> None:
 
     @app.template_global()
     def latest_score(evaluation: dict | None) -> str:
-        if not evaluation or evaluation.get("status") != "success":
-            return "-"
-        score = (evaluation.get("result") or {}).get("score")
-        return "-" if score is None else str(score)
+        view = evaluation_result_view(evaluation)
+        return view["score_text"] if view else "-"
 
     @app.template_global()
     def latest_attention(evaluation: dict | None) -> str:
-        if not evaluation or evaluation.get("status") != "success":
-            return "pending"
-        return (evaluation.get("result") or {}).get("attention") or "unknown"
+        view = evaluation_result_view(evaluation)
+        return view["attention"] if view else "pending"
 
     @app.template_global()
     def vc_impact(evaluation: dict | None) -> str:
-        if not evaluation or evaluation.get("status") != "success":
-            return ""
-        vc = (evaluation.get("result") or {}).get("vc_perspective") or {}
-        return vc.get("impact", "") if isinstance(vc, dict) else ""
+        view = evaluation_result_view(evaluation)
+        return view["vc_impact"] if view and view["is_success"] else ""
 
     @app.template_global()
     def markdown_cached(arxiv_id: str) -> bool:
         return has_markdown(arxiv_id)
 
-    @app.template_global()
-    def job_type_label(job_type: str | None) -> str:
-        return _job_type_label(job_type)
-
-    @app.template_global()
-    def job_status_label(status: str | None) -> str:
-        return _job_status_label(status)
-
-    @app.template_global()
-    def job_progress_label(job: dict[str, Any]) -> str:
-        return _job_progress_label(job)
-
 
 def register_routes(app: Flask) -> None:
     @app.get("/")
     def index():
-        job_runner.reconcile_orphaned_pending_jobs()
-        date_from, date_to = _normalized_date_range(
-            request.args.get("date_from"),
-            request.args.get("date_to"),
-        )
-        use_date_range = bool(date_from or date_to)
-        selected_date = "" if use_date_range else (_valid_date_string(request.args.get("date")) or db.get_latest_crawl_date())
-        selected_category = request.args.get("category") or ""
-        attention = request.args.get("attention") or ""
-        sort = request.args.get("sort") or "rank"
-        papers = db.list_paper_rows(
-            crawl_date=selected_date,
-            date_from=date_from or None,
-            date_to=date_to or None,
-            category=selected_category or None,
-            attention=attention or None,
-            sort=sort,
-        )
-        jobs = db.list_jobs(12)
+        job_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
+        digest_query = _paper_digest_query_from_request()
+        papers = db.list_paper_rows(digest_query)
+        jobs = _job_status_payloads(db.list_job_summaries(12))
         active_jobs = [job for job in jobs if job["status"] in {"pending", "running"}]
         progress_jobs = active_jobs
         if not progress_jobs and jobs and jobs[0]["status"] == "failed":
@@ -136,15 +109,19 @@ def register_routes(app: Flask) -> None:
             "index.html",
             papers=papers,
             categories=db.list_categories(),
-            selected_date=selected_date,
-            date_from=date_from,
-            date_to=date_to,
-            use_date_range=use_date_range,
-            selected_category=selected_category,
-            attention=attention,
-            sort=sort,
+            digest_query=digest_query,
+            selected_date=digest_query.selected_date,
+            date_from=digest_query.date_from,
+            date_to=digest_query.date_to,
+            use_date_range=digest_query.use_date_range,
+            selected_category=digest_query.category,
+            attention=digest_query.attention,
+            sort=digest_query.sort,
+            export_csv_url=url_for("export_csv", **digest_query.url_args()),
+            rank_sort_url=url_for("index", **digest_query.url_args(sort="rank_desc")),
+            stars_sort_url=url_for("index", **digest_query.url_args(sort="stars_desc")),
             jobs=jobs[:8],
-            active_jobs=active_jobs,
+            has_active_jobs=bool(active_jobs),
             progress_jobs=progress_jobs,
         )
 
@@ -210,20 +187,22 @@ def register_routes(app: Flask) -> None:
 
     @app.post("/api/papers/<int:paper_id>/evaluate-abstract")
     def evaluate_abstract(paper_id: int):
-        prompt_id = _optional_int(request.form.get("prompt_id"))
-        job_id = job_runner.enqueue("abstract_eval", {"paper_id": paper_id, "prompt_id": prompt_id})
-        flash(f"已创建摘要评估任务 #{job_id}")
+        job_id = _enqueue_paper_evaluation(paper_id, "abstract_review", "abstract_eval")
+        if job_id:
+            flash(f"已创建摘要评估任务 #{job_id}")
         return redirect(_back_to_detail_or_index(paper_id))
 
     @app.post("/api/papers/<int:paper_id>/evaluate-fulltext")
     def evaluate_fulltext(paper_id: int):
-        prompt_id = _optional_int(request.form.get("prompt_id"))
         force_markdown = bool(request.form.get("force_markdown"))
-        job_id = job_runner.enqueue(
+        job_id = _enqueue_paper_evaluation(
+            paper_id,
+            "fulltext_review",
             "fulltext_eval",
-            {"paper_id": paper_id, "prompt_id": prompt_id, "force_markdown": force_markdown},
+            force_markdown=force_markdown,
         )
-        flash(f"已创建全文阅读任务 #{job_id}")
+        if job_id:
+            flash(f"已创建全文阅读任务 #{job_id}")
         return redirect(_back_to_detail_or_index(paper_id))
 
     @app.get("/papers/<int:paper_id>")
@@ -236,14 +215,8 @@ def register_routes(app: Flask) -> None:
             "paper_detail.html",
             paper=paper,
             categories=db.get_paper_categories(paper_id),
-            evaluations=db.list_evaluations(paper_id),
-            latest_abstract_eval=db.get_latest_evaluation(paper_id, "abstract_review"),
-            latest_fulltext_eval=db.get_latest_evaluation(paper_id, "fulltext_review"),
-            latest_successful_fulltext_eval=db.get_latest_successful_evaluation(
-                paper_id, "fulltext_review"
-            ),
-            abstract_prompts=db.list_prompts("abstract_review", enabled_only=True),
-            fulltext_prompts=db.list_prompts("fulltext_review", enabled_only=True),
+            evaluation_results=paper_evaluation_result_model(paper_id),
+            evaluation_actions=_paper_evaluation_actions(paper_id),
             has_pdf=has_pdf(paper["arxiv_id"]),
             has_markdown=has_markdown(paper["arxiv_id"]),
             pdf_path=pdf_path(paper["arxiv_id"]),
@@ -282,7 +255,7 @@ def register_routes(app: Flask) -> None:
         if not paper:
             flash("论文不存在")
             return redirect(url_for("index"))
-        body = build_paper_export(paper, db.list_evaluations(paper_id))
+        body = build_paper_evaluation_export(paper)
         return Response(
             body,
             mimetype="text/markdown; charset=utf-8",
@@ -291,40 +264,10 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/export.csv")
     def export_csv():
-        date_from, date_to = _normalized_date_range(
-            request.args.get("date_from"),
-            request.args.get("date_to"),
-        )
-        use_date_range = bool(date_from or date_to)
-        papers = db.list_paper_rows(
-            crawl_date=None if use_date_range else (_valid_date_string(request.args.get("date")) or db.get_latest_crawl_date()),
-            date_from=date_from or None,
-            date_to=date_to or None,
-            category=request.args.get("category") or None,
-            attention=request.args.get("attention") or None,
-            sort=request.args.get("sort") or "rank",
-        )
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["date", "category", "rank", "stars", "score", "attention", "title", "arxiv_id", "pdf_url"])
-        for paper in papers:
-            evaluation = paper.get("latest_abstract_eval") or {}
-            result = evaluation.get("result") or {}
-            writer.writerow(
-                [
-                    paper.get("crawl_date"),
-                    paper.get("category"),
-                    paper.get("rank"),
-                    paper.get("reading_stars"),
-                    result.get("score"),
-                    result.get("attention"),
-                    paper.get("title"),
-                    paper.get("arxiv_id"),
-                    paper.get("pdf_url"),
-                ]
-            )
+        digest_query = _paper_digest_query_from_request()
+        body = build_paper_digest_csv(db.list_paper_rows(digest_query))
         return Response(
-            output.getvalue(),
+            body,
             mimetype="text/csv; charset=utf-8",
             headers={"Content-Disposition": "attachment; filename=papers.csv"},
         )
@@ -460,7 +403,7 @@ def register_routes(app: Flask) -> None:
                 "scheduler_enabled": db.get_bool_setting("scheduler.enabled", True),
                 "scheduler_daily_times": db.get_setting("scheduler.daily_times", "10:30,12:00"),
             },
-            jobs=db.list_jobs(30),
+            jobs=_job_status_payloads(db.list_job_summaries(30)),
         )
 
     @app.post("/api/settings")
@@ -489,7 +432,7 @@ def register_routes(app: Flask) -> None:
     @app.get("/logs")
     def logs():
         log_text = CURRENT_LOG.read_text(encoding="utf-8") if CURRENT_LOG.exists() else ""
-        return render_template("logs.html", log_text=log_text, jobs=db.list_jobs(80))
+        return render_template("logs.html", log_text=log_text, jobs=_job_status_payloads(db.list_job_summaries(80)))
 
     @app.get("/api/logs/current")
     def current_log():
@@ -498,10 +441,9 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/api/jobs/progress")
     def jobs_progress():
-        job_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
-        jobs = db.list_jobs(12)
+        jobs = _job_status_payloads(db.list_active_job_progress(12))
         return {
-            "jobs": [_job_progress_payload(job) for job in jobs]
+            "jobs": jobs
         }
 
 
@@ -511,27 +453,16 @@ def _optional_int(value: str | None) -> int | None:
     return int(value)
 
 
-def _normalized_date_range(date_from: str | None, date_to: str | None) -> tuple[str, str]:
-    start = _valid_date_string(date_from)
-    end = _valid_date_string(date_to)
-    if start and end and start > end:
-        start, end = end, start
-    return start, end
-
-
-def _valid_date_string(value: str | None) -> str:
-    cleaned = (value or "").strip()
-    if not cleaned:
-        return ""
-    if cleaned.isdigit() and len(cleaned) == 8:
-        cleaned = f"{cleaned[:4]}-{cleaned[4:6]}-{cleaned[6:8]}"
-    else:
-        cleaned = cleaned.replace("/", "-").replace(".", "-")
-    try:
-        date.fromisoformat(cleaned)
-    except ValueError:
-        return ""
-    return cleaned
+def _paper_digest_query_from_request() -> db.PaperDigestQuery:
+    return db.PaperDigestQuery.from_raw(
+        date_value=request.args.get("date"),
+        date_from=request.args.get("date_from"),
+        date_to=request.args.get("date_to"),
+        category=request.args.get("category"),
+        attention=request.args.get("attention"),
+        sort=request.args.get("sort"),
+        latest_crawl_date=db.get_latest_crawl_date(),
+    )
 
 
 def _valid_json_or_empty(value: str | None) -> str:
@@ -555,6 +486,49 @@ def _back_to_detail_or_index(paper_id: int) -> str:
     if request.form.get("from_detail"):
         return url_for("paper_detail", paper_id=paper_id)
     return request.referrer or url_for("index")
+
+
+def _paper_evaluation_actions(paper_id: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "key": "abstract_review",
+            "title": "摘要 Prompt",
+            "action_url": url_for("evaluate_abstract", paper_id=paper_id),
+            "button_label": "重新摘要评估",
+            "prompt_options": evaluation_prompt_options("abstract_review"),
+            "force_markdown": False,
+        },
+        {
+            "key": "fulltext_review",
+            "title": "全文 Prompt",
+            "action_url": url_for("evaluate_fulltext", paper_id=paper_id),
+            "button_label": "全文阅读",
+            "prompt_options": evaluation_prompt_options("fulltext_review"),
+            "force_markdown": True,
+        },
+    ]
+
+
+def _enqueue_paper_evaluation(
+    paper_id: int,
+    evaluation_type: str,
+    job_type: str,
+    force_markdown: bool = False,
+) -> int | None:
+    prompt_id = _optional_int(request.form.get("prompt_id"))
+    try:
+        config = resolve_evaluation_config(evaluation_type, prompt_id)
+    except ValueError as exc:
+        flash(f"无法创建评估任务：{exc}")
+        return None
+
+    payload: dict[str, Any] = {
+        "paper_id": paper_id,
+        "prompt_id": config.prompt_id,
+    }
+    if force_markdown:
+        payload["force_markdown"] = True
+    return job_runner.enqueue(job_type, payload)
 
 
 def _job_type_label(job_type: str | None) -> str:
@@ -588,47 +562,101 @@ def _job_progress_label(job: dict[str, Any]) -> str:
 
 
 def _job_progress_payload(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
     return {
         "id": job["id"],
         "type": job["type"],
         "type_label": _job_type_label(job.get("type")),
-        "status": job["status"],
+        "status": status,
         "status_label": _job_status_label(job.get("status")),
         "progress_current": job["progress_current"],
         "progress_total": job["progress_total"],
         "progress_percent": job["progress_percent"],
         "progress_label": _job_progress_label(job),
         "progress_message": job["progress_message"],
+        "message": _job_message(job),
         "progress_details": job.get("progress_details") or {},
+        "detail": _job_detail_payload(job.get("progress_details") or {}),
         "error_message": job.get("error_message") or "",
         "created_at": job.get("created_at") or "",
         "started_at": job.get("started_at") or "",
         "finished_at": job.get("finished_at") or "",
+        "is_pending": status == "pending",
+        "is_failed": status == "failed",
     }
 
 
-def build_paper_export(paper: dict[str, Any], evaluations: list[dict[str, Any]]) -> str:
-    lines = [
-        f"# {paper['title']}",
-        "",
-        f"- arXiv ID: {paper['arxiv_id']}",
-        f"- Published: {paper.get('published_at') or ''}",
-        f"- PDF: {paper.get('pdf_url') or ''}",
-        "",
-        "## Abstract",
-        "",
-        paper.get("abstract") or "",
-        "",
-    ]
-    for evaluation in evaluations:
-        lines.extend(
-            [
-                f"## {evaluation['evaluation_type']} - {evaluation['status']} - {evaluation['created_at']}",
-                "",
-                "```json",
-                json.dumps(evaluation.get("result") or {}, ensure_ascii=False, indent=2),
-                "```",
-                "",
-            ]
-        )
-    return "\n".join(lines)
+def _job_message(job: dict[str, Any]) -> str:
+    if job.get("status") == "failed" and job.get("error_message"):
+        return str(job.get("error_message") or "")
+    return str(job.get("progress_message") or _job_progress_label(job))
+
+
+def _job_status_payloads(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_job_progress_payload(job) for job in jobs]
+
+
+def _job_detail_payload(details: dict[str, Any]) -> dict[str, Any] | None:
+    phase = details.get("phase")
+    if phase == "crawl":
+        summary = details.get("summary") or {}
+        return {
+            "summary_lines": [
+                f"成功 {summary.get('success') or 0}/{summary.get('total') or 0}",
+                f"失败 {summary.get('failed') or 0}",
+                f"已保存 {summary.get('saved') or 0} 篇",
+                f"运行中 {summary.get('running') or 0}",
+                f"待处理 {summary.get('pending') or 0}",
+            ],
+            "item_rows": [_crawl_detail_item_payload(item) for item in details.get("categories") or []],
+        }
+    if phase == "catch_up":
+        summary = details.get("summary") or {}
+        summary_lines = [
+            f"目标内最新 {summary.get('latest_reference_date') or '无'}",
+            f"数据库最大 {summary.get('latest_db_date') or '无'}",
+            f"目标最新 {summary.get('latest_target_date') or ''}",
+            f"日期 {summary.get('completed_dates') or 0}/{summary.get('total_dates') or 0}",
+            f"失败 {summary.get('failed_dates') or 0}",
+        ]
+        if summary.get("current_date"):
+            summary_lines.append(f"当前 {summary.get('current_date')}")
+        return {
+            "summary_lines": summary_lines,
+            "item_rows": [_catch_up_detail_item_payload(item) for item in details.get("dates") or []],
+        }
+    return None
+
+
+def _crawl_detail_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    status = str(item.get("status") or "pending")
+    line = "等待中"
+    if status == "success":
+        line = f"{item.get('papers') or 0} 篇 · {item.get('crawl_date') or ''}"
+    elif status == "running":
+        line = f"第 {item.get('attempt') or 0}/{item.get('max_attempts') or 0} 次尝试"
+    elif status == "failed":
+        line = str(item.get("error") or "抓取失败")
+    return {
+        "title": item.get("category") or "",
+        "status": status,
+        "status_label": _job_status_label(status),
+        "line": line,
+    }
+
+
+def _catch_up_detail_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    status = str(item.get("status") or "pending")
+    line = "等待中"
+    if status == "success":
+        line = f"已保存 {item.get('saved') or 0} 条类目记录"
+    elif status == "running":
+        line = "抓取中"
+    elif status == "failed":
+        line = str(item.get("error") or "metadata 抓取失败")
+    return {
+        "title": item.get("date") or "",
+        "status": status,
+        "status_label": _job_status_label(status),
+        "line": line,
+    }

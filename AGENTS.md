@@ -19,7 +19,11 @@ Key runtime paths:
 
 Before editing, do a short preflight:
 
-- Confirm the working directory is `E:\claude-projects\daily-coolpapers`.
+- Confirm the working directory is the repository root for this project. It should contain
+  `AGENTS.md`, `daily_coolpapers/`, and `tests/`.
+- Do not assume a fixed drive letter or absolute parent path. This project may live at
+  different local clone paths on different machines; treat paths in these instructions as
+  relative to the repository root unless an absolute path is explicitly provided by the user.
 - This directory may not be a Git repository; do not rely on `git diff` unless it is available.
 - Check whether the target file or PRD exists before implementing from it.
 - Search with `rg` and exclude `cache`, `data`, `instance`, `logs`, `tmp`, `__pycache__`, and generated Markdown/PDF artifacts unless the task explicitly needs them.

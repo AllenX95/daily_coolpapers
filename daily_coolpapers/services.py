@@ -1,5 +1,9 @@
+import csv
+import io
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from threading import Lock, RLock
 from typing import Any, Callable
 
@@ -14,6 +18,359 @@ from .prompt_engine import estimate_tokens, render_prompt
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, str, dict[str, Any] | None], None]
+
+EVALUATION_TYPE_LABELS = {
+    "abstract_review": "摘要评估",
+    "fulltext_review": "全文评估",
+}
+EVALUATION_STATUS_LABELS = {
+    "pending": "排队中",
+    "running": "运行中",
+    "success": "成功",
+    "failed": "失败",
+}
+
+
+@dataclass(frozen=True)
+class EvaluationRequest:
+    paper_id: int
+    evaluation_type: str
+    prompt_id: int | None = None
+    force_markdown: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    evaluation_type: str
+    prompt: dict[str, Any]
+    profile: dict[str, Any]
+
+    @property
+    def prompt_id(self) -> int | None:
+        value = self.prompt.get("id")
+        return int(value) if value is not None else None
+
+    @property
+    def prompt_version(self) -> int | None:
+        value = self.prompt.get("version")
+        return int(value) if value is not None else None
+
+    @property
+    def profile_id(self) -> int | None:
+        value = self.profile.get("id")
+        return int(value) if value is not None else None
+
+    @property
+    def model(self) -> str | None:
+        value = self.profile.get("model")
+        return str(value) if value is not None else None
+
+
+def resolve_evaluation_config(evaluation_type: str, prompt_id: int | None = None) -> EvaluationConfig:
+    prompt = db.get_prompt(prompt_id) if prompt_id else db.get_default_prompt(evaluation_type)
+    if not prompt:
+        raise ValueError(f"No available prompt: {evaluation_type}")
+    if prompt.get("type") != evaluation_type:
+        raise ValueError(
+            f"Prompt {prompt.get('id')} is for {prompt.get('type')}, not {evaluation_type}"
+        )
+    if not int(prompt.get("enabled") or 0):
+        raise ValueError(f"Prompt {prompt.get('id')} is disabled")
+
+    profile = db.get_llm_profile(prompt.get("llm_profile_id"))
+    if profile and not int(profile.get("enabled") or 0):
+        profile = None
+    profile = profile or db.get_default_llm_profile(evaluation_type)
+    if not profile:
+        raise ValueError("No available LLM profile")
+    if not int(profile.get("enabled") or 0):
+        raise ValueError(f"LLM profile {profile.get('id')} is disabled")
+    return EvaluationConfig(evaluation_type=evaluation_type, prompt=prompt, profile=profile)
+
+
+def evaluation_prompt_options(evaluation_type: str) -> list[dict[str, Any]]:
+    prompts = db.list_prompts(evaluation_type, enabled_only=True)
+    default_prompt = db.get_default_prompt(evaluation_type)
+    default_prompt_id = int(default_prompt["id"]) if default_prompt else None
+    if default_prompt_id is not None:
+        default_prompt = next(
+            (prompt for prompt in prompts if int(prompt["id"]) == default_prompt_id),
+            default_prompt,
+        )
+    default_profile = db.get_default_llm_profile(evaluation_type)
+    options: list[dict[str, Any]] = []
+
+    if default_prompt:
+        options.append(
+            {
+                "value": str(default_prompt["id"]),
+                "label": f"默认：{_prompt_choice_label(default_prompt, default_profile)}",
+                "is_default": True,
+                "disabled": False,
+            }
+        )
+    else:
+        options.append(
+            {
+                "value": "",
+                "label": "无可用 Prompt",
+                "is_default": True,
+                "disabled": True,
+            }
+        )
+
+    for prompt in prompts:
+        prompt_id = int(prompt["id"])
+        if prompt_id == default_prompt_id:
+            continue
+        options.append(
+            {
+                "value": str(prompt_id),
+                "label": _prompt_choice_label(prompt, default_profile),
+                "is_default": bool(prompt.get("is_default")),
+                "disabled": False,
+            }
+        )
+    return options
+
+
+def _prompt_choice_label(prompt: dict[str, Any], default_profile: dict[str, Any] | None) -> str:
+    profile = _prompt_profile_label(prompt, default_profile)
+    version = prompt.get("version") or 1
+    return f"{prompt.get('name') or 'Prompt'} · v{version} · {profile}"
+
+
+def _prompt_profile_label(prompt: dict[str, Any], default_profile: dict[str, Any] | None) -> str:
+    if prompt.get("llm_profile_id") and prompt.get("llm_profile_enabled") is not False:
+        name = prompt.get("llm_profile_name")
+        model = prompt.get("llm_model")
+        if name and model:
+            return f"{name} / {model}"
+        if name or model:
+            return str(name or model)
+    if default_profile:
+        name = default_profile.get("name")
+        model = default_profile.get("model")
+        if name and model:
+            return f"默认模型：{name} / {model}"
+        if name or model:
+            return f"默认模型：{name or model}"
+    return "默认模型"
+
+
+def evaluation_result_view(evaluation: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not evaluation:
+        return None
+    result = evaluation.get("result") if isinstance(evaluation.get("result"), dict) else {}
+    status = str(evaluation.get("status") or "pending")
+    is_success = status == "success"
+    vc = result.get("vc_perspective") if isinstance(result.get("vc_perspective"), dict) else {}
+    score = result.get("score") if is_success else None
+    attention = (result.get("attention") or "unknown") if is_success else "pending"
+    prompt_name = evaluation.get("prompt_name") or "Prompt 已删除"
+    model = evaluation.get("model") or ""
+    profile_name = evaluation.get("llm_profile_name") or ""
+    return {
+        "id": evaluation.get("id"),
+        "evaluation_type": evaluation.get("evaluation_type") or "",
+        "type_label": EVALUATION_TYPE_LABELS.get(
+            evaluation.get("evaluation_type"),
+            evaluation.get("evaluation_type") or "评估",
+        ),
+        "status": status,
+        "status_label": EVALUATION_STATUS_LABELS.get(status, status),
+        "is_success": is_success,
+        "is_failed": status == "failed",
+        "created_at": evaluation.get("created_at") or "",
+        "prompt_name": prompt_name,
+        "prompt_label": prompt_name,
+        "model": model,
+        "profile_name": profile_name,
+        "profile_label": _evaluation_profile_label(profile_name, model),
+        "score": score,
+        "score_text": "-" if score is None else str(score),
+        "attention": str(attention),
+        "summary_text": _first_text(result, "summary_zh", "one_sentence_summary", "detailed_summary_zh"),
+        "one_sentence_summary": _text(result.get("one_sentence_summary")),
+        "detailed_summary_zh": _text(result.get("detailed_summary_zh")),
+        "problem": _text(result.get("problem")),
+        "method": _text(result.get("method")),
+        "novelty_assessment": _text(result.get("novelty_assessment")),
+        "recommended_action": _text(result.get("recommended_action")),
+        "sections": _evaluation_sections(result),
+        "vc": _evaluation_vc_view(vc),
+        "vc_impact": _text(vc.get("impact")),
+        "result_json": result,
+        "has_result": bool(result),
+        "error_message": evaluation.get("error_message") or "",
+        "raw_output": evaluation.get("raw_output") or "",
+    }
+
+
+def paper_evaluation_result_model(paper_id: int) -> dict[str, Any]:
+    history = [
+        view
+        for view in (evaluation_result_view(item) for item in db.list_evaluations(paper_id))
+        if view is not None
+    ]
+    latest_abstract = _first_evaluation(history, "abstract_review")
+    latest_fulltext = _first_evaluation(history, "fulltext_review")
+    latest_successful_fulltext = _first_evaluation(history, "fulltext_review", success_only=True)
+    latest_fulltext_failure = None
+    if latest_fulltext and latest_fulltext["is_failed"]:
+        if not latest_successful_fulltext or latest_fulltext["id"] != latest_successful_fulltext["id"]:
+            latest_fulltext_failure = latest_fulltext
+    return {
+        "history": history,
+        "latest_abstract": latest_abstract,
+        "latest_fulltext": latest_fulltext,
+        "latest_successful_fulltext": latest_successful_fulltext,
+        "latest_fulltext_failure": latest_fulltext_failure,
+    }
+
+
+def build_paper_evaluation_export(
+    paper: dict[str, Any],
+    result_model: dict[str, Any] | None = None,
+) -> str:
+    result_model = result_model or paper_evaluation_result_model(int(paper["id"]))
+    lines = [
+        f"# {paper['title']}",
+        "",
+        f"- arXiv ID: {paper['arxiv_id']}",
+        f"- Published: {paper.get('published_at') or ''}",
+        f"- PDF: {paper.get('pdf_url') or ''}",
+        "",
+        "## Abstract",
+        "",
+        paper.get("abstract") or "",
+        "",
+    ]
+    for evaluation in result_model.get("history") or []:
+        lines.extend(_evaluation_export_block(evaluation))
+    return "\n".join(lines)
+
+
+def build_paper_digest_csv(papers: list[dict[str, Any]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "category", "rank", "stars", "score", "attention", "title", "arxiv_id", "pdf_url"])
+    for paper in papers:
+        abstract_eval = evaluation_result_view(paper.get("latest_abstract_eval"))
+        writer.writerow(
+            [
+                paper.get("crawl_date"),
+                paper.get("category"),
+                paper.get("rank"),
+                paper.get("reading_stars"),
+                abstract_eval["score"] if abstract_eval else None,
+                abstract_eval["attention"] if abstract_eval and abstract_eval["is_success"] else None,
+                paper.get("title"),
+                paper.get("arxiv_id"),
+                paper.get("pdf_url"),
+            ]
+        )
+    return output.getvalue()
+
+
+def _first_evaluation(
+    evaluations: list[dict[str, Any]],
+    evaluation_type: str,
+    success_only: bool = False,
+) -> dict[str, Any] | None:
+    for evaluation in evaluations:
+        if evaluation["evaluation_type"] != evaluation_type:
+            continue
+        if success_only and not evaluation["is_success"]:
+            continue
+        return evaluation
+    return None
+
+
+def _evaluation_sections(result: dict[str, Any]) -> list[dict[str, str]]:
+    fields = [
+        ("详细总结", "detailed_summary_zh"),
+        ("问题", "problem"),
+        ("方法", "method"),
+        ("新颖性", "novelty_assessment"),
+        ("建议动作", "recommended_action"),
+    ]
+    return [
+        {"title": title, "body": body}
+        for title, key in fields
+        if (body := _text(result.get(key)))
+    ]
+
+
+def _evaluation_vc_view(vc: dict[str, Any]) -> dict[str, Any]:
+    startup_opportunities = _string_list(vc.get("startup_opportunities"))
+    investment_risks = _string_list(vc.get("investment_risks"))
+    view = {
+        "impact": _text(vc.get("impact")),
+        "market_relevance": _text(vc.get("market_relevance")),
+        "commercialization_path": _text(vc.get("commercialization_path")),
+        "startup_opportunities": startup_opportunities,
+        "investment_risks": investment_risks,
+    }
+    view["has_content"] = any(
+        [
+            view["impact"],
+            view["market_relevance"],
+            view["commercialization_path"],
+            startup_opportunities,
+            investment_risks,
+        ]
+    )
+    return view
+
+
+def _evaluation_profile_label(profile_name: str, model: str) -> str:
+    if profile_name and model:
+        return f"{profile_name} / {model}"
+    return profile_name or model
+
+
+def _evaluation_export_block(evaluation: dict[str, Any]) -> list[str]:
+    lines = [
+        f"## {evaluation['type_label']} - {evaluation['status_label']} - {evaluation['created_at']}",
+        "",
+        f"- Prompt: {evaluation['prompt_label']}",
+        f"- Model: {evaluation['profile_label']}",
+        "",
+    ]
+    if evaluation["has_result"]:
+        lines.extend(
+            [
+                "```json",
+                json.dumps(evaluation["result_json"], ensure_ascii=False, indent=2),
+                "```",
+                "",
+            ]
+        )
+    else:
+        if evaluation["error_message"]:
+            lines.extend(["Error:", "", evaluation["error_message"], ""])
+        if evaluation["raw_output"]:
+            lines.extend(["Raw output:", "", "```text", evaluation["raw_output"], "```", ""])
+    return lines
+
+
+def _first_text(source: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = _text(source.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in (_text(item) for item in value) if item]
 
 
 def crawl_all_categories(
@@ -351,28 +708,18 @@ def evaluate_missing_abstracts(
     concurrency = min(concurrency, total)
     completed = 0
     lock = Lock()
-    prompt = db.get_default_prompt("abstract_review")
-    if not prompt:
-        raise ValueError("No available prompt: abstract_review")
-    profile = db.get_llm_profile(prompt.get("llm_profile_id")) or db.get_default_llm_profile("abstract_review")
-    if not profile:
-        raise ValueError("No available LLM profile")
+    config = resolve_evaluation_config("abstract_review")
 
     def evaluate_one(target_paper_id: int) -> bool:
         try:
-            evaluate_paper(
-                target_paper_id,
-                "abstract_review",
-                prompt=prompt,
-                profile=profile,
-                llm_client=llm_client,
-            )
+            runner.evaluate(EvaluationRequest(target_paper_id, "abstract_review"))
             return True
         except Exception as exc:
             logger.warning("Abstract evaluation failed for paper_id=%s: %s", target_paper_id, exc)
             return False
 
-    with make_llm_client(profile) as llm_client:
+    with make_llm_client(config.profile) as llm_client:
+        runner = EvaluationRunner(config=config, llm_client=llm_client)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(evaluate_one, paper_id) for paper_id in paper_ids]
             for future in as_completed(futures):
@@ -395,34 +742,81 @@ def evaluate_missing_abstracts(
     return {"success": success, "failed": failed, "total": len(paper_ids)}
 
 
-def evaluate_paper(
-    paper_id: int,
-    evaluation_type: str,
-    prompt_id: int | None = None,
-    force_markdown: bool = False,
-    prompt: dict[str, Any] | None = None,
-    profile: dict[str, Any] | None = None,
-    llm_client: httpx.Client | None = None,
-) -> dict[str, Any]:
-    paper = db.get_paper(paper_id)
-    if not paper:
-        raise ValueError(f"论文不存在: {paper_id}")
+class EvaluationRunner:
+    def __init__(
+        self,
+        config: EvaluationConfig | None = None,
+        llm_client: httpx.Client | None = None,
+    ) -> None:
+        self._config = config
+        self._llm_client = llm_client
 
-    prompt = prompt or (db.get_prompt(prompt_id) if prompt_id else db.get_default_prompt(evaluation_type))
-    if not prompt:
-        raise ValueError(f"没有可用 Prompt: {evaluation_type}")
+    def evaluate(self, request: EvaluationRequest) -> dict[str, Any]:
+        paper = self._load_paper(request.paper_id)
+        config = self._resolve_config(request)
+        prompt_text = self._build_prompt_text(request, paper, config)
 
-    profile = profile or db.get_llm_profile(prompt.get("llm_profile_id")) or db.get_default_llm_profile(evaluation_type)
-    if not profile:
-        raise ValueError("没有可用 LLM Profile，请先在 LLM 配置页新增模型")
+        try:
+            response = call_llm(config.profile, prompt_text, client=self._llm_client)
+        except Exception as exc:
+            self._record_failure(request, config, raw_output=None, error_message=str(exc))
+            raise
 
-    variables = paper_variables(paper)
-    prompt_text = ""
-    if evaluation_type == "fulltext_review":
-        md_path, _created = ensure_markdown(paper, force=force_markdown)
-        markdown = md_path.read_text(encoding="utf-8")
-        variables["markdown"] = markdown
-        prompt_text = render_prompt(prompt["template"], variables)
+        if response.result_json is None:
+            message = "LLM 输出不是合法 JSON"
+            self._record_failure(request, config, raw_output=response.raw_text, error_message=message)
+            raise LLMError(message)
+
+        eval_id = db.create_evaluation(
+            request.paper_id,
+            request.evaluation_type,
+            config.prompt_id,
+            config.prompt_version,
+            config.profile_id,
+            config.model,
+            "success",
+            response.result_json,
+            response.raw_text,
+            None,
+        )
+        return {"evaluation_id": eval_id, "result": response.result_json}
+
+    def _load_paper(self, paper_id: int) -> dict[str, Any]:
+        paper = db.get_paper(paper_id)
+        if not paper:
+            raise ValueError(f"论文不存在: {paper_id}")
+        return paper
+
+    def _resolve_config(self, request: EvaluationRequest) -> EvaluationConfig:
+        if self._config:
+            if self._config.evaluation_type != request.evaluation_type:
+                raise ValueError(
+                    f"Runner configured for {self._config.evaluation_type}, not {request.evaluation_type}"
+                )
+            if request.prompt_id and request.prompt_id != self._config.prompt_id:
+                raise ValueError(
+                    f"Runner configured for prompt {self._config.prompt_id}, not {request.prompt_id}"
+                )
+            return self._config
+        return resolve_evaluation_config(request.evaluation_type, request.prompt_id)
+
+    def _build_prompt_text(
+        self,
+        request: EvaluationRequest,
+        paper: dict[str, Any],
+        config: EvaluationConfig,
+    ) -> str:
+        variables = paper_variables(paper)
+        if request.evaluation_type == "fulltext_review":
+            md_path, _created = ensure_markdown(paper, force=request.force_markdown)
+            variables["markdown"] = md_path.read_text(encoding="utf-8")
+
+        prompt_text = render_prompt(config.prompt["template"], variables)
+        if request.evaluation_type == "fulltext_review":
+            self._ensure_context_window(prompt_text, config.profile)
+        return prompt_text
+
+    def _ensure_context_window(self, prompt_text: str, profile: dict[str, Any]) -> None:
         estimated = estimate_tokens(prompt_text)
         context_window = int(profile.get("context_window_tokens") or 0)
         max_output = int(profile.get("max_output_tokens") or 0)
@@ -432,52 +826,39 @@ def evaluate_paper(
                 f"({context_window} - {max_output})。请切换长上下文模型。"
             )
 
-    if not prompt_text:
-        prompt_text = render_prompt(prompt["template"], variables)
-    try:
-        response = call_llm(profile, prompt_text, client=llm_client)
-        if response.result_json is None:
-            db.create_evaluation(
-                paper_id,
-                evaluation_type,
-                prompt["id"],
-                prompt["version"],
-                profile["id"],
-                profile["model"],
-                "failed",
-                None,
-                response.raw_text,
-                "LLM 输出不是合法 JSON",
-            )
-            raise LLMError("LLM 输出不是合法 JSON")
-        eval_id = db.create_evaluation(
-            paper_id,
-            evaluation_type,
-            prompt["id"],
-            prompt["version"],
-            profile["id"],
-            profile["model"],
-            "success",
-            response.result_json,
-            response.raw_text,
+    def _record_failure(
+        self,
+        request: EvaluationRequest,
+        config: EvaluationConfig,
+        raw_output: str | None,
+        error_message: str,
+    ) -> int:
+        return db.create_evaluation(
+            request.paper_id,
+            request.evaluation_type,
+            config.prompt_id,
+            config.prompt_version,
+            config.profile_id,
+            config.model,
+            "failed",
             None,
+            raw_output,
+            error_message,
         )
-        return {"evaluation_id": eval_id, "result": response.result_json}
-    except Exception as exc:
-        if not isinstance(exc, LLMError) or str(exc) != "LLM 输出不是合法 JSON":
-            db.create_evaluation(
-                paper_id,
-                evaluation_type,
-                prompt["id"],
-                prompt["version"],
-                profile["id"],
-                profile["model"],
-                "failed",
-                None,
-                None,
-                str(exc),
-            )
-        raise
+
+def evaluate_paper(
+    paper_id: int,
+    evaluation_type: str,
+    prompt_id: int | None = None,
+    force_markdown: bool = False,
+) -> dict[str, Any]:
+    request = EvaluationRequest(
+        paper_id=paper_id,
+        evaluation_type=evaluation_type,
+        prompt_id=prompt_id,
+        force_markdown=force_markdown,
+    )
+    return EvaluationRunner().evaluate(request)
 
 
 def paper_variables(paper: dict[str, Any]) -> dict[str, Any]:

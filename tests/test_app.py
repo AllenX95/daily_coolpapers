@@ -3,6 +3,54 @@ import unittest
 from unittest.mock import patch
 
 
+def _empty_evaluation_results():
+    return {
+        "history": [],
+        "latest_abstract": None,
+        "latest_fulltext": None,
+        "latest_successful_fulltext": None,
+        "latest_fulltext_failure": None,
+    }
+
+
+def _renderable_evaluation_results():
+    fulltext = {
+        "id": 77,
+        "evaluation_type": "fulltext_review",
+        "type_label": "全文评估",
+        "status": "success",
+        "status_label": "成功",
+        "is_success": True,
+        "is_failed": False,
+        "created_at": "2026-06-30 12:00:00",
+        "prompt_label": "Fulltext Prompt",
+        "profile_label": "Profile / model-x",
+        "score_text": "92",
+        "attention": "must_read",
+        "one_sentence_summary": "Fulltext one line",
+        "sections": [{"title": "详细总结", "body": "Detailed result"}],
+        "vc": {
+            "has_content": True,
+            "impact": "Strong impact",
+            "market_relevance": "",
+            "commercialization_path": "",
+            "startup_opportunities": [],
+            "investment_risks": [],
+        },
+        "has_result": True,
+        "result_json": {"score": 92},
+        "error_message": "",
+        "raw_output": "",
+    }
+    return {
+        "history": [fulltext],
+        "latest_abstract": None,
+        "latest_fulltext": fulltext,
+        "latest_successful_fulltext": fulltext,
+        "latest_fulltext_failure": None,
+    }
+
+
 class AppSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -57,6 +105,33 @@ class AppSmokeTests(unittest.TestCase):
         self.assertEqual(export_response.status_code, 200)
         self.assertIn("date,category,rank,stars".encode(), export_response.data)
 
+    def test_digest_routes_use_normalized_query_object(self):
+        from daily_coolpapers import db
+
+        client = self.app.test_client()
+        with patch("daily_coolpapers.app.db.list_paper_rows", return_value=[]) as list_rows:
+            response = client.get(
+                "/?date_from=20990102&date_to=2099.01.01&category=%20cs.AI%20&attention=read&sort=bad-sort"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        query = list_rows.call_args.args[0]
+        self.assertIsInstance(query, db.PaperDigestQuery)
+        self.assertEqual(query.date_from, "2099-01-01")
+        self.assertEqual(query.date_to, "2099-01-02")
+        self.assertEqual(query.category, "cs.AI")
+        self.assertEqual(query.attention, "read")
+        self.assertEqual(query.sort, "rank")
+
+        with patch("daily_coolpapers.app.db.list_paper_rows", return_value=[]) as list_rows:
+            response = client.get("/export.csv?date=20990103&sort=stars_desc")
+
+        self.assertEqual(response.status_code, 200)
+        query = list_rows.call_args.args[0]
+        self.assertIsInstance(query, db.PaperDigestQuery)
+        self.assertEqual(query.selected_date, "2099-01-03")
+        self.assertEqual(query.sort, "stars_desc")
+
     def test_management_pages_load(self):
         client = self.app.test_client()
         for path in ["/favorites", "/categories", "/prompts", "/llm-profiles", "/settings", "/logs"]:
@@ -81,6 +156,37 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("pdf_download_timeout_seconds".encode(), response.data)
         self.assertIn("pdf_download_retries".encode(), response.data)
 
+    def test_settings_and_logs_use_job_status_payloads(self):
+        client = self.app.test_client()
+        job = {
+            "id": 321,
+            "type": "crawl",
+            "status": "failed",
+            "progress_current": 1,
+            "progress_total": 3,
+            "progress_percent": 33,
+            "progress_message": "ignored for failed jobs",
+            "progress_details": {},
+            "error_message": "boom",
+            "started_at": "2026-06-29 10:00:00",
+            "finished_at": "2026-06-29 10:01:00",
+            "created_at": "2026-06-29 09:59:00",
+        }
+
+        with patch("daily_coolpapers.app.db.list_job_summaries", return_value=[job]) as list_jobs:
+            response = client.get("/settings")
+        self.assertEqual(response.status_code, 200)
+        list_jobs.assert_called_once_with(30)
+        self.assertIn("Metadata".encode(), response.data)
+        self.assertIn("boom".encode(), response.data)
+
+        with patch("daily_coolpapers.app.db.list_job_summaries", return_value=[job]) as list_jobs:
+            response = client.get("/logs")
+        self.assertEqual(response.status_code, 200)
+        list_jobs.assert_called_once_with(80)
+        self.assertIn("Metadata".encode(), response.data)
+        self.assertIn("boom".encode(), response.data)
+
     def test_llm_page_has_prompt_model_bindings(self):
         client = self.app.test_client()
         response = client.get("/llm-profiles")
@@ -89,6 +195,151 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("参数说明".encode("utf-8"), response.data)
         self.assertIn("Context Window Tokens".encode("utf-8"), response.data)
 
+    def test_paper_detail_uses_evaluation_action_view_model(self):
+        client = self.app.test_client()
+        paper = {
+            "id": 7,
+            "title": "Action Paper",
+            "authors_list": ["Ada"],
+            "arxiv_id": "2606.00007",
+            "published_at": "2026-06-30",
+            "abstract": "A paper.",
+        }
+
+        def prompt_options(evaluation_type):
+            return [{"value": "11", "label": f"{evaluation_type} prompt", "disabled": False}]
+
+        with (
+            patch("daily_coolpapers.app.db.get_paper", return_value=paper),
+            patch("daily_coolpapers.app.db.get_paper_categories", return_value=[]),
+            patch("daily_coolpapers.app.paper_evaluation_result_model", return_value=_empty_evaluation_results()) as results,
+            patch("daily_coolpapers.app.has_pdf", return_value=False),
+            patch("daily_coolpapers.app.has_markdown", return_value=False),
+            patch("daily_coolpapers.app.evaluation_prompt_options", side_effect=prompt_options) as options,
+            patch("daily_coolpapers.app.render_template", return_value="ok") as render,
+        ):
+            response = client.get("/papers/7")
+
+        self.assertEqual(response.status_code, 200)
+        options.assert_any_call("abstract_review")
+        options.assert_any_call("fulltext_review")
+        results.assert_called_once_with(7)
+        context = render.call_args.kwargs
+        self.assertEqual(render.call_args.args[0], "paper_detail.html")
+        self.assertIn("evaluation_actions", context)
+        self.assertIn("evaluation_results", context)
+        self.assertNotIn("abstract_prompts", context)
+        self.assertNotIn("fulltext_prompts", context)
+        self.assertNotIn("evaluations", context)
+        self.assertNotIn("latest_abstract_eval", context)
+        self.assertNotIn("latest_fulltext_eval", context)
+        self.assertNotIn("latest_successful_fulltext_eval", context)
+        self.assertEqual(
+            [action["key"] for action in context["evaluation_actions"]],
+            ["abstract_review", "fulltext_review"],
+        )
+
+    def test_paper_detail_renders_evaluation_actions(self):
+        from flask import template_rendered
+
+        client = self.app.test_client()
+        paper = {
+            "id": 7,
+            "title": "Action Paper",
+            "authors_list": ["Ada"],
+            "arxiv_id": "2606.00007",
+            "published_at": "2026-06-30",
+            "abstract": "A paper.",
+        }
+        recorded = []
+
+        def record(_sender, template, context, **_extra):
+            recorded.append((template.name, context))
+
+        template_rendered.connect(record, self.app)
+        try:
+            with (
+                patch("daily_coolpapers.app.db.get_paper", return_value=paper),
+                patch("daily_coolpapers.app.db.get_paper_categories", return_value=[]),
+                patch(
+                    "daily_coolpapers.app.paper_evaluation_result_model",
+                    return_value=_renderable_evaluation_results(),
+                ),
+                patch("daily_coolpapers.app.has_pdf", return_value=False),
+                patch("daily_coolpapers.app.has_markdown", return_value=False),
+                patch(
+                    "daily_coolpapers.app.evaluation_prompt_options",
+                    side_effect=lambda evaluation_type: [
+                        {"value": "11", "label": f"{evaluation_type} prompt", "disabled": False}
+                    ],
+                ),
+            ):
+                response = client.get("/papers/7")
+        finally:
+            template_rendered.disconnect(record, self.app)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("abstract_review prompt".encode(), response.data)
+        self.assertIn("fulltext_review prompt".encode(), response.data)
+        self.assertIn("Fulltext one line".encode(), response.data)
+        self.assertIn("Detailed result".encode(), response.data)
+        self.assertIn("全文评估".encode("utf-8"), response.data)
+        self.assertEqual(recorded[0][0], "paper_detail.html")
+        self.assertIn("evaluation_actions", recorded[0][1])
+        self.assertIn("evaluation_results", recorded[0][1])
+
+    def test_paper_markdown_export_uses_evaluation_export_builder(self):
+        client = self.app.test_client()
+        paper = {
+            "id": 7,
+            "title": "Export Paper",
+            "arxiv_id": "2606.00007",
+            "published_at": "2026-06-30",
+            "abstract": "A paper.",
+        }
+        with (
+            patch("daily_coolpapers.app.db.get_paper", return_value=paper),
+            patch("daily_coolpapers.app.build_paper_evaluation_export", return_value="# Export") as build_export,
+        ):
+            response = client.get("/papers/7/export.md")
+
+        self.assertEqual(response.status_code, 200)
+        build_export.assert_called_once_with(paper)
+        self.assertEqual(response.data, b"# Export")
+
+    def test_paper_evaluation_routes_validate_prompt_before_enqueue(self):
+        from daily_coolpapers import services
+
+        client = self.app.test_client()
+        config = services.EvaluationConfig(
+            evaluation_type="abstract_review",
+            prompt={"id": 44, "version": 2, "template": "Title: {{ title }}", "enabled": 1},
+            profile={"id": 55, "model": "test-model", "enabled": 1},
+        )
+        with (
+            patch("daily_coolpapers.app.resolve_evaluation_config", return_value=config) as resolve,
+            patch("daily_coolpapers.app.job_runner.enqueue", return_value=999) as enqueue,
+        ):
+            response = client.post(
+                "/api/papers/7/evaluate-abstract",
+                data={"prompt_id": "44", "from_detail": "1"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        resolve.assert_called_once_with("abstract_review", 44)
+        enqueue.assert_called_once_with("abstract_eval", {"paper_id": 7, "prompt_id": 44})
+
+        with (
+            patch("daily_coolpapers.app.resolve_evaluation_config", side_effect=ValueError("wrong prompt")),
+            patch("daily_coolpapers.app.job_runner.enqueue") as enqueue,
+        ):
+            response = client.post(
+                "/api/papers/7/evaluate-fulltext",
+                data={"prompt_id": "44", "force_markdown": "1", "from_detail": "1"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        enqueue.assert_not_called()
     def test_prompt_model_binding_save(self):
         client = self.app.test_client()
         response = client.post("/api/prompt-model-bindings", follow_redirects=True)
@@ -97,15 +348,42 @@ class AppSmokeTests(unittest.TestCase):
 
     def test_jobs_progress_endpoint(self):
         client = self.app.test_client()
-        response = client.get("/api/jobs/progress")
+        job = {
+            "id": 123,
+            "type": "crawl",
+            "status": "running",
+            "progress_current": 1,
+            "progress_total": 4,
+            "progress_percent": 25,
+            "progress_message": "running",
+            "progress_details": {
+                "phase": "crawl",
+                "summary": {"success": 1, "total": 2, "failed": 0, "saved": 1, "running": 1, "pending": 0},
+                "categories": [{"category": "cs.AI", "status": "running", "attempt": 1, "max_attempts": 3}],
+            },
+            "error_message": None,
+            "started_at": "2026-06-29 10:00:00",
+            "finished_at": None,
+            "created_at": "2026-06-29 09:59:00",
+        }
+        with (
+            patch("daily_coolpapers.app.job_runner.reconcile_orphaned_pending_jobs") as reconcile,
+            patch("daily_coolpapers.app.db.list_active_job_progress", return_value=[job]) as list_progress,
+        ):
+            response = client.get("/api/jobs/progress")
+
         self.assertEqual(response.status_code, 200)
+        reconcile.assert_not_called()
+        list_progress.assert_called_once_with(12)
         data = response.get_json()
-        self.assertIn("jobs", data)
-        if data["jobs"]:
-            self.assertIn("progress_details", data["jobs"][0])
-            self.assertIn("type_label", data["jobs"][0])
-            self.assertIn("status_label", data["jobs"][0])
-            self.assertIn("progress_label", data["jobs"][0])
+        self.assertEqual(len(data["jobs"]), 1)
+        self.assertEqual(data["jobs"][0]["id"], 123)
+        self.assertIn("progress_details", data["jobs"][0])
+        self.assertIn("type_label", data["jobs"][0])
+        self.assertIn("status_label", data["jobs"][0])
+        self.assertIn("progress_label", data["jobs"][0])
+        self.assertEqual(data["jobs"][0]["message"], "running")
+        self.assertEqual(data["jobs"][0]["detail"]["item_rows"][0]["title"], "cs.AI")
 
     def test_split_crawl_and_eval_routes_enqueue(self):
         client = self.app.test_client()

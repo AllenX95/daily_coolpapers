@@ -1,15 +1,70 @@
+import json
 import logging
 import queue
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from . import db
 from .cache_manager import cleanup_caches
 from .services import crawl_all_categories, crawl_to_latest, evaluate_missing_abstracts, evaluate_paper
 
 logger = logging.getLogger(__name__)
+
+
+class JobProgressWriter:
+    def __init__(
+        self,
+        job_id: int,
+        min_interval_seconds: float = 0.5,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.job_id = job_id
+        self.min_interval_seconds = min_interval_seconds
+        self.clock = clock
+        self._last_written_key: tuple[int, int, str, str] | None = None
+        self._pending: tuple[int, int, str | None, dict[str, Any] | None, tuple[int, int, str, str]] | None = None
+        self._last_written_at: float | None = None
+
+    def update(
+        self,
+        current: int,
+        total: int,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        current = max(0, int(current))
+        total = max(0, int(total))
+        if total and current > total:
+            current = total
+        details_key = json.dumps(details, ensure_ascii=False, sort_keys=True) if details else ""
+        key = (current, total, message or "", details_key)
+        if key == self._last_written_key:
+            return
+        if self._pending and key == self._pending[4]:
+            return
+        self._pending = (current, total, message, details, key)
+        now = self.clock()
+        if self._last_written_at is None:
+            self.flush(now)
+            return
+        if total and current >= total:
+            self.flush(now)
+            return
+        if now - self._last_written_at >= self.min_interval_seconds:
+            self.flush(now)
+
+    def flush(self, now: float | None = None) -> None:
+        if not self._pending:
+            return
+        if now is None:
+            now = self.clock()
+        current, total, message, details, key = self._pending
+        db.update_job_progress(self.job_id, current, total, message, details)
+        self._last_written_key = key
+        self._last_written_at = now
+        self._pending = None
 
 
 class JobRunner:
@@ -127,46 +182,51 @@ class JobRunner:
             db.update_job(job_id, "failed", str(exc))
 
     def _dispatch(self, job_id: int, job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        progress_writer = JobProgressWriter(job_id)
+
         def progress(
             current: int,
             total: int,
             message: str,
             details: dict[str, Any] | None = None,
         ) -> None:
-            db.update_job_progress(job_id, current, total, message, details)
+            progress_writer.update(current, total, message, details)
 
-        if job_type == "crawl":
-            return crawl_all_categories(
-                payload.get("category_ids"),
-                crawl_date=payload.get("crawl_date"),
-                progress=progress,
-            )
-        if job_type == "crawl_catch_up":
-            return crawl_to_latest(payload.get("category_ids"), progress=progress)
-        if job_type == "abstract_eval":
-            paper_id = payload.get("paper_id")
-            if paper_id:
-                progress(0, 1, "准备摘要评估")
-                result = evaluate_paper(int(paper_id), "abstract_review", payload.get("prompt_id"))
-                progress(1, 1, "摘要评估完成")
+        try:
+            if job_type == "crawl":
+                return crawl_all_categories(
+                    payload.get("category_ids"),
+                    crawl_date=payload.get("crawl_date"),
+                    progress=progress,
+                )
+            if job_type == "crawl_catch_up":
+                return crawl_to_latest(payload.get("category_ids"), progress=progress)
+            if job_type == "abstract_eval":
+                paper_id = payload.get("paper_id")
+                if paper_id:
+                    progress(0, 1, "准备摘要评估")
+                    result = evaluate_paper(int(paper_id), "abstract_review", payload.get("prompt_id"))
+                    progress(1, 1, "摘要评估完成")
+                    return result
+                return evaluate_missing_abstracts(progress=progress)
+            if job_type == "fulltext_eval":
+                progress(0, 1, "准备全文阅读")
+                result = evaluate_paper(
+                    int(payload["paper_id"]),
+                    "fulltext_review",
+                    payload.get("prompt_id"),
+                    force_markdown=bool(payload.get("force_markdown")),
+                )
+                progress(1, 1, "全文阅读完成")
                 return result
-            return evaluate_missing_abstracts(progress=progress)
-        if job_type == "fulltext_eval":
-            progress(0, 1, "准备全文阅读")
-            result = evaluate_paper(
-                int(payload["paper_id"]),
-                "fulltext_review",
-                payload.get("prompt_id"),
-                force_markdown=bool(payload.get("force_markdown")),
-            )
-            progress(1, 1, "全文阅读完成")
-            return result
-        if job_type == "cleanup":
-            progress(0, 1, "准备清理缓存")
-            result = cleanup_caches()
-            progress(1, 1, "缓存清理完成")
-            return result
-        raise ValueError(f"未知任务类型: {job_type}")
+            if job_type == "cleanup":
+                progress(0, 1, "准备清理缓存")
+                result = cleanup_caches()
+                progress(1, 1, "缓存清理完成")
+                return result
+            raise ValueError(f"未知任务类型: {job_type}")
+        finally:
+            progress_writer.flush()
 
 
 job_runner = JobRunner()
