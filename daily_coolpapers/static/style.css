@@ -3,18 +3,17 @@
   --bg: #f3f6fc;
   --surface: #ffffff;
   --surface-soft: #f7f9fd;
-  --surface-glass: rgba(255, 255, 255, 0.78);
   --ink: #101828;
   --muted: #667085;
   --faint: #94a3b8;
   --line: rgba(148, 163, 184, 0.22);
   --line-strong: rgba(100, 116, 139, 0.34);
-  --accent: #246bfd;
+  --accent: #2563eb;
   --accent-hover: #1554d1;
   --accent-soft: #edf4ff;
   --accent-violet: #6558f5;
   --accent-cyan: #26b8d5;
-  --blue: #246bfd;
+  --blue: #2563eb;
   --blue-soft: #edf4ff;
   --danger: #b42318;
   --danger-soft: #fff1f0;
@@ -329,7 +328,7 @@ section {
 
 .toolbar-group-label {
   width: 100%;
-  color: #7c8aa2;
+  color: var(--muted);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.1em;
