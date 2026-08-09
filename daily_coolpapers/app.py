@@ -427,7 +427,16 @@ def register_routes(app: Flask) -> None:
     def llm_profiles():
         profiles = db.list_llm_profiles()
         for profile in profiles:
-            profile["api_key_masked"] = runtime_secret_store.masked(profile.get("encrypted_api_key_ref"))
+            try:
+                profile["api_key_masked"] = runtime_secret_store.masked(
+                    profile.get("encrypted_api_key_ref")
+                )
+            except ValueError:
+                logger.warning(
+                    "Unable to decrypt API key for LLM profile id=%s",
+                    profile.get("id"),
+                )
+                profile["api_key_masked"] = "无法解密，请重新输入"
         return render_template(
             "llm_profiles.html",
             profiles=profiles,

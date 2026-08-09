@@ -300,6 +300,38 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("参数说明".encode("utf-8"), response.data)
         self.assertIn("Context Window Tokens".encode("utf-8"), response.data)
 
+    def test_llm_page_stays_available_when_a_saved_key_cannot_be_decrypted(self):
+        from daily_coolpapers import db
+
+        profile_id = db.save_llm_profile(
+            {
+                "name": "Unreadable Key",
+                "provider": "openai_compatible",
+                "base_url": "https://example.test/v1",
+                "model": "model-x",
+                "encrypted_api_key_ref": "dpapi:not-valid-base64",
+                "custom_headers": "{}",
+                "temperature": 0.2,
+                "max_output_tokens": 2000,
+                "context_window_tokens": 128000,
+                "timeout_seconds": 120,
+                "enabled": True,
+                "is_default_abstract": False,
+                "is_default_fulltext": False,
+            }
+        )
+
+        def remove_profile():
+            with db.connect_llm_profiles() as conn:
+                conn.execute("DELETE FROM llm_profiles WHERE id = ?", (profile_id,))
+
+        self.addCleanup(remove_profile)
+
+        response = self.app.test_client().get("/llm-profiles")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("无法解密，请重新输入".encode("utf-8"), response.data)
+
     def test_paper_detail_uses_evaluation_action_view_model(self):
         client = self.app.test_client()
         paper = {
