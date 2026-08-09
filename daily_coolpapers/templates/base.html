@@ -3,29 +3,33 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f7ff">
   <title>{% block title %}Daily Cool Papers{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
   <header class="topbar">
-    <a class="brand" href="{{ url_for('index') }}">
-      <span class="brand-mark">D</span>
-      <span>Daily Cool Papers</span>
-    </a>
-    <nav class="main-nav" aria-label="主导航">
-      <a class="nav-link {% if request.endpoint == 'index' %}active{% endif %}" href="{{ url_for('index') }}">论文</a>
-      <a class="nav-link {% if request.endpoint == 'favorites' %}active{% endif %}" href="{{ url_for('favorites') }}">收藏</a>
-      <a class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}" href="{{ url_for('categories') }}">类目</a>
-      <a class="nav-link {% if request.endpoint == 'prompts' %}active{% endif %}" href="{{ url_for('prompts') }}">Prompt</a>
-      <a class="nav-link {% if request.endpoint == 'llm_profiles' %}active{% endif %}" href="{{ url_for('llm_profiles') }}">LLM</a>
-      <a class="nav-link {% if request.endpoint == 'settings' %}active{% endif %}" href="{{ url_for('settings') }}">设置</a>
-      <a class="nav-link {% if request.endpoint == 'logs' %}active{% endif %}" href="{{ url_for('logs') }}">日志</a>
-    </nav>
+    <div class="topbar-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark">D</span>
+        <span>Daily Cool Papers</span>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a class="nav-link {% if request.endpoint == 'index' %}active{% endif %}" {% if request.endpoint == 'index' %}aria-current="page"{% endif %} href="{{ url_for('index') }}">论文</a>
+        <a class="nav-link {% if request.endpoint == 'favorites' %}active{% endif %}" {% if request.endpoint == 'favorites' %}aria-current="page"{% endif %} href="{{ url_for('favorites') }}">收藏</a>
+        <a class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}" {% if request.endpoint == 'categories' %}aria-current="page"{% endif %} href="{{ url_for('categories') }}">类目</a>
+        <a class="nav-link {% if request.endpoint == 'prompts' %}active{% endif %}" {% if request.endpoint == 'prompts' %}aria-current="page"{% endif %} href="{{ url_for('prompts') }}">Prompt</a>
+        <a class="nav-link {% if request.endpoint == 'llm_profiles' %}active{% endif %}" {% if request.endpoint == 'llm_profiles' %}aria-current="page"{% endif %} href="{{ url_for('llm_profiles') }}">LLM</a>
+        <a class="nav-link {% if request.endpoint == 'settings' %}active{% endif %}" {% if request.endpoint == 'settings' %}aria-current="page"{% endif %} href="{{ url_for('settings') }}">设置</a>
+        <a class="nav-link {% if request.endpoint == 'logs' %}active{% endif %}" {% if request.endpoint == 'logs' %}aria-current="page"{% endif %} href="{{ url_for('logs') }}">日志</a>
+      </nav>
+    </div>
   </header>
-  <main class="page">
+  <main class="page" id="main-content" tabindex="-1">
     {% with messages = get_flashed_messages() %}
       {% if messages %}
-        <section class="flash">
+        <section class="flash" role="status" aria-live="polite">
           {% for message in messages %}
             <div>{{ message }}</div>
           {% endfor %}
