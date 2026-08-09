@@ -14,7 +14,34 @@ logger = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "llm_error", retryable: bool = False) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__(message)
+
+
+class LLMResultError(LLMError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}", code=code, retryable=False)
+
+
+class LLMHTTPError(LLMError):
+    def __init__(
+        self,
+        provider: str,
+        status_code: int,
+        body_excerpt: str,
+        *,
+        retryable: bool,
+    ) -> None:
+        self.provider = provider
+        self.status_code = status_code
+        self.body_excerpt = body_excerpt
+        super().__init__(
+            f"{provider} HTTP {status_code}: {body_excerpt or 'request failed'}",
+            code="http_error",
+            retryable=retryable,
+        )
 
 
 @dataclass
@@ -29,7 +56,8 @@ def parse_json_response(text: str) -> dict[str, Any] | None:
     if fence:
         cleaned = fence.group(1).strip()
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         pass
 
@@ -37,10 +65,67 @@ def parse_json_response(text: str) -> dict[str, Any] | None:
     end = cleaned.rfind("}")
     if start >= 0 and end > start:
         try:
-            return json.loads(cleaned[start : end + 1])
+            parsed = json.loads(cleaned[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             return None
     return None
+
+
+def validate_evaluation_result(
+    result: dict[str, Any],
+    evaluation_type: str,
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise LLMResultError("invalid_object", "LLM 输出必须是 JSON object")
+
+    score = result.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 100:
+        raise LLMResultError("invalid_schema", "score 必须是 0 到 100 的数字")
+
+    attention = result.get("attention")
+    allowed_attention = {"must_read", "read", "skim", "ignore"}
+    if not isinstance(attention, str) or attention not in allowed_attention:
+        raise LLMResultError(
+            "invalid_schema",
+            f"{evaluation_type} 的 attention 必须是 must_read/read/skim/ignore",
+        )
+
+    for key in {"novelty", "practical_value", "technical_depth", "reproduction_value"}:
+        if key not in result:
+            continue
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 10:
+            raise LLMResultError("invalid_schema", f"{key} 必须是 0 到 10 的数字")
+
+    for key in {
+        "tags",
+        "why_interesting",
+        "risk_or_limitations",
+        "main_findings",
+        "strengths",
+        "weaknesses",
+        "follow_up_questions",
+    }:
+        if key in result and not isinstance(result[key], list):
+            raise LLMResultError("invalid_schema", f"{key} 必须是数组")
+
+    vc = result.get("vc_perspective")
+    if vc is not None:
+        if not isinstance(vc, dict):
+            raise LLMResultError("invalid_schema", "vc_perspective 必须是 JSON object")
+        market_relevance = vc.get("market_relevance")
+        if market_relevance is not None and (
+            isinstance(market_relevance, bool)
+            or not isinstance(market_relevance, (int, float))
+            or not 0 <= market_relevance <= 10
+        ):
+            raise LLMResultError("invalid_schema", "market_relevance 必须是 0 到 10 的数字")
+        for key in {"startup_opportunities", "investment_risks"}:
+            if key in vc and not isinstance(vc[key], list):
+                raise LLMResultError("invalid_schema", f"vc_perspective.{key} 必须是数组")
+
+    return result
 
 
 def call_llm(profile: dict[str, Any], prompt: str, client: httpx.Client | None = None) -> LLMResponse:
@@ -59,6 +144,8 @@ def test_profile(profile: dict[str, Any]) -> str:
         profile,
         '请只返回 JSON：{"ok": true, "message": "connection works"}',
     )
+    if response.result_json is None:
+        raise LLMResultError("invalid_json", "连接测试响应必须是 JSON object")
     return response.raw_text
 
 
@@ -116,22 +203,32 @@ def _call_openai_compatible(
         client = make_llm_client(profile)
     try:
         response = client.post(url, headers=headers, json=payload)
-        if response.status_code >= 400 and "response_format" in payload:
-            payload.pop("response_format", None)
-            response = client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        if _response_format_unsupported(response) and "response_format" in payload:
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            response = client.post(url, headers=headers, json=fallback_payload)
+        _raise_for_http_status("openai_compatible", response)
+        data = _response_json("openai_compatible", response)
+    except LLMError:
+        raise
     except httpx.HTTPError as exc:
         logger.exception("OpenAI-compatible LLM call failed")
-        raise LLMError(str(exc)) from exc
+        retryable = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+        raise LLMError(str(exc), code="transport_error", retryable=retryable) from exc
     finally:
         if owns_client:
             client.close()
 
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            raise TypeError("message.content is not text")
+        return content
     except (KeyError, IndexError, TypeError) as exc:
-        raise LLMError(f"无法解析 OpenAI-compatible 响应: {data}") from exc
+        raise LLMError(
+            f"无法解析 OpenAI-compatible 响应: {data}",
+            code="provider_response",
+        ) from exc
 
 
 def _call_anthropic(
@@ -159,17 +256,75 @@ def _call_anthropic(
         client = make_llm_client(profile)
     try:
         response = client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        _raise_for_http_status("anthropic", response)
+        data = _response_json("anthropic", response)
+    except LLMError:
+        raise
     except httpx.HTTPError as exc:
         logger.exception("Anthropic LLM call failed")
-        raise LLMError(str(exc)) from exc
+        retryable = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+        raise LLMError(str(exc), code="transport_error", retryable=retryable) from exc
     finally:
         if owns_client:
             client.close()
 
     try:
         parts = data["content"]
-        return "".join(part.get("text", "") for part in parts if part.get("type") == "text")
+        if not isinstance(parts, list):
+            raise TypeError("content is not a list")
+        return "".join(
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
     except (KeyError, TypeError) as exc:
-        raise LLMError(f"无法解析 Anthropic 响应: {data}") from exc
+        raise LLMError(f"无法解析 Anthropic 响应: {data}", code="provider_response") from exc
+
+
+def _response_format_unsupported(response: Any) -> bool:
+    if int(getattr(response, "status_code", 0)) != 400:
+        return False
+    text = _response_body_excerpt(response).lower()
+    mentions_format = "response_format" in text or "json_object" in text
+    unsupported = any(
+        marker in text
+        for marker in {"not supported", "unsupported", "unknown parameter", "unrecognized"}
+    )
+    return mentions_format and unsupported
+
+
+def _response_body_excerpt(response: Any, limit: int = 500) -> str:
+    try:
+        text = str(response.text or "")
+    except Exception:
+        text = ""
+    if not text:
+        try:
+            text = json.dumps(response.json(), ensure_ascii=False)
+        except Exception:
+            text = ""
+    cleaned = " ".join(text.split())
+    return cleaned[:limit]
+
+
+def _raise_for_http_status(provider: str, response: Any) -> None:
+    status_code = int(getattr(response, "status_code", 0))
+    if status_code < 400:
+        return
+    retryable = status_code in {408, 425, 429} or status_code >= 500
+    raise LLMHTTPError(
+        provider,
+        status_code,
+        _response_body_excerpt(response),
+        retryable=retryable,
+    )
+
+
+def _response_json(provider: str, response: Any) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise LLMError(f"{provider} 响应不是合法 JSON", code="provider_response") from exc
+    if not isinstance(data, dict):
+        raise LLMError(f"{provider} 响应必须是 JSON object", code="provider_response")
+    return data

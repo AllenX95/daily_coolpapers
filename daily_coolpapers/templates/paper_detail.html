@@ -1,11 +1,17 @@
 {% extends "base.html" %}
 {% block title %}{{ paper.title }}{% endblock %}
 {% block content %}
+<div class="paper-detail-page">
 <section class="detail-head">
   <div>
     <h1>{{ paper.title }}</h1>
     <p class="muted">{{ paper.authors_list|join(", ") }}</p>
     <p class="muted mono">{{ paper.arxiv_id }} · {{ paper.published_at or "" }}</p>
+    {% if paper.subjects_list %}
+      <div class="tag-list detail-subjects">
+        {% for subject in paper.subjects_list %}<span>{{ subject }}</span>{% endfor %}
+      </div>
+    {% endif %}
   </div>
   <div class="detail-actions">
     <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">打开 PDF</a>
@@ -32,6 +38,7 @@
     <h2>操作</h2>
     {% for action in evaluation_actions %}
       <form method="post" action="{{ action.action_url }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="from_detail" value="1">
         <label>{{ action.title }}
           <select name="prompt_id">
@@ -121,14 +128,47 @@
         <span class="muted">{{ evaluation.created_at }} · {{ evaluation.prompt_label }} · {{ evaluation.profile_label }}</span>
       </header>
       {% if evaluation.has_result %}
-        <pre>{{ evaluation.result_json|json_pretty }}</pre>
+        {% set result = evaluation.result_json %}
+        <div class="evaluation-summary">
+          {% if result.score is defined or result.attention %}
+            <div>
+              {% if result.score is defined %}<span class="score compact">{{ result.score }}</span>{% endif %}
+              {% if result.attention %}<span class="badge {{ result.attention }}">{{ result.attention }}</span>{% endif %}
+            </div>
+          {% endif %}
+          {% if result.summary_zh or result.one_sentence_summary or result.detailed_summary_zh %}
+            <p>{{ result.summary_zh or result.one_sentence_summary or result.detailed_summary_zh }}</p>
+          {% endif %}
+          {% if result.core_idea %}<p><strong>核心思路：</strong>{{ result.core_idea }}</p>{% endif %}
+          {% if result.tags %}
+            <div class="tag-list">
+              {% for tag in result.tags %}<span>{{ tag }}</span>{% endfor %}
+            </div>
+          {% endif %}
+        </div>
+        <details class="raw-result">
+          <summary>查看原始数据</summary>
+          <pre>{{ result|json_pretty }}</pre>
+        </details>
+        {% if evaluation.raw_output %}
+          <details class="raw-result">
+            <summary>查看模型原始输出</summary>
+            <pre>{{ evaluation.raw_output }}</pre>
+          </details>
+        {% endif %}
       {% else %}
         <p class="danger">{{ evaluation.error_message or "无结构化结果" }}</p>
-        {% if evaluation.raw_output %}<pre>{{ evaluation.raw_output }}</pre>{% endif %}
+        {% if evaluation.raw_output %}
+          <details class="raw-result">
+            <summary>查看原始输出</summary>
+            <pre>{{ evaluation.raw_output }}</pre>
+          </details>
+        {% endif %}
       {% endif %}
     </article>
   {% else %}
     <p class="empty">暂无评估结果。</p>
   {% endfor %}
 </section>
+</div>
 {% endblock %}

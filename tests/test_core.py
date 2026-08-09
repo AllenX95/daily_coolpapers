@@ -567,7 +567,11 @@ class CoreTests(unittest.TestCase):
             patch.object(services.db, "get_default_prompt") as get_default_prompt,
             patch.object(services.db, "get_llm_profile") as get_profile,
             patch.object(services.db, "get_default_llm_profile") as get_default_profile,
-            patch.object(services, "call_llm", return_value=LLMResponse("{}", {"score": 77})),
+            patch.object(
+                services,
+                "call_llm",
+                return_value=LLMResponse("{}", {"score": 77, "attention": "read"}),
+            ),
             patch.object(services.db, "create_evaluation", return_value=123) as create_evaluation,
         ):
             result = services.EvaluationRunner(config=config).evaluate(
@@ -763,7 +767,11 @@ class CoreTests(unittest.TestCase):
 
                 with (
                     patch.object(services, "ensure_markdown", return_value=(md_path, False)),
-                    patch.object(services, "call_llm", return_value=LLMResponse("{}", {"score": 77})),
+                    patch.object(
+                        services,
+                        "call_llm",
+                        return_value=LLMResponse("{}", {"score": 77, "attention": "read"}),
+                    ),
                     patch.object(services, "render_prompt", wraps=render_prompt) as render_mock,
                 ):
                     result = services.evaluate_paper(paper_id, "fulltext_review")
@@ -975,9 +983,9 @@ class CoreTests(unittest.TestCase):
                     )
 
                 prompts = db.list_prompts()
-                self.assertEqual(len(prompts), 1)
-                self.assertEqual(prompts[0]["llm_profile_name"], "My Profile")
-                self.assertEqual(prompts[0]["llm_model"], "model-x")
+                prompt = next(item for item in prompts if item["name"] == "Prompt")
+                self.assertEqual(prompt["llm_profile_name"], "My Profile")
+                self.assertEqual(prompt["llm_model"], "model-x")
 
     def test_list_evaluations_hydrates_from_llm_profiles_db(self):
         with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:

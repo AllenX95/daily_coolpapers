@@ -4,6 +4,7 @@
 <section>
   <h1>类目管理</h1>
   <form method="post" action="{{ url_for('save_category') }}" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="category" placeholder="cs.AI" required>
     <input name="name" placeholder="Artificial Intelligence" required>
     <input name="top_n" type="number" min="1" max="200" value="30">
@@ -19,6 +20,7 @@
       {% for category in categories %}
         <tr>
           <form method="post" action="{{ url_for('save_category') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="id" value="{{ category.id }}">
             <td><input name="category" value="{{ category.category }}"></td>
             <td><input name="name" value="{{ category.name }}"></td>

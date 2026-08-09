@@ -12,7 +12,7 @@ import httpx
 from . import db
 from .crawler import available_arxiv_dates_after, crawl_date_from_papers, fetch_category, latest_available_arxiv_date
 from .fulltext import ensure_markdown
-from .llm import LLMError, call_llm, make_llm_client
+from .llm import LLMError, LLMResultError, call_llm, make_llm_client, validate_evaluation_result
 from .network import httpx_proxy_kwargs
 from .prompt_engine import estimate_tokens, render_prompt
 
@@ -754,18 +754,27 @@ class EvaluationRunner:
     def evaluate(self, request: EvaluationRequest) -> dict[str, Any]:
         paper = self._load_paper(request.paper_id)
         config = self._resolve_config(request)
-        prompt_text = self._build_prompt_text(request, paper, config)
-
+        response = None
+        phase = "preparation"
         try:
+            prompt_text = self._build_prompt_text(request, paper, config)
+            phase = "provider"
             response = call_llm(config.profile, prompt_text, client=self._llm_client)
+            phase = "validation"
+            if response.result_json is None:
+                raise LLMResultError("invalid_json", "LLM 输出不是合法 JSON object")
+            result = validate_evaluation_result(response.result_json, request.evaluation_type)
         except Exception as exc:
-            self._record_failure(request, config, raw_output=None, error_message=str(exc))
+            error_code, retryable = _evaluation_failure(exc, phase)
+            self._record_failure(
+                request,
+                config,
+                raw_output=response.raw_text if response else None,
+                error_message=str(exc),
+                error_code=error_code,
+                error_retryable=retryable,
+            )
             raise
-
-        if response.result_json is None:
-            message = "LLM 输出不是合法 JSON"
-            self._record_failure(request, config, raw_output=response.raw_text, error_message=message)
-            raise LLMError(message)
 
         eval_id = db.create_evaluation(
             request.paper_id,
@@ -775,11 +784,11 @@ class EvaluationRunner:
             config.profile_id,
             config.model,
             "success",
-            response.result_json,
+            result,
             response.raw_text,
             None,
         )
-        return {"evaluation_id": eval_id, "result": response.result_json}
+        return {"evaluation_id": eval_id, "result": result}
 
     def _load_paper(self, paper_id: int) -> dict[str, Any]:
         paper = db.get_paper(paper_id)
@@ -832,6 +841,8 @@ class EvaluationRunner:
         config: EvaluationConfig,
         raw_output: str | None,
         error_message: str,
+        error_code: str,
+        error_retryable: bool,
     ) -> int:
         return db.create_evaluation(
             request.paper_id,
@@ -844,6 +855,8 @@ class EvaluationRunner:
             None,
             raw_output,
             error_message,
+            error_code,
+            error_retryable,
         )
 
 def evaluate_paper(
@@ -859,6 +872,15 @@ def evaluate_paper(
         force_markdown=force_markdown,
     )
     return EvaluationRunner().evaluate(request)
+
+
+def _evaluation_failure(exc: Exception, phase: str) -> tuple[str, bool]:
+    if phase == "validation" or isinstance(exc, LLMResultError):
+        return "invalid_response", False
+    if phase == "provider":
+        return "provider_failed", bool(getattr(exc, "retryable", False))
+    retryable = isinstance(exc, (OSError, RuntimeError, httpx.HTTPError))
+    return "preparation_failed", retryable
 
 
 def paper_variables(paper: dict[str, Any]) -> dict[str, Any]:

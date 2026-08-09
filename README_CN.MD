@@ -118,6 +118,7 @@ daily_coolpapers/
 ├── security.py         # API key 加密（DPAPI / Fernet）
 ├── jobs.py             # 后台任务队列和定时调度
 ├── cache_manager.py    # PDF/Markdown 缓存和清理
+├── abstract_audit.py   # 历史摘要污染的只读审计与 dry-run 建议
 ├── config.py           # 路径、默认设置和默认类目
 ├── static/             # CSS
 └── templates/          # Jinja2 HTML 模板
@@ -156,6 +157,24 @@ API key 在静态存储时加密；界面中只显示掩码，不会写入日志
 - `llm.abstract_concurrency` — 摘要评估时的并行 LLM 调用数。
 - `cache.pdf_retention_days` / `cache.markdown_retention_days` — 自动清理保留天数。
 - `scheduler.enabled` / `scheduler.daily_times` — 每日自动抓取时间。
+
+---
+
+## 历史 Abstract 只读审计
+
+本地启发式扫描不会修改数据库，也不会创建不存在的数据库文件：
+
+```bash
+python -B -m daily_coolpapers.abstract_audit --limit 200
+```
+
+指定其他现有 SQLite 文件并输出 JSON：
+
+```bash
+python -B -m daily_coolpapers.abstract_audit --db path/to/database.sqlite3 --limit 1000 --json
+```
+
+显式加入 `--verify-arxiv` 后，工具会从 `export.arxiv.org` 获取候选论文的权威摘要并生成 dry-run 替换建议。该工具没有 `--apply` 参数；无论是否联网复核，都不会更新历史数据。
 
 ---
 

@@ -3,7 +3,8 @@
 {% block content %}
 <section>
   <h1>缓存与调度设置</h1>
-  <form method="post" action="{{ url_for('save_settings') }}" class="form-grid">
+  <form method="post" action="{{ url_for('save_settings') }}" class="form-grid settings-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>PDF 保留天数 <input name="pdf_retention_days" type="number" min="0" value="{{ settings.pdf_retention_days }}"></label>
     <label>Markdown 保留天数 <input name="markdown_retention_days" type="number" min="0" value="{{ settings.markdown_retention_days }}"></label>
     <label>摘要评估并发数 <input name="abstract_concurrency" type="number" min="1" max="20" value="{{ settings.abstract_concurrency }}"></label>
@@ -19,24 +20,27 @@
     <button type="submit">保存设置</button>
   </form>
   <form method="post" action="{{ url_for('run_cleanup') }}" class="inline-actions">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit">立即清理缓存</button>
   </form>
 </section>
 <section>
   <h2>最近任务</h2>
-  <table>
-    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>创建</th><th>消息</th></tr></thead>
-    <tbody>
-      {% for job in jobs %}
-        <tr>
-          <td>#{{ job.id }}</td>
-          <td>{{ job.type_label }}</td>
-          <td><span class="badge {{ job.status }}">{{ job.status_label }}</span></td>
-          <td>{{ job.created_at }}</td>
-          <td>{{ job.message }}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>创建</th><th>消息</th></tr></thead>
+      <tbody>
+        {% for job in jobs %}
+          <tr>
+            <td>#{{ job.id }}</td>
+            <td>{{ job.type_label }}</td>
+            <td><span class="badge {{ job.status }}">{{ job.status_label }}</span></td>
+            <td>{{ job.created_at }}</td>
+            <td>{{ job.message }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 {% endblock %}

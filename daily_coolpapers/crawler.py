@@ -1,5 +1,6 @@
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
@@ -66,6 +67,12 @@ class CrawledPaper:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class _PaperBlock:
+    text: str
+    items: tuple[str, ...] = ()
 
 
 def build_category_url(
@@ -196,11 +203,11 @@ def _parse_heading_block(heading: Tag, source_url: str) -> CrawledPaper | None:
     kimi_clicks = _extract_label_count(heading_text, "Kimi")
     reading_stars = pdf_clicks + kimi_clicks
 
-    lines = _block_lines_until_next_heading(heading)
-    authors = _extract_list_line(lines, "Authors")
-    subjects = _extract_list_line(lines, "Subjects")
-    published_at = _extract_value_line(lines, "Publish")
-    abstract = _extract_abstract(lines)
+    blocks = _blocks_until_next_heading(heading)
+    authors = _extract_metadata_items(blocks, "authors")
+    subjects = _extract_metadata_items(blocks, "subjects")
+    published_at = _extract_metadata_value(blocks, "publish")
+    abstract = _extract_abstract(blocks)
 
     return CrawledPaper(
         arxiv_id=arxiv_id,
@@ -306,52 +313,115 @@ def _extract_label_count(text: str, label: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _block_lines_until_next_heading(heading: Tag) -> list[str]:
-    lines: list[str] = []
+def _blocks_until_next_heading(heading: Tag) -> list[_PaperBlock]:
+    blocks: list[_PaperBlock] = []
     for sibling in heading.next_siblings:
         if isinstance(sibling, Tag) and sibling.name == "h2":
             break
         if isinstance(sibling, Tag):
-            text = sibling.get_text("\n", strip=True)
+            leaf_blocks = [
+                child
+                for child in sibling.find_all(["p", "li", "div", "section", "article"])
+                if not child.find(["p", "li", "div", "section", "article"], recursive=False)
+            ]
+            elements = leaf_blocks or [sibling]
+            for element in elements:
+                text = _clean_text(element.get_text(" ", strip=True))
+                if not text:
+                    continue
+                links = tuple(
+                    link_text
+                    for link in element.find_all("a")
+                    if (link_text := _clean_text(link.get_text(" ", strip=True)))
+                )
+                spans = tuple(
+                    span_text
+                    for span in element.find_all("span")
+                    if not span.find("span")
+                    and (span_text := _clean_text(span.get_text(" ", strip=True)))
+                    and span_text != text
+                )
+                blocks.append(_PaperBlock(text, links or spans))
         else:
-            text = str(sibling).strip()
-        for line in text.splitlines():
-            cleaned = re.sub(r"\s+", " ", line).strip()
-            if cleaned:
-                lines.append(cleaned)
-    return lines
+            text = _clean_text(str(sibling))
+            if text:
+                blocks.append(_PaperBlock(text))
+    return blocks
 
 
-def _extract_value_line(lines: list[str], label: str) -> str | None:
-    prefix = label.lower()
-    for line in lines:
-        if line.lower().startswith(prefix):
-            return line.split(":", 1)[1].strip() if ":" in line else line[len(label) :].strip()
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip()
+
+
+_METADATA_LABELS = {
+    "authors": re.compile(r"^(?:authors?|author\s*\(s\))\s*(?::|：|$)\s*", re.I),
+    "subjects": re.compile(r"^(?:subjects?|categories)\s*(?::|：|$)\s*", re.I),
+    "publish": re.compile(r"^(?:publish|published)\s*(?::|：|$)\s*", re.I),
+    "abstract": re.compile(r"^(?:abstract|abs)\s*(?::|：|$)\s*", re.I),
+}
+
+
+def _labeled_value(block: _PaperBlock, kind: str) -> str | None:
+    match = _METADATA_LABELS[kind].match(block.text)
+    return block.text[match.end() :].strip() if match else None
+
+
+def _extract_metadata_value(blocks: list[_PaperBlock], kind: str) -> str | None:
+    for block in blocks:
+        value = _labeled_value(block, kind)
+        if value is not None:
+            return value
     return None
 
 
-def _extract_list_line(lines: list[str], label: str) -> list[str]:
-    value = _extract_value_line(lines, label)
-    if not value:
-        return []
-    return [item.strip() for item in re.split(r",|;|\|", value) if item.strip()]
+def _extract_metadata_items(blocks: list[_PaperBlock], kind: str) -> list[str]:
+    for block in blocks:
+        value = _labeled_value(block, kind)
+        if value is None:
+            continue
+        structured_items: list[str] = []
+        for item in block.items:
+            item_value = _labeled_value(_PaperBlock(item), kind)
+            if item_value is not None:
+                if item_value:
+                    structured_items.extend(_split_metadata_items(item_value))
+                continue
+            structured_items.append(item)
+        if structured_items:
+            return list(dict.fromkeys(structured_items))
+        return _split_metadata_items(value)
+    return []
 
 
-def _extract_abstract(lines: list[str]) -> str:
+def _split_metadata_items(value: str) -> list[str]:
+    return [
+            item.strip()
+            for item in re.split(r",|，|;|；|\|", value)
+            if item.strip()
+        ]
+
+
+def _extract_abstract(blocks: list[_PaperBlock]) -> str:
     abstract_lines: list[str] = []
-    skipped_authors = False
-    for line in lines:
-        lower = line.lower()
-        if lower.startswith("authors"):
-            skipped_authors = True
+    authors_seen = False
+    abstract_closed = False
+    for block in blocks:
+        if _labeled_value(block, "authors") is not None:
+            authors_seen = True
             continue
-        if lower.startswith("subjects") or lower.startswith("publish"):
+        if (
+            _labeled_value(block, "subjects") is not None
+            or _labeled_value(block, "publish") is not None
+        ):
+            abstract_closed = True
             continue
-        if lower.startswith("abs") and ":" in line:
-            abstract_lines.append(line.split(":", 1)[1].strip())
+        explicit_abstract = _labeled_value(block, "abstract")
+        if explicit_abstract is not None:
+            if explicit_abstract:
+                abstract_lines.append(explicit_abstract)
             continue
-        if skipped_authors:
-            abstract_lines.append(line)
+        if authors_seen and not abstract_closed:
+            abstract_lines.append(block.text)
     return " ".join(abstract_lines).strip()
 
 

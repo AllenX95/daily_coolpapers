@@ -4,6 +4,7 @@
 <section>
   <h1>Prompt 管理</h1>
   <form method="post" action="{{ url_for('save_prompt') }}" class="prompt-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="form-row">
       <input name="name" placeholder="Prompt 名称" required>
       <select name="type">
@@ -34,6 +35,7 @@
         <span class="muted">v{{ prompt.version }} · {{ "默认" if prompt.is_default else "非默认" }} · {{ prompt.llm_profile_name or "默认模型" }}</span>
       </summary>
       <form method="post" action="{{ url_for('save_prompt') }}" class="prompt-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="id" value="{{ prompt.id }}">
         <div class="form-row">
           <input name="name" value="{{ prompt.name }}" required>
@@ -54,6 +56,7 @@
         <textarea name="template" rows="18" required>{{ prompt.template }}</textarea>
       </form>
       <form method="post" action="{{ url_for('copy_prompt', prompt_id=prompt.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="secondary" type="submit">复制 Prompt</button>
       </form>
     </details>

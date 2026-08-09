@@ -1,5 +1,8 @@
 import os
+import tempfile
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -54,12 +57,80 @@ def _renderable_evaluation_results():
 class AppSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["DAILY_COOLPAPERS_DISABLE_WORKER"] = "1"
-        os.environ["DAILY_COOLPAPERS_DISABLE_SHUTDOWN"] = "1"
-        from daily_coolpapers.app import create_app
+        from daily_coolpapers import app as app_module
+        from daily_coolpapers import cache_manager, config, db, llm, logging_setup, security
+        from daily_coolpapers.security import SecretStore
 
-        cls.app = create_app()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.runtime_root = Path(cls._tmp.name)
+        instance_dir = cls.runtime_root / "instance"
+        data_dir = cls.runtime_root / "data"
+        cache_dir = cls.runtime_root / "cache"
+        pdf_cache_dir = cache_dir / "pdf"
+        markdown_cache_dir = cache_dir / "markdown"
+        log_dir = cls.runtime_root / "logs"
+        current_log = log_dir / "current.log"
+        db_path = data_dir / "daily_coolpapers.sqlite3"
+        llm_profiles_db_path = instance_dir / "llm_profiles.sqlite3"
+
+        cls._patches = ExitStack()
+        cls.addClassCleanup(cls._patches.close)
+        cls._patches.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "DAILY_COOLPAPERS_DISABLE_WORKER": "1",
+                    "DAILY_COOLPAPERS_DISABLE_SHUTDOWN": "1",
+                },
+            )
+        )
+        for module, name, value in [
+            (config, "INSTANCE_DIR", instance_dir),
+            (config, "DATA_DIR", data_dir),
+            (config, "CACHE_DIR", cache_dir),
+            (config, "PDF_CACHE_DIR", pdf_cache_dir),
+            (config, "MARKDOWN_CACHE_DIR", markdown_cache_dir),
+            (config, "LOG_DIR", log_dir),
+            (config, "CURRENT_LOG", current_log),
+            (config, "DB_PATH", db_path),
+            (config, "LLM_PROFILES_DB_PATH", llm_profiles_db_path),
+            (db, "DB_PATH", db_path),
+            (db, "LLM_PROFILES_DB_PATH", llm_profiles_db_path),
+            (cache_manager, "PDF_CACHE_DIR", pdf_cache_dir),
+            (cache_manager, "MARKDOWN_CACHE_DIR", markdown_cache_dir),
+            (logging_setup, "CURRENT_LOG", current_log),
+            (app_module, "INSTANCE_DIR", instance_dir),
+            (app_module, "CURRENT_LOG", current_log),
+        ]:
+            cls._patches.enter_context(patch.object(module, name, value))
+        secret_store = SecretStore(instance_dir / "fernet.key")
+        cls._patches.enter_context(patch.object(app_module, "secret_store", secret_store))
+        cls._patches.enter_context(patch.object(llm, "secret_store", secret_store))
+        cls._patches.enter_context(patch.object(security, "secret_store", secret_store))
+        cls._patches.enter_context(patch.object(app_module, "setup_logging", return_value=None))
+
+        cls.runtime = app_module.start_runtime(start_worker=False)
+        cls.addClassCleanup(cls.runtime.stop)
+        cls.app = app_module.create_app()
         cls.app.config.update(TESTING=True)
+
+    def test_runtime_state_is_isolated(self):
+        from daily_coolpapers import app as app_module
+        from daily_coolpapers import cache_manager, db
+
+        self.assertTrue(db.DB_PATH.is_relative_to(self.runtime_root))
+        self.assertTrue(db.LLM_PROFILES_DB_PATH.is_relative_to(self.runtime_root))
+        self.assertTrue(cache_manager.PDF_CACHE_DIR.is_relative_to(self.runtime_root))
+        self.assertTrue(cache_manager.MARKDOWN_CACHE_DIR.is_relative_to(self.runtime_root))
+        self.assertTrue(app_module.secret_store.key_path.is_relative_to(self.runtime_root))
+        self.assertTrue(db.DB_PATH.exists())
+        self.assertTrue(db.LLM_PROFILES_DB_PATH.exists())
+
+    def csrf_data(self, client, path="/"):
+        client.get(path)
+        with client.session_transaction() as flask_session:
+            return {"csrf_token": flask_session["_csrf_token"]}
 
     def test_index_loads(self):
         client = self.app.test_client()
@@ -109,19 +180,27 @@ class AppSmokeTests(unittest.TestCase):
         from daily_coolpapers import db
 
         client = self.app.test_client()
-        with patch("daily_coolpapers.app.db.list_paper_rows", return_value=[]) as list_rows:
+        empty_page = {
+            "items": [],
+            "page": 1,
+            "page_size": 50,
+            "total": 0,
+            "pages": 0,
+            "has_previous": False,
+            "has_next": False,
+        }
+        with patch("daily_coolpapers.app.db.list_paper_page", return_value=empty_page) as list_page:
             response = client.get(
                 "/?date_from=20990102&date_to=2099.01.01&category=%20cs.AI%20&attention=read&sort=bad-sort"
             )
 
         self.assertEqual(response.status_code, 200)
-        query = list_rows.call_args.args[0]
-        self.assertIsInstance(query, db.PaperDigestQuery)
-        self.assertEqual(query.date_from, "2099-01-01")
-        self.assertEqual(query.date_to, "2099-01-02")
-        self.assertEqual(query.category, "cs.AI")
-        self.assertEqual(query.attention, "read")
-        self.assertEqual(query.sort, "rank")
+        page_args = list_page.call_args.kwargs
+        self.assertEqual(page_args["date_from"], "2099-01-01")
+        self.assertEqual(page_args["date_to"], "2099-01-02")
+        self.assertEqual(page_args["category"], "cs.AI")
+        self.assertEqual(page_args["attention"], "read")
+        self.assertEqual(page_args["sort"], "rank")
 
         with patch("daily_coolpapers.app.db.list_paper_rows", return_value=[]) as list_rows:
             response = client.get("/export.csv?date=20990103&sort=stars_desc")
@@ -155,6 +234,32 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("llm_trust_env_proxy".encode(), response.data)
         self.assertIn("pdf_download_timeout_seconds".encode(), response.data)
         self.assertIn("pdf_download_retries".encode(), response.data)
+
+    def test_settings_reject_invalid_range_without_write(self):
+        client = self.app.test_client()
+        data = self.csrf_data(client, "/settings")
+        data["abstract_concurrency"] = "21"
+        with patch("daily_coolpapers.app.db.save_settings") as save_settings:
+            response = client.post("/api/settings", data=data)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("abstract_concurrency".encode(), response.data)
+        save_settings.assert_not_called()
+
+    def test_llm_profile_rejects_non_object_headers(self):
+        client = self.app.test_client()
+        data = {
+            **self.csrf_data(client, "/llm-profiles"),
+            "name": "Test",
+            "provider": "openai_compatible",
+            "base_url": "https://example.test/v1",
+            "model": "model-x",
+            "custom_headers": "[]",
+        }
+        with patch("daily_coolpapers.app.db.save_llm_profile") as save_profile:
+            response = client.post("/api/llm-profiles", data=data)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["errors"]["custom_headers"], "必须是 JSON object")
+        save_profile.assert_not_called()
 
     def test_settings_and_logs_use_job_status_payloads(self):
         client = self.app.test_client()
@@ -311,6 +416,7 @@ class AppSmokeTests(unittest.TestCase):
         from daily_coolpapers import services
 
         client = self.app.test_client()
+        csrf_data = self.csrf_data(client)
         config = services.EvaluationConfig(
             evaluation_type="abstract_review",
             prompt={"id": 44, "version": 2, "template": "Title: {{ title }}", "enabled": 1},
@@ -322,7 +428,7 @@ class AppSmokeTests(unittest.TestCase):
         ):
             response = client.post(
                 "/api/papers/7/evaluate-abstract",
-                data={"prompt_id": "44", "from_detail": "1"},
+                data={**csrf_data, "prompt_id": "44", "from_detail": "1"},
             )
 
         self.assertEqual(response.status_code, 302)
@@ -335,14 +441,23 @@ class AppSmokeTests(unittest.TestCase):
         ):
             response = client.post(
                 "/api/papers/7/evaluate-fulltext",
-                data={"prompt_id": "44", "force_markdown": "1", "from_detail": "1"},
+                data={
+                    **csrf_data,
+                    "prompt_id": "44",
+                    "force_markdown": "1",
+                    "from_detail": "1",
+                },
             )
 
         self.assertEqual(response.status_code, 302)
         enqueue.assert_not_called()
     def test_prompt_model_binding_save(self):
         client = self.app.test_client()
-        response = client.post("/api/prompt-model-bindings", follow_redirects=True)
+        response = client.post(
+            "/api/prompt-model-bindings",
+            data=self.csrf_data(client, "/llm-profiles"),
+            follow_redirects=True,
+        )
         self.assertEqual(response.status_code, 200)
         self.assertIn("Prompt 模型绑定已保存".encode("utf-8"), response.data)
 
@@ -373,7 +488,7 @@ class AppSmokeTests(unittest.TestCase):
             response = client.get("/api/jobs/progress")
 
         self.assertEqual(response.status_code, 200)
-        reconcile.assert_not_called()
+        reconcile.assert_called_once_with(min_interval_seconds=30)
         list_progress.assert_called_once_with(12)
         data = response.get_json()
         self.assertEqual(len(data["jobs"]), 1)
@@ -387,13 +502,14 @@ class AppSmokeTests(unittest.TestCase):
 
     def test_split_crawl_and_eval_routes_enqueue(self):
         client = self.app.test_client()
+        csrf_data = self.csrf_data(client)
         with patch("daily_coolpapers.app.job_runner.enqueue", return_value=999) as enqueue:
             for path, text in [
                 ("/api/crawl/run", "metadata 抓取任务"),
                 ("/api/crawl/catch-up", "metadata 补抓到最新任务"),
                 ("/api/abstract-evaluations/run", "摘要评估任务"),
             ]:
-                response = client.post(path, follow_redirects=True)
+                response = client.post(path, data=csrf_data, follow_redirects=True)
                 self.assertEqual(response.status_code, 200, path)
                 self.assertIn(text.encode("utf-8"), response.data)
             self.assertEqual(enqueue.call_count, 3)
@@ -408,9 +524,44 @@ class AppSmokeTests(unittest.TestCase):
 
     def test_shutdown_page_loads_without_exiting_in_tests(self):
         client = self.app.test_client()
-        response = client.post("/api/shutdown")
+        response = client.post("/api/shutdown", data=self.csrf_data(client))
         self.assertEqual(response.status_code, 200)
         self.assertIn("服务正在退出".encode("utf-8"), response.data)
+
+    def test_post_without_csrf_token_is_rejected_before_enqueue(self):
+        client = self.app.test_client()
+        with patch("daily_coolpapers.app.job_runner.enqueue") as enqueue:
+            response = client.post("/api/crawl/run")
+        self.assertEqual(response.status_code, 403)
+        enqueue.assert_not_called()
+
+    def test_cross_origin_post_is_rejected(self):
+        client = self.app.test_client()
+        with patch("daily_coolpapers.app.job_runner.enqueue") as enqueue:
+            response = client.post(
+                "/api/crawl/run",
+                data=self.csrf_data(client),
+                headers={"Origin": "https://evil.example"},
+            )
+        self.assertEqual(response.status_code, 403)
+        enqueue.assert_not_called()
+
+    def test_back_redirect_rejects_external_referrer(self):
+        from daily_coolpapers.app import _back_to_detail_or_index
+
+        with self.app.test_request_context(
+            "/api/papers/1/evaluate-abstract",
+            method="POST",
+            headers={"Referer": "https://evil.example/landing"},
+        ):
+            self.assertEqual(_back_to_detail_or_index(1), "/")
+
+    def test_session_cookie_uses_lax_samesite(self):
+        client = self.app.test_client()
+        response = client.get("/")
+        cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
+import hmac
 import json
 import logging
 import os
+import secrets
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from flask import (
     Flask,
@@ -14,16 +18,29 @@ from flask import (
     render_template,
     request,
     send_file,
+    session,
     url_for,
 )
 
 from . import db
 from .cache_manager import cleanup_caches, has_markdown, has_pdf, markdown_path, pdf_path
 from .config import CURRENT_LOG, INSTANCE_DIR, ensure_directories
-from .jobs import job_runner
+from .form_commands import (
+    SETTINGS_DEFAULTS,
+    FormValidationError,
+    SettingsCommand,
+    parse_bool,
+    parse_choice,
+    parse_float,
+    parse_int,
+    parse_json_object,
+    parse_optional_int,
+    parse_required_text,
+)
+from .jobs import JobRunner, job_runner
 from .llm import test_profile
 from .logging_setup import setup_logging
-from .security import secret_store
+from .security import SecretStore, secret_store
 from .services import (
     build_paper_digest_csv,
     build_paper_evaluation_export,
@@ -36,23 +53,57 @@ from .services import (
 logger = logging.getLogger(__name__)
 
 
-def create_app() -> Flask:
+@dataclass
+class RuntimeHandle:
+    runner: JobRunner
+    worker_started: bool
+
+    def stop(self) -> None:
+        if self.worker_started:
+            self.runner.stop()
+            self.worker_started = False
+
+
+def start_runtime(
+    runner: JobRunner | None = None,
+    start_worker: bool | None = None,
+) -> RuntimeHandle:
+    runtime_runner = runner or job_runner
     ensure_directories()
-    setup_logging(clear_on_start=True)
     db.init_db()
     db.init_llm_profiles_db()
     db.migrate_llm_profiles_from_main_db()
     db.mark_unfinished_jobs_interrupted()
-    app = Flask(__name__)
-    app.secret_key = _flask_secret()
-
+    setup_logging(clear_on_start=db.get_bool_setting("logs.clear_on_start", True))
     if db.get_bool_setting("cache.cleanup_on_start", True):
         cleanup_caches()
-    if os.environ.get("DAILY_COOLPAPERS_DISABLE_WORKER") != "1":
-        job_runner.start()
+    if start_worker is None:
+        start_worker = os.environ.get("DAILY_COOLPAPERS_DISABLE_WORKER") != "1"
+    if start_worker:
+        runtime_runner.start()
+    return RuntimeHandle(runtime_runner, bool(start_worker))
+
+
+def create_app(
+    runner: JobRunner | None = None,
+    store: SecretStore | None = None,
+    secret_key: str | None = None,
+) -> Flask:
+    app = Flask(__name__)
+    app.secret_key = secret_key or secrets.token_hex(32)
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.extensions["daily_coolpapers.job_runner"] = runner or job_runner
+    app.extensions["daily_coolpapers.secret_store"] = store or secret_store
 
     register_template_helpers(app)
+    register_request_security(app)
     register_routes(app)
+
+    @app.errorhandler(FormValidationError)
+    def handle_form_validation(error: FormValidationError):
+        return {"errors": error.errors}, 400
+
     return app
 
 
@@ -64,6 +115,10 @@ def _flask_secret() -> str:
 
 
 def register_template_helpers(app: Flask) -> None:
+    @app.template_global()
+    def csrf_token() -> str:
+        return _csrf_token()
+
     @app.template_filter("json_pretty")
     def json_pretty(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2)
@@ -94,12 +149,41 @@ def register_template_helpers(app: Flask) -> None:
         return has_markdown(arxiv_id)
 
 
+def register_request_security(app: Flask) -> None:
+    @app.before_request
+    def protect_state_changes():
+        if request.method != "POST":
+            return None
+        expected = session.get("_csrf_token")
+        provided = request.form.get("csrf_token")
+        if not expected or not provided or not hmac.compare_digest(str(expected), str(provided)):
+            abort(403)
+        source = request.headers.get("Origin") or request.headers.get("Referer")
+        if source and not _same_origin(source):
+            abort(403)
+        return None
+
+
 def register_routes(app: Flask) -> None:
+    runtime_runner: JobRunner = app.extensions["daily_coolpapers.job_runner"]
+    runtime_secret_store: SecretStore = app.extensions["daily_coolpapers.secret_store"]
+
     @app.get("/")
     def index():
-        job_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
+        runtime_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
         digest_query = _paper_digest_query_from_request()
-        papers = db.list_paper_rows(digest_query)
+        page_number = _query_int(request.args.get("page"), 1, 1)
+        page_size = _query_int(request.args.get("page_size"), 50, 1, 100)
+        paper_page = db.list_paper_page(
+            crawl_date=digest_query.selected_date or None,
+            date_from=digest_query.date_from or None,
+            date_to=digest_query.date_to or None,
+            category=digest_query.category or None,
+            attention=digest_query.attention or None,
+            sort=digest_query.sort,
+            page=page_number,
+            page_size=page_size,
+        )
         jobs = _job_status_payloads(db.list_job_summaries(12))
         active_jobs = [job for job in jobs if job["status"] in {"pending", "running"}]
         progress_jobs = active_jobs
@@ -107,7 +191,8 @@ def register_routes(app: Flask) -> None:
             progress_jobs = [jobs[0]]
         return render_template(
             "index.html",
-            papers=papers,
+            papers=paper_page["items"],
+            paper_page=paper_page,
             categories=db.list_categories(),
             digest_query=digest_query,
             selected_date=digest_query.selected_date,
@@ -118,8 +203,12 @@ def register_routes(app: Flask) -> None:
             attention=digest_query.attention,
             sort=digest_query.sort,
             export_csv_url=url_for("export_csv", **digest_query.url_args()),
-            rank_sort_url=url_for("index", **digest_query.url_args(sort="rank_desc")),
-            stars_sort_url=url_for("index", **digest_query.url_args(sort="stars_desc")),
+            rank_sort_url=url_for(
+                "index", **digest_query.url_args(sort="rank_desc"), page_size=page_size
+            ),
+            stars_sort_url=url_for(
+                "index", **digest_query.url_args(sort="stars_desc"), page_size=page_size
+            ),
             jobs=jobs[:8],
             has_active_jobs=bool(active_jobs),
             progress_jobs=progress_jobs,
@@ -161,41 +250,44 @@ def register_routes(app: Flask) -> None:
 
     @app.post("/api/crawl/run")
     def run_crawl():
-        category_ids = [int(item) for item in request.form.getlist("category_ids") if item]
+        category_ids = [parse_int(item, "category_ids", minimum=1) for item in request.form.getlist("category_ids") if item]
         payload: dict[str, Any] = {}
         if category_ids:
             payload["category_ids"] = category_ids
-        job_id = job_runner.enqueue("crawl", payload)
+        job_id = runtime_runner.enqueue("crawl", payload)
         flash(f"已创建 metadata 抓取任务 #{job_id}")
         return redirect(url_for("index"))
 
     @app.post("/api/crawl/catch-up")
     def run_crawl_catch_up():
-        category_ids = [int(item) for item in request.form.getlist("category_ids") if item]
+        category_ids = [parse_int(item, "category_ids", minimum=1) for item in request.form.getlist("category_ids") if item]
         payload: dict[str, Any] = {}
         if category_ids:
             payload["category_ids"] = category_ids
-        job_id = job_runner.enqueue("crawl_catch_up", payload)
+        job_id = runtime_runner.enqueue("crawl_catch_up", payload)
         flash(f"已创建 metadata 补抓到最新任务 #{job_id}")
         return redirect(url_for("index"))
 
     @app.post("/api/abstract-evaluations/run")
     def run_abstract_evaluations():
-        job_id = job_runner.enqueue("abstract_eval", {})
+        job_id = runtime_runner.enqueue("abstract_eval", {})
         flash(f"已创建摘要评估任务 #{job_id}")
         return redirect(url_for("index"))
 
     @app.post("/api/papers/<int:paper_id>/evaluate-abstract")
     def evaluate_abstract(paper_id: int):
-        job_id = _enqueue_paper_evaluation(paper_id, "abstract_review", "abstract_eval")
+        job_id = _enqueue_paper_evaluation(
+            runtime_runner, paper_id, "abstract_review", "abstract_eval"
+        )
         if job_id:
             flash(f"已创建摘要评估任务 #{job_id}")
         return redirect(_back_to_detail_or_index(paper_id))
 
     @app.post("/api/papers/<int:paper_id>/evaluate-fulltext")
     def evaluate_fulltext(paper_id: int):
-        force_markdown = bool(request.form.get("force_markdown"))
+        force_markdown = parse_bool(request.form.get("force_markdown"), "force_markdown")
         job_id = _enqueue_paper_evaluation(
+            runtime_runner,
             paper_id,
             "fulltext_review",
             "fulltext_eval",
@@ -230,7 +322,7 @@ def register_routes(app: Flask) -> None:
             flash("论文不存在")
             return redirect(url_for("index"))
         path = markdown_path(paper["arxiv_id"])
-        if not path.exists():
+        if not has_markdown(paper["arxiv_id"]):
             flash("Markdown 缓存不存在，请先触发全文阅读")
             return redirect(url_for("paper_detail", paper_id=paper_id))
         return render_template("markdown_view.html", paper=paper, markdown=path.read_text(encoding="utf-8"))
@@ -242,7 +334,7 @@ def register_routes(app: Flask) -> None:
             flash("论文不存在")
             return redirect(url_for("index"))
         path = pdf_path(paper["arxiv_id"])
-        if path.exists():
+        if has_pdf(paper["arxiv_id"]):
             return send_file(path, mimetype="application/pdf", as_attachment=False)
         if paper.get("pdf_url"):
             return redirect(paper["pdf_url"])
@@ -280,10 +372,10 @@ def register_routes(app: Flask) -> None:
     def save_category():
         data = {
             "id": _optional_int(request.form.get("id")),
-            "category": request.form["category"].strip(),
-            "name": request.form["name"].strip(),
-            "enabled": bool(request.form.get("enabled")),
-            "top_n": request.form.get("top_n") or 30,
+            "category": parse_required_text(request.form.get("category"), "category"),
+            "name": parse_required_text(request.form.get("name"), "name"),
+            "enabled": parse_bool(request.form.get("enabled"), "enabled"),
+            "top_n": parse_int(request.form.get("top_n"), "top_n", default=30, minimum=1, maximum=200),
             "sort_param": request.form.get("sort_param") or "sort=1",
         }
         db.save_category(data)
@@ -300,14 +392,19 @@ def register_routes(app: Flask) -> None:
 
     @app.post("/api/prompts")
     def save_prompt():
+        prompt_type = parse_choice(
+            request.form.get("type"),
+            "type",
+            {"abstract_review", "fulltext_review"},
+        )
         data = {
             "id": _optional_int(request.form.get("id")),
-            "name": request.form["name"].strip(),
-            "type": request.form["type"],
-            "template": request.form["template"],
+            "name": parse_required_text(request.form.get("name"), "name"),
+            "type": prompt_type,
+            "template": parse_required_text(request.form.get("template"), "template"),
             "llm_profile_id": _optional_int(request.form.get("llm_profile_id")),
-            "is_default": bool(request.form.get("is_default")),
-            "enabled": bool(request.form.get("enabled")),
+            "is_default": parse_bool(request.form.get("is_default"), "is_default"),
+            "enabled": parse_bool(request.form.get("enabled"), "enabled"),
         }
         db.save_prompt(data)
         flash("Prompt 已保存")
@@ -330,7 +427,7 @@ def register_routes(app: Flask) -> None:
     def llm_profiles():
         profiles = db.list_llm_profiles()
         for profile in profiles:
-            profile["api_key_masked"] = secret_store.masked(profile.get("encrypted_api_key_ref"))
+            profile["api_key_masked"] = runtime_secret_store.masked(profile.get("encrypted_api_key_ref"))
         return render_template(
             "llm_profiles.html",
             profiles=profiles,
@@ -339,25 +436,30 @@ def register_routes(app: Flask) -> None:
 
     @app.post("/api/llm-profiles")
     def save_llm_profile():
+        provider = parse_choice(
+            request.form.get("provider"),
+            "provider",
+            {"openai_compatible", "anthropic"},
+        )
         encrypted = None
         api_key = request.form.get("api_key", "").strip()
         if api_key:
-            encrypted = secret_store.encrypt(api_key)
+            encrypted = runtime_secret_store.encrypt(api_key)
         data = {
             "id": _optional_int(request.form.get("id")),
-            "name": request.form["name"].strip(),
-            "provider": request.form["provider"],
-            "base_url": request.form["base_url"].strip().rstrip("/"),
-            "model": request.form["model"].strip(),
+            "name": parse_required_text(request.form.get("name"), "name"),
+            "provider": provider,
+            "base_url": parse_required_text(request.form.get("base_url"), "base_url").rstrip("/"),
+            "model": parse_required_text(request.form.get("model"), "model"),
             "encrypted_api_key_ref": encrypted,
             "custom_headers": _valid_json_or_empty(request.form.get("custom_headers")),
-            "temperature": request.form.get("temperature") or 0.2,
-            "max_output_tokens": request.form.get("max_output_tokens") or 2000,
-            "context_window_tokens": request.form.get("context_window_tokens") or 128000,
-            "timeout_seconds": request.form.get("timeout_seconds") or 120,
-            "enabled": bool(request.form.get("enabled")),
-            "is_default_abstract": bool(request.form.get("is_default_abstract")),
-            "is_default_fulltext": bool(request.form.get("is_default_fulltext")),
+            "temperature": parse_float(request.form.get("temperature"), "temperature", default=0.2, minimum=0),
+            "max_output_tokens": parse_int(request.form.get("max_output_tokens"), "max_output_tokens", default=2000, minimum=1),
+            "context_window_tokens": parse_int(request.form.get("context_window_tokens"), "context_window_tokens", default=128000, minimum=0),
+            "timeout_seconds": parse_int(request.form.get("timeout_seconds"), "timeout_seconds", default=120, minimum=1),
+            "enabled": parse_bool(request.form.get("enabled"), "enabled"),
+            "is_default_abstract": parse_bool(request.form.get("is_default_abstract"), "is_default_abstract"),
+            "is_default_fulltext": parse_bool(request.form.get("is_default_fulltext"), "is_default_fulltext"),
         }
         db.save_llm_profile(data)
         flash("LLM Profile 已保存")
@@ -389,43 +491,28 @@ def register_routes(app: Flask) -> None:
     def settings():
         return render_template(
             "settings.html",
-            settings={
-                "pdf_retention_days": db.get_int_setting("cache.pdf_retention_days", 5),
-                "markdown_retention_days": db.get_int_setting("cache.markdown_retention_days", 7),
-                "cleanup_on_start": db.get_bool_setting("cache.cleanup_on_start", True),
-                "cleanup_daily": db.get_bool_setting("cache.cleanup_daily", True),
-                "abstract_concurrency": db.get_int_setting("llm.abstract_concurrency", 4),
-                "crawler_trust_env_proxy": db.get_bool_setting("crawler.trust_env_proxy", False),
-                "crawler_proxy_url": db.get_setting("crawler.proxy_url", ""),
-                "llm_trust_env_proxy": db.get_bool_setting("llm.trust_env_proxy", False),
-                "pdf_download_timeout_seconds": db.get_int_setting("llm.pdf_download_timeout_seconds", 300),
-                "pdf_download_retries": db.get_int_setting("llm.pdf_download_retries", 2),
-                "scheduler_enabled": db.get_bool_setting("scheduler.enabled", True),
-                "scheduler_daily_times": db.get_setting("scheduler.daily_times", "10:30,12:00"),
-            },
+            settings=_settings_form_values(),
             jobs=_job_status_payloads(db.list_job_summaries(30)),
         )
 
     @app.post("/api/settings")
     def save_settings():
-        db.set_setting("cache.pdf_retention_days", int(request.form.get("pdf_retention_days") or 5))
-        db.set_setting("cache.markdown_retention_days", int(request.form.get("markdown_retention_days") or 7))
-        db.set_setting("cache.cleanup_on_start", bool(request.form.get("cleanup_on_start")))
-        db.set_setting("cache.cleanup_daily", bool(request.form.get("cleanup_daily")))
-        db.set_setting("llm.abstract_concurrency", int(request.form.get("abstract_concurrency") or 4))
-        db.set_setting("crawler.trust_env_proxy", bool(request.form.get("crawler_trust_env_proxy")))
-        db.set_setting("crawler.proxy_url", (request.form.get("crawler_proxy_url") or "").strip())
-        db.set_setting("llm.trust_env_proxy", bool(request.form.get("llm_trust_env_proxy")))
-        db.set_setting("llm.pdf_download_timeout_seconds", int(request.form.get("pdf_download_timeout_seconds") or 300))
-        db.set_setting("llm.pdf_download_retries", int(request.form.get("pdf_download_retries") or 2))
-        db.set_setting("scheduler.enabled", bool(request.form.get("scheduler_enabled")))
-        db.set_setting("scheduler.daily_times", request.form.get("scheduler_daily_times") or "10:30,12:00")
+        try:
+            command = SettingsCommand.from_form(request.form)
+        except FormValidationError as exc:
+            flash(f"设置未保存：{exc}")
+            return render_template(
+                "settings.html",
+                settings=_settings_form_values(),
+                jobs=_job_status_payloads(db.list_job_summaries(30)),
+            ), 400
+        db.save_settings(command.values)
         flash("设置已保存")
         return redirect(url_for("settings"))
 
     @app.post("/api/cache/cleanup")
     def run_cleanup():
-        job_id = job_runner.enqueue("cleanup", {})
+        job_id = runtime_runner.enqueue("cleanup", {})
         flash(f"已创建缓存清理任务 #{job_id}")
         return redirect(url_for("settings"))
 
@@ -441,6 +528,7 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/api/jobs/progress")
     def jobs_progress():
+        runtime_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
         jobs = _job_status_payloads(db.list_active_job_progress(12))
         return {
             "jobs": jobs
@@ -448,9 +536,7 @@ def register_routes(app: Flask) -> None:
 
 
 def _optional_int(value: str | None) -> int | None:
-    if value in {None, "", "None"}:
-        return None
-    return int(value)
+    return parse_optional_int(value, "id")
 
 
 def _paper_digest_query_from_request() -> db.PaperDigestQuery:
@@ -465,11 +551,84 @@ def _paper_digest_query_from_request() -> db.PaperDigestQuery:
     )
 
 
+def _query_int(
+    value: str | None,
+    default: int,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    try:
+        parsed = int(value) if value not in {None, ""} else default
+    except (TypeError, ValueError):
+        return default
+    parsed = max(minimum, parsed)
+    return min(parsed, maximum) if maximum is not None else parsed
+
+
 def _valid_json_or_empty(value: str | None) -> str:
-    if not value or not value.strip():
-        return "{}"
-    json.loads(value)
-    return value
+    return parse_json_object(value, "custom_headers")
+
+
+def _settings_form_values() -> dict[str, Any]:
+    values = db.get_settings(SETTINGS_DEFAULTS)
+    return {
+        "pdf_retention_days": _safe_setting_int(values, "cache.pdf_retention_days", 5, minimum=0),
+        "markdown_retention_days": _safe_setting_int(values, "cache.markdown_retention_days", 7, minimum=0),
+        "cleanup_on_start": _safe_setting_bool(values, "cache.cleanup_on_start", True),
+        "cleanup_daily": _safe_setting_bool(values, "cache.cleanup_daily", True),
+        "abstract_concurrency": _safe_setting_int(
+            values,
+            "llm.abstract_concurrency",
+            4,
+            minimum=1,
+            maximum=20,
+        ),
+        "crawler_trust_env_proxy": _safe_setting_bool(values, "crawler.trust_env_proxy", False),
+        "crawler_proxy_url": str(values.get("crawler.proxy_url") or ""),
+        "llm_trust_env_proxy": _safe_setting_bool(values, "llm.trust_env_proxy", False),
+        "pdf_download_timeout_seconds": _safe_setting_int(
+            values,
+            "llm.pdf_download_timeout_seconds",
+            300,
+            minimum=30,
+        ),
+        "pdf_download_retries": _safe_setting_int(
+            values,
+            "llm.pdf_download_retries",
+            2,
+            minimum=0,
+            maximum=5,
+        ),
+        "scheduler_enabled": _safe_setting_bool(values, "scheduler.enabled", True),
+        "scheduler_daily_times": str(values.get("scheduler.daily_times") or "10:30,12:00"),
+    }
+
+
+def _safe_setting_int(
+    values: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    try:
+        return parse_int(
+            values.get(key),
+            key,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+        )
+    except FormValidationError:
+        return default
+
+
+def _safe_setting_bool(values: dict[str, Any], key: str, default: bool) -> bool:
+    try:
+        return parse_bool(values.get(key), key)
+    except FormValidationError:
+        return default
 
 
 def _delayed_shutdown(shutdown_func: Any) -> None:
@@ -485,7 +644,49 @@ def _delayed_shutdown(shutdown_func: Any) -> None:
 def _back_to_detail_or_index(paper_id: int) -> str:
     if request.form.get("from_detail"):
         return url_for("paper_detail", paper_id=paper_id)
-    return request.referrer or url_for("index")
+    return _safe_local_redirect(request.referrer) or url_for("index")
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return str(token)
+
+
+def _origin_tuple(url: str) -> tuple[str, str, int | None] | None:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if not scheme or not hostname:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, hostname, port
+
+
+def _same_origin(url: str) -> bool:
+    return _origin_tuple(url) == _origin_tuple(request.host_url)
+
+
+def _safe_local_redirect(candidate: str | None) -> str | None:
+    if not candidate or "\\" in candidate or any(ord(char) < 32 for char in candidate):
+        return None
+    if candidate.startswith("//"):
+        return None
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc:
+        if not _same_origin(candidate):
+            return None
+        return urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
+    if not parsed.path.startswith("/"):
+        return None
+    return urlunsplit(("", "", parsed.path, parsed.query, parsed.fragment))
 
 
 def _paper_evaluation_actions(paper_id: int) -> list[dict[str, Any]]:
@@ -510,6 +711,7 @@ def _paper_evaluation_actions(paper_id: int) -> list[dict[str, Any]]:
 
 
 def _enqueue_paper_evaluation(
+    runner: JobRunner,
     paper_id: int,
     evaluation_type: str,
     job_type: str,
@@ -528,7 +730,7 @@ def _enqueue_paper_evaluation(
     }
     if force_markdown:
         payload["force_markdown"] = True
-    return job_runner.enqueue(job_type, payload)
+    return runner.enqueue(job_type, payload)
 
 
 def _job_type_label(job_type: str | None) -> str:
