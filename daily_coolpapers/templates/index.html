@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 {% block title %}论文 - Daily Cool Papers{% endblock %}
 {% block content %}
+<section class="page-hero">
+  <div>
+    <span class="eyebrow">Research intelligence</span>
+    <h1>论文情报台</h1>
+    <p>聚合每日前沿研究，用本地模型工作流完成筛选、评估与深度阅读。</p>
+  </div>
+  <div class="hero-signal"><span></span>Local workspace</div>
+</section>
 <section class="toolbar">
   <form method="get" class="filters toolbar-primary">
     <input type="hidden" name="page_size" value="{{ paper_page.page_size }}">
