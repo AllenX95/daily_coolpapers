@@ -12,10 +12,17 @@
 <section>
   <h2>任务状态</h2>
   <table>
-    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>开始</th><th>结束</th><th>错误</th></tr></thead>
+    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>开始</th><th>结束</th><th>消息</th></tr></thead>
     <tbody>
       {% for job in jobs %}
-        <tr><td>#{{ job.id }}</td><td>{{ job.type }}</td><td>{{ job.status }}</td><td>{{ job.started_at or "" }}</td><td>{{ job.finished_at or "" }}</td><td>{{ job.error_message or "" }}</td></tr>
+        <tr>
+          <td>#{{ job.id }}</td>
+          <td>{{ job.type_label }}</td>
+          <td><span class="badge {{ job.status }}">{{ job.status_label }}</span></td>
+          <td>{{ job.started_at or "" }}</td>
+          <td>{{ job.finished_at or "" }}</td>
+          <td>{{ job.message }}</td>
+        </tr>
       {% endfor %}
     </tbody>
   </table>

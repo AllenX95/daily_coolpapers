@@ -8,19 +8,27 @@ from daily_coolpapers.llm import LLMError
 
 
 class EvaluationOutcomeTests(unittest.TestCase):
-    def _inputs(self):
+    def _inputs(self, evaluation_type):
         paper = {"id": 1, "title": "Paper", "subjects_list": [], "abstract": "A"}
-        prompt = {"id": 2, "version": 1, "template": "{{ markdown }}", "llm_profile_id": 3}
+        prompt = {
+            "id": 2,
+            "version": 1,
+            "type": evaluation_type,
+            "template": "{{ markdown }}",
+            "llm_profile_id": 3,
+            "enabled": 1,
+        }
         profile = {
             "id": 3,
             "model": "model-x",
+            "enabled": 1,
             "context_window_tokens": 1000,
             "max_output_tokens": 100,
         }
         return paper, prompt, profile
 
     def test_fulltext_preparation_failure_is_recorded_once(self):
-        paper, prompt, profile = self._inputs()
+        paper, prompt, profile = self._inputs("fulltext_review")
         with (
             patch.object(services.db, "get_paper", return_value=paper),
             patch.object(services.db, "get_default_prompt", return_value=prompt),
@@ -41,7 +49,7 @@ class EvaluationOutcomeTests(unittest.TestCase):
         call_llm.assert_not_called()
 
     def test_provider_failure_keeps_retryable_classification(self):
-        paper, prompt, profile = self._inputs()
+        paper, prompt, profile = self._inputs("abstract_review")
         prompt["template"] = "{{ title }}"
         with (
             patch.object(services.db, "get_paper", return_value=paper),

@@ -36,33 +36,23 @@
   </div>
   <aside class="side-panel">
     <h2>操作</h2>
-    <form method="post" action="{{ url_for('evaluate_abstract', paper_id=paper.id) }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="from_detail" value="1">
-      <label>摘要 Prompt
-        <select name="prompt_id">
-          <option value="">默认</option>
-          {% for prompt in abstract_prompts %}
-            <option value="{{ prompt.id }}">{{ prompt.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <button type="submit">重新摘要评估</button>
-    </form>
-    <form method="post" action="{{ url_for('evaluate_fulltext', paper_id=paper.id) }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="from_detail" value="1">
-      <label>全文 Prompt
-        <select name="prompt_id">
-          <option value="">默认</option>
-          {% for prompt in fulltext_prompts %}
-            <option value="{{ prompt.id }}">{{ prompt.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="check"><input type="checkbox" name="force_markdown" value="1"> 重新生成 Markdown</label>
-      <button type="submit">全文阅读</button>
-    </form>
+    {% for action in evaluation_actions %}
+      <form method="post" action="{{ action.action_url }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="from_detail" value="1">
+        <label>{{ action.title }}
+          <select name="prompt_id">
+            {% for option in action.prompt_options %}
+              <option value="{{ option.value }}" {% if option.disabled %}disabled{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        {% if action.force_markdown %}
+          <label class="check"><input type="checkbox" name="force_markdown" value="1"> 重新生成 Markdown</label>
+        {% endif %}
+        <button type="submit">{{ action.button_label }}</button>
+      </form>
+    {% endfor %}
     <div class="cache-state">
       <div>PDF 缓存：{{ "存在" if has_pdf else "无" }}</div>
       <div>Markdown 缓存：{{ "存在" if has_markdown else "无" }}</div>
@@ -75,71 +65,45 @@
 
 <section id="fulltext-result" class="result-panel">
   <h2>全文评估结果</h2>
-  {% set fulltext = latest_successful_fulltext_eval %}
-  {% set last_attempt = latest_fulltext_eval %}
+  {% set fulltext = evaluation_results.latest_successful_fulltext %}
+  {% set latest_failure = evaluation_results.latest_fulltext_failure %}
   {% if fulltext %}
-    {% set result = fulltext.result %}
     <div class="result-head">
       <div>
-        <div class="score">{{ latest_score(fulltext) }}</div>
-        <div class="badge {{ latest_attention(fulltext) }}">{{ latest_attention(fulltext) }}</div>
+        <div class="score">{{ fulltext.score_text }}</div>
+        <div class="badge {{ fulltext.attention }}">{{ fulltext.attention }}</div>
       </div>
-      <div class="muted small">成功时间：{{ fulltext.created_at }} · {{ fulltext.model or "" }}</div>
+      <div class="muted small">成功时间：{{ fulltext.created_at }} · {{ fulltext.profile_label }}</div>
     </div>
-    {% if last_attempt and last_attempt.status == "failed" and last_attempt.id != fulltext.id %}
-      <p class="danger small">最新一次全文任务失败：{{ last_attempt.error_message }}</p>
+    {% if latest_failure %}
+      <p class="danger small">最新一次全文任务失败：{{ latest_failure.error_message }}</p>
     {% endif %}
-    <p class="result-lead">{{ result.one_sentence_summary or "" }}</p>
+    <p class="result-lead">{{ fulltext.one_sentence_summary }}</p>
     <div class="result-grid">
-      {% if result.detailed_summary_zh %}
+      {% for section in fulltext.sections %}
         <section>
-          <h3>详细总结</h3>
-          <p>{{ result.detailed_summary_zh }}</p>
+          <h3>{{ section.title }}</h3>
+          <p>{{ section.body }}</p>
         </section>
-      {% endif %}
-      {% if result.problem %}
-        <section>
-          <h3>问题</h3>
-          <p>{{ result.problem }}</p>
-        </section>
-      {% endif %}
-      {% if result.method %}
-        <section>
-          <h3>方法</h3>
-          <p>{{ result.method }}</p>
-        </section>
-      {% endif %}
-      {% if result.novelty_assessment %}
-        <section>
-          <h3>新颖性</h3>
-          <p>{{ result.novelty_assessment }}</p>
-        </section>
-      {% endif %}
-      {% if result.recommended_action %}
-        <section>
-          <h3>建议动作</h3>
-          <p>{{ result.recommended_action }}</p>
-        </section>
-      {% endif %}
-      {% set vc = result.vc_perspective %}
-      {% if vc %}
+      {% endfor %}
+      {% if fulltext.vc.has_content %}
         <section>
           <h3>VC 视角</h3>
-          {% if vc.impact %}<p>{{ vc.impact }}</p>{% endif %}
-          {% if vc.market_relevance %}<p class="small muted">Market relevance：{{ vc.market_relevance }}</p>{% endif %}
-          {% if vc.commercialization_path %}<p>{{ vc.commercialization_path }}</p>{% endif %}
-          {% if vc.startup_opportunities %}
+          {% if fulltext.vc.impact %}<p>{{ fulltext.vc.impact }}</p>{% endif %}
+          {% if fulltext.vc.market_relevance %}<p class="small muted">Market relevance：{{ fulltext.vc.market_relevance }}</p>{% endif %}
+          {% if fulltext.vc.commercialization_path %}<p>{{ fulltext.vc.commercialization_path }}</p>{% endif %}
+          {% if fulltext.vc.startup_opportunities %}
             <h4>创业机会</h4>
             <ul>
-              {% for item in vc.startup_opportunities %}
+              {% for item in fulltext.vc.startup_opportunities %}
                 <li>{{ item }}</li>
               {% endfor %}
             </ul>
           {% endif %}
-          {% if vc.investment_risks %}
+          {% if fulltext.vc.investment_risks %}
             <h4>投资风险</h4>
             <ul>
-              {% for item in vc.investment_risks %}
+              {% for item in fulltext.vc.investment_risks %}
                 <li>{{ item }}</li>
               {% endfor %}
             </ul>
@@ -147,8 +111,8 @@
         </section>
       {% endif %}
     </div>
-  {% elif last_attempt and last_attempt.status == "failed" %}
-    <p class="danger">{{ last_attempt.error_message or "全文评估失败" }}</p>
+  {% elif latest_failure %}
+    <p class="danger">{{ latest_failure.error_message or "全文评估失败" }}</p>
   {% else %}
     <p class="empty">还没有成功的全文评估。点击右侧“全文阅读”后会显示在这里。</p>
   {% endif %}
@@ -156,15 +120,15 @@
 
 <section id="evaluations">
   <h2>评估历史</h2>
-  {% for evaluation in evaluations %}
+  {% for evaluation in evaluation_results.history %}
     <article class="eval-block">
       <header>
-        <strong>{{ "摘要评估" if evaluation.evaluation_type == "abstract_review" else ("全文评估" if evaluation.evaluation_type == "fulltext_review" else evaluation.evaluation_type) }}</strong>
-        <span class="badge {{ evaluation.status }}">{{ "成功" if evaluation.status == "success" else ("失败" if evaluation.status == "failed" else evaluation.status) }}</span>
-        <span class="muted">{{ evaluation.created_at }} · {{ evaluation.prompt_name or "Prompt 已删除" }} · {{ evaluation.model or "" }}</span>
+        <strong>{{ evaluation.type_label }}</strong>
+        <span class="badge {{ evaluation.status }}">{{ evaluation.status_label }}</span>
+        <span class="muted">{{ evaluation.created_at }} · {{ evaluation.prompt_label }} · {{ evaluation.profile_label }}</span>
       </header>
-      {% if evaluation.result_json is not none %}
-        {% set result = evaluation.result %}
+      {% if evaluation.has_result %}
+        {% set result = evaluation.result_json %}
         <div class="evaluation-summary">
           {% if result.score is defined or result.attention %}
             <div>

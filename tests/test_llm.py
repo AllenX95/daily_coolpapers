@@ -150,8 +150,15 @@ class LLMContractTests(unittest.TestCase):
             "subjects_list": [],
             "abstract": "Abstract",
         }
-        prompt = {"id": 2, "version": 1, "template": "{{title}}", "llm_profile_id": 3}
-        profile = {"id": 3, "model": "model-x"}
+        prompt = {
+            "id": 2,
+            "version": 1,
+            "type": "abstract_review",
+            "template": "{{title}}",
+            "llm_profile_id": 3,
+            "enabled": 1,
+        }
+        profile = {"id": 3, "model": "model-x", "enabled": 1}
 
         with (
             patch.object(services.db, "get_paper", return_value=paper),
