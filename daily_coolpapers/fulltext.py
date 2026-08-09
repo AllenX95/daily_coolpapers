@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pdfminer.high_level import extract_text
 
-from .cache_manager import download_pdf, markdown_path, touch
+from .cache_manager import atomic_write_text, cache_lock, download_pdf, has_markdown, markdown_path, touch
 from .db import get_int_setting
 
 logger = logging.getLogger(__name__)
@@ -11,24 +11,25 @@ logger = logging.getLogger(__name__)
 
 def ensure_markdown(paper: dict, force: bool = False) -> tuple[Path, bool]:
     arxiv_id = paper["arxiv_id"]
-    md_path = markdown_path(arxiv_id)
-    if md_path.exists() and not force:
-        touch(md_path)
-        return md_path, False
+    with cache_lock(arxiv_id):
+        md_path = markdown_path(arxiv_id)
+        if not force and has_markdown(arxiv_id):
+            touch(md_path)
+            return md_path, False
 
-    pdf_url = paper.get("pdf_url")
-    if not pdf_url:
-        raise ValueError("论文没有 PDF URL")
+        pdf_url = paper.get("pdf_url")
+        if not pdf_url:
+            raise ValueError("论文没有 PDF URL")
 
-    pdf = download_pdf(
-        arxiv_id,
-        pdf_url,
-        timeout_seconds=get_int_setting("llm.pdf_download_timeout_seconds", 120),
-        retries=get_int_setting("llm.pdf_download_retries", 2),
-    )
-    markdown = convert_pdf_to_markdown(pdf)
-    md_path.write_text(markdown, encoding="utf-8")
-    return md_path, True
+        pdf = download_pdf(
+            arxiv_id,
+            pdf_url,
+            timeout_seconds=get_int_setting("llm.pdf_download_timeout_seconds", 120),
+            retries=get_int_setting("llm.pdf_download_retries", 2),
+        )
+        markdown = convert_pdf_to_markdown(pdf)
+        atomic_write_text(md_path, markdown)
+        return md_path, True
 
 
 def convert_pdf_to_markdown(pdf_path: Path) -> str:

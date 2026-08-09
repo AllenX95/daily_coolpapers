@@ -8,7 +8,7 @@ import httpx
 from . import db
 from .crawler import available_arxiv_dates_after, crawl_date_from_papers, fetch_category, latest_available_arxiv_date
 from .fulltext import ensure_markdown
-from .llm import LLMError, call_llm, make_llm_client
+from .llm import LLMError, LLMResultError, call_llm, make_llm_client, validate_evaluation_result
 from .network import httpx_proxy_kwargs
 from .prompt_engine import estimate_tokens, render_prompt
 
@@ -416,68 +416,70 @@ def evaluate_paper(
     if not profile:
         raise ValueError("没有可用 LLM Profile，请先在 LLM 配置页新增模型")
 
-    variables = paper_variables(paper)
-    prompt_text = ""
-    if evaluation_type == "fulltext_review":
-        md_path, _created = ensure_markdown(paper, force=force_markdown)
-        markdown = md_path.read_text(encoding="utf-8")
-        variables["markdown"] = markdown
-        prompt_text = render_prompt(prompt["template"], variables)
-        estimated = estimate_tokens(prompt_text)
-        context_window = int(profile.get("context_window_tokens") or 0)
-        max_output = int(profile.get("max_output_tokens") or 0)
-        if context_window and estimated + max_output > context_window:
-            raise ValueError(
-                f"全文约 {estimated} tokens，超过模型上下文可用范围 "
-                f"({context_window} - {max_output})。请切换长上下文模型。"
-            )
-
-    if not prompt_text:
-        prompt_text = render_prompt(prompt["template"], variables)
+    response = None
+    phase = "preparation"
     try:
+        variables = paper_variables(paper)
+        if evaluation_type == "fulltext_review":
+            md_path, _created = ensure_markdown(paper, force=force_markdown)
+            markdown = md_path.read_text(encoding="utf-8")
+            variables["markdown"] = markdown
+        prompt_text = render_prompt(prompt["template"], variables)
+        if evaluation_type == "fulltext_review":
+            estimated = estimate_tokens(prompt_text)
+            context_window = int(profile.get("context_window_tokens") or 0)
+            max_output = int(profile.get("max_output_tokens") or 0)
+            if context_window and estimated + max_output > context_window:
+                raise ValueError(
+                    f"全文约 {estimated} tokens，超过模型上下文可用范围 "
+                    f"({context_window} - {max_output})。请切换长上下文模型。"
+                )
+
+        phase = "provider"
         response = call_llm(profile, prompt_text, client=llm_client)
+        phase = "validation"
         if response.result_json is None:
-            db.create_evaluation(
-                paper_id,
-                evaluation_type,
-                prompt["id"],
-                prompt["version"],
-                profile["id"],
-                profile["model"],
-                "failed",
-                None,
-                response.raw_text,
-                "LLM 输出不是合法 JSON",
-            )
-            raise LLMError("LLM 输出不是合法 JSON")
-        eval_id = db.create_evaluation(
+            raise LLMResultError("invalid_json", "LLM 输出不是合法 JSON object")
+        result = validate_evaluation_result(response.result_json, evaluation_type)
+    except Exception as exc:
+        error_code, retryable = _evaluation_failure(exc, phase)
+        db.create_evaluation(
             paper_id,
             evaluation_type,
             prompt["id"],
             prompt["version"],
             profile["id"],
             profile["model"],
-            "success",
-            response.result_json,
-            response.raw_text,
+            "failed",
             None,
+            response.raw_text if response else None,
+            str(exc),
+            error_code,
+            retryable,
         )
-        return {"evaluation_id": eval_id, "result": response.result_json}
-    except Exception as exc:
-        if not isinstance(exc, LLMError) or str(exc) != "LLM 输出不是合法 JSON":
-            db.create_evaluation(
-                paper_id,
-                evaluation_type,
-                prompt["id"],
-                prompt["version"],
-                profile["id"],
-                profile["model"],
-                "failed",
-                None,
-                None,
-                str(exc),
-            )
         raise
+    eval_id = db.create_evaluation(
+        paper_id,
+        evaluation_type,
+        prompt["id"],
+        prompt["version"],
+        profile["id"],
+        profile["model"],
+        "success",
+        result,
+        response.raw_text,
+        None,
+    )
+    return {"evaluation_id": eval_id, "result": result}
+
+
+def _evaluation_failure(exc: Exception, phase: str) -> tuple[str, bool]:
+    if phase == "validation" or isinstance(exc, LLMResultError):
+        return "invalid_response", False
+    if phase == "provider":
+        return "provider_failed", bool(getattr(exc, "retryable", False))
+    retryable = isinstance(exc, (OSError, RuntimeError, httpx.HTTPError))
+    return "preparation_failed", retryable
 
 
 def paper_variables(paper: dict[str, Any]) -> dict[str, Any]:

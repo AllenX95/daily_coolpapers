@@ -29,10 +29,24 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path or DB_PATH, timeout=30, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.OperationalError:
-        conn.execute("PRAGMA journal_mode = DELETE")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def connect_readonly(path: Path | None = None) -> sqlite3.Connection:
+    target = (path or DB_PATH).resolve()
+    if not target.is_file():
+        raise FileNotFoundError(f"数据库不存在，拒绝创建只读审计目标: {target}")
+    uri = f"{target.as_uri()}?mode=ro"
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=30,
+        factory=ClosingConnection,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -41,11 +55,15 @@ def connect_llm_profiles(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path or LLM_PROFILES_DB_PATH, timeout=30, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def _configure_journal_mode(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
     except sqlite3.OperationalError:
         conn.execute("PRAGMA journal_mode = DELETE")
-    return conn
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -69,6 +87,7 @@ def init_db() -> None:
 
 def init_llm_profiles_db() -> None:
     with connect_llm_profiles() as conn:
+        _configure_journal_mode(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS llm_profiles (
@@ -100,18 +119,16 @@ def init_llm_profiles_db() -> None:
 
 
 def migrate_llm_profiles_from_main_db() -> None:
-    with connect() as main_conn:
-        row = main_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'llm_profiles'"
-        ).fetchone()
-        if not row:
-            return
-
-        profiles = main_conn.execute("SELECT * FROM llm_profiles").fetchall()
-
     init_llm_profiles_db()
+    with connect() as main_conn:
+        main_conn.execute("BEGIN IMMEDIATE")
+        source_exists = _table_exists(main_conn, "llm_profiles")
+        legacy_exists = _table_exists(main_conn, "llm_profiles_legacy")
+        if not source_exists:
+            return
+        if legacy_exists:
+            raise RuntimeError("LLM Profile 迁移冲突：源表和 legacy 表同时存在")
 
-    if profiles:
         columns = [
             "id", "name", "provider", "base_url", "model",
             "encrypted_api_key_ref", "custom_headers", "temperature",
@@ -119,20 +136,50 @@ def migrate_llm_profiles_from_main_db() -> None:
             "enabled", "is_default_abstract", "is_default_fulltext",
             "created_at", "updated_at",
         ]
-        placeholders = ",".join("?" for _ in columns)
-        with connect_llm_profiles() as llm_conn:
-            for profile in profiles:
-                llm_conn.execute(
-                    f"INSERT INTO llm_profiles({','.join(columns)}) VALUES ({placeholders})",
-                    tuple(profile[col] for col in columns),
+        profiles = main_conn.execute(
+            f"SELECT {','.join(columns)} FROM llm_profiles ORDER BY id"
+        ).fetchall()
+        if profiles:
+            placeholders = ",".join("?" for _ in columns)
+            updates = ",".join(f"{column}=excluded.{column}" for column in columns if column != "id")
+            expected = {
+                int(profile["id"]): tuple(profile[column] for column in columns)
+                for profile in profiles
+            }
+            with connect_llm_profiles() as llm_conn:
+                llm_conn.executemany(
+                    f"""
+                    INSERT INTO llm_profiles({','.join(columns)}) VALUES ({placeholders})
+                    ON CONFLICT(id) DO UPDATE SET {updates}
+                    """,
+                    [tuple(profile[column] for column in columns) for profile in profiles],
                 )
+                migrated = {
+                    int(row["id"]): tuple(row[column] for column in columns)
+                    for row in llm_conn.execute(
+                        f"SELECT {','.join(columns)} FROM llm_profiles",
+                    ).fetchall()
+                    if int(row["id"]) in expected
+                }
+            if migrated != expected:
+                raise RuntimeError("LLM Profile 迁移校验失败，源表保持不变")
+        _archive_legacy_llm_profiles(main_conn)
 
-    with connect() as main_conn:
-        main_conn.execute("ALTER TABLE llm_profiles RENAME TO llm_profiles_legacy")
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone() is not None
+
+
+def _archive_legacy_llm_profiles(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE llm_profiles RENAME TO llm_profiles_legacy")
 
 
 def _init_db_once() -> None:
     with connect() as conn:
+        _configure_journal_mode(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS categories (
@@ -199,6 +246,8 @@ def _init_db_once() -> None:
                 result_json TEXT,
                 raw_output TEXT,
                 error_message TEXT,
+                error_code TEXT,
+                error_retryable INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
 
@@ -230,15 +279,27 @@ def _init_db_once() -> None:
 
 
 def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    migrations = {
+    job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    job_migrations = {
         "progress_current": "ALTER TABLE jobs ADD COLUMN progress_current INTEGER NOT NULL DEFAULT 0",
         "progress_total": "ALTER TABLE jobs ADD COLUMN progress_total INTEGER NOT NULL DEFAULT 0",
         "progress_message": "ALTER TABLE jobs ADD COLUMN progress_message TEXT",
         "progress_details_json": "ALTER TABLE jobs ADD COLUMN progress_details_json TEXT",
     }
-    for column, sql in migrations.items():
-        if column not in columns:
+    for column, sql in job_migrations.items():
+        if column not in job_columns:
+            conn.execute(sql)
+    evaluation_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
+    }
+    evaluation_migrations = {
+        "error_code": "ALTER TABLE evaluations ADD COLUMN error_code TEXT",
+        "error_retryable": (
+            "ALTER TABLE evaluations ADD COLUMN error_retryable INTEGER NOT NULL DEFAULT 0"
+        ),
+    }
+    for column, sql in evaluation_migrations.items():
+        if column not in evaluation_columns:
             conn.execute(sql)
 
 
@@ -322,16 +383,50 @@ def get_setting(key: str, default: Any = None) -> Any:
 
 def set_setting(key: str, value: Any) -> None:
     with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO settings(key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (key, json.dumps(value, ensure_ascii=False), now_iso()),
-        )
+        _set_setting_with_conn(conn, key, value, now_iso())
+
+
+def save_settings(values: dict[str, Any]) -> None:
+    now = now_iso()
+    with connect() as conn:
+        for key, value in values.items():
+            _set_setting_with_conn(conn, key, value, now)
+
+
+def _set_setting_with_conn(
+    conn: sqlite3.Connection,
+    key: str,
+    value: Any,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (key, json.dumps(value, ensure_ascii=False), updated_at),
+    )
+
+
+def get_settings(defaults: dict[str, Any]) -> dict[str, Any]:
+    result = dict(defaults)
+    if not defaults:
+        return result
+    placeholders = ",".join("?" for _ in defaults)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            list(defaults),
+        ).fetchall()
+    for row in rows:
+        try:
+            result[row["key"]] = json.loads(row["value"])
+        except json.JSONDecodeError:
+            result[row["key"]] = row["value"]
+    return result
 
 
 def get_bool_setting(key: str, default: bool = False) -> bool:
@@ -413,83 +508,84 @@ def upsert_papers(papers: Iterable[dict[str, Any]], category: str, crawl_date: s
     if not paper_items:
         return []
     now = now_iso()
-    paper_ids: list[int] = []
+    paper_values = [_paper_upsert_values(paper, now) for paper in paper_items]
     with connect() as conn:
-        for paper in paper_items:
-            paper_ids.append(_upsert_paper_with_conn(conn, paper, category, crawl_date, now))
+        conn.executemany(
+            """
+            INSERT INTO papers(
+                arxiv_id, title, authors, abstract, subjects, published_at,
+                pdf_url, abs_url, papers_cool_url, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(arxiv_id) DO UPDATE SET
+                title = excluded.title,
+                authors = excluded.authors,
+                abstract = excluded.abstract,
+                subjects = excluded.subjects,
+                published_at = excluded.published_at,
+                pdf_url = excluded.pdf_url,
+                abs_url = excluded.abs_url,
+                papers_cool_url = excluded.papers_cool_url,
+                updated_at = excluded.updated_at
+            """,
+            paper_values,
+        )
+        ids_by_arxiv: dict[str, int] = {}
+        arxiv_ids = list(dict.fromkeys(str(paper["arxiv_id"]) for paper in paper_items))
+        for chunk_start in range(0, len(arxiv_ids), 500):
+            chunk = arxiv_ids[chunk_start : chunk_start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT id, arxiv_id FROM papers WHERE arxiv_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            ids_by_arxiv.update({str(row["arxiv_id"]): int(row["id"]) for row in rows})
+
+        paper_ids = [ids_by_arxiv[str(paper["arxiv_id"])] for paper in paper_items]
+        conn.executemany(
+            """
+            INSERT INTO paper_categories(
+                paper_id, category, crawl_date, rank, reading_stars,
+                pdf_clicks, kimi_clicks, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(paper_id, category, crawl_date) DO UPDATE SET
+                rank = excluded.rank,
+                reading_stars = excluded.reading_stars,
+                pdf_clicks = excluded.pdf_clicks,
+                kimi_clicks = excluded.kimi_clicks
+            """,
+            [
+                (
+                    paper_id,
+                    category,
+                    crawl_date,
+                    paper.get("rank"),
+                    int(paper.get("reading_stars") or 0),
+                    int(paper.get("pdf_clicks") or 0),
+                    int(paper.get("kimi_clicks") or 0),
+                    now,
+                )
+                for paper_id, paper in zip(paper_ids, paper_items)
+            ],
+        )
     return paper_ids
 
 
-def _upsert_paper_with_conn(
-    conn: sqlite3.Connection,
-    paper: dict[str, Any],
-    category: str,
-    crawl_date: str,
-    now: str,
-) -> int:
-    authors = paper.get("authors", [])
-    subjects = paper.get("subjects", [])
-    conn.execute(
-        """
-        INSERT INTO papers(
-            arxiv_id, title, authors, abstract, subjects, published_at,
-            pdf_url, abs_url, papers_cool_url, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(arxiv_id) DO UPDATE SET
-            title = excluded.title,
-            authors = excluded.authors,
-            abstract = excluded.abstract,
-            subjects = excluded.subjects,
-            published_at = excluded.published_at,
-            pdf_url = excluded.pdf_url,
-            abs_url = excluded.abs_url,
-            papers_cool_url = excluded.papers_cool_url,
-            updated_at = excluded.updated_at
-        """,
-        (
-            paper["arxiv_id"],
-            paper["title"],
-            json.dumps(authors, ensure_ascii=False),
-            paper.get("abstract", ""),
-            json.dumps(subjects, ensure_ascii=False),
-            paper.get("published_at"),
-            paper.get("pdf_url"),
-            paper.get("abs_url"),
-            paper.get("papers_cool_url"),
-            now,
-            now,
-        ),
+def _paper_upsert_values(paper: dict[str, Any], now: str) -> tuple[Any, ...]:
+    return (
+        paper["arxiv_id"],
+        paper["title"],
+        json.dumps(paper.get("authors", []), ensure_ascii=False),
+        paper.get("abstract", ""),
+        json.dumps(paper.get("subjects", []), ensure_ascii=False),
+        paper.get("published_at"),
+        paper.get("pdf_url"),
+        paper.get("abs_url"),
+        paper.get("papers_cool_url"),
+        now,
+        now,
     )
-    paper_id = conn.execute(
-        "SELECT id FROM papers WHERE arxiv_id = ?",
-        (paper["arxiv_id"],),
-    ).fetchone()["id"]
-    conn.execute(
-        """
-        INSERT INTO paper_categories(
-            paper_id, category, crawl_date, rank, reading_stars,
-            pdf_clicks, kimi_clicks, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(paper_id, category, crawl_date) DO UPDATE SET
-            rank = excluded.rank,
-            reading_stars = excluded.reading_stars,
-            pdf_clicks = excluded.pdf_clicks,
-            kimi_clicks = excluded.kimi_clicks
-        """,
-        (
-            paper_id,
-            category,
-            crawl_date,
-            paper.get("rank"),
-            int(paper.get("reading_stars") or 0),
-            int(paper.get("pdf_clicks") or 0),
-            int(paper.get("kimi_clicks") or 0),
-            now,
-        ),
-    )
-    return int(paper_id)
 
 
 def get_latest_crawl_date() -> str | None:
@@ -580,6 +676,213 @@ def list_paper_rows(
         success_only=True,
     )
 
+    hydrated = []
+    for row in rows:
+        paper_id = int(row["id"])
+        row["authors_list"] = loads_json(row.get("authors"), [])
+        row["subjects_list"] = loads_json(row.get("subjects"), [])
+        row["latest_abstract_eval"] = latest_abstract_evals.get(paper_id)
+        row["latest_fulltext_eval"] = latest_fulltext_evals.get(paper_id)
+        row["latest_successful_fulltext_eval"] = latest_successful_fulltext_evals.get(paper_id)
+        if attention:
+            result = row["latest_abstract_eval"] or {}
+            if ((result.get("result") or {}).get("attention") or "") != attention:
+                continue
+        hydrated.append(row)
+    return hydrated
+
+
+def list_paper_page(
+    crawl_date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    category: str | None = None,
+    attention: str | None = None,
+    sort: str = "rank",
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    """Return one stable page after paper/category rows have been deduplicated."""
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    use_date_range = bool(date_from or date_to)
+    crawl_date = None if use_date_range else (crawl_date or get_latest_crawl_date())
+    if not crawl_date and not use_date_range:
+        return _paper_page_result([], 0, page, page_size)
+
+    scope_sql, scope_params = _paper_scope_sql(crawl_date, date_from, date_to)
+    representative_order, final_order = _paper_page_sort_sql(sort)
+    filters: list[str] = ["rn = 1"]
+    filter_params: list[Any] = []
+    if category:
+        filters.append(
+            "EXISTS (SELECT 1 FROM scoped membership "
+            "WHERE membership.paper_id = ranked.paper_id AND membership.category = ?)"
+        )
+        filter_params.append(category)
+    if attention:
+        filters.append(
+            "CASE WHEN json_valid(latest_abstract.result_json) "
+            "THEN json_extract(latest_abstract.result_json, '$.attention') END = ?"
+        )
+        filter_params.append(attention)
+
+    candidate_ctes = f"""
+        WITH scoped AS (
+            SELECT pc.*, p.title, p.updated_at
+            FROM paper_categories pc
+            JOIN papers p ON p.id = pc.paper_id
+            WHERE {scope_sql}
+        ),
+        ranked AS (
+            SELECT
+                scoped.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY paper_id
+                    ORDER BY {representative_order}
+                ) AS rn
+            FROM scoped
+        ),
+        latest_abstract AS (
+            SELECT paper_id, result_json
+            FROM (
+                SELECT
+                    e.paper_id,
+                    e.result_json,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY e.paper_id
+                        ORDER BY e.created_at DESC, e.id DESC
+                    ) AS eval_rn
+                FROM evaluations e
+                WHERE e.evaluation_type = 'abstract_review'
+            )
+            WHERE eval_rn = 1
+        ),
+        candidates AS (
+            SELECT ranked.*
+            FROM ranked
+            LEFT JOIN latest_abstract ON latest_abstract.paper_id = ranked.paper_id
+            WHERE {' AND '.join(filters)}
+        )
+    """
+    all_params = [*scope_params, *filter_params]
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = int(
+            conn.execute(
+                candidate_ctes + " SELECT COUNT(*) AS total FROM candidates",
+                all_params,
+            ).fetchone()["total"]
+        )
+        candidate_rows = conn.execute(
+            candidate_ctes
+            + f" SELECT paper_id FROM candidates ORDER BY {final_order} LIMIT ? OFFSET ?",
+            [*all_params, page_size, offset],
+        ).fetchall()
+        paper_ids = [int(row["paper_id"]) for row in candidate_rows]
+        rows = _list_scoped_paper_rows_with_conn(conn, paper_ids, scope_sql, scope_params)
+
+    items = _hydrate_paper_rows(_dedupe_paper_category_rows(rows, None, sort), attention=None)
+    return _paper_page_result(items, total, page, page_size)
+
+
+def _paper_page_result(
+    items: list[dict[str, Any]],
+    total: int,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "has_previous": page > 1,
+        "has_next": page * page_size < total,
+    }
+
+
+def _paper_scope_sql(
+    crawl_date: str | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str, list[Any]]:
+    if date_from or date_to:
+        clauses = ["1 = 1"]
+        params: list[Any] = []
+        if date_from:
+            clauses.append("pc.crawl_date >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("pc.crawl_date <= ?")
+            params.append(date_to)
+        return " AND ".join(clauses), params
+    return "pc.crawl_date = ?", [crawl_date]
+
+
+def _paper_page_sort_sql(sort: str) -> tuple[str, str]:
+    rank_asc = "CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC"
+    if sort in {"stars", "stars_desc"}:
+        representative = f"reading_stars DESC, crawl_date DESC, {rank_asc}, id ASC"
+        final = "reading_stars DESC, crawl_date DESC, rank ASC, paper_id ASC"
+    elif sort == "rank_desc":
+        representative = "COALESCE(rank, 0) DESC, crawl_date DESC, reading_stars DESC, id ASC"
+        final = "COALESCE(rank, 0) DESC, crawl_date DESC, reading_stars DESC, paper_id ASC"
+    elif sort == "title":
+        representative = f"{rank_asc}, category ASC, crawl_date DESC, id ASC"
+        final = "title COLLATE NOCASE ASC, paper_id ASC"
+    elif sort == "updated":
+        representative = "updated_at DESC, id ASC"
+        final = "updated_at DESC, paper_id ASC"
+    else:
+        representative = f"{rank_asc}, category ASC, crawl_date DESC, id ASC"
+        final = "crawl_date DESC, category ASC, rank ASC, paper_id ASC"
+    return representative, final
+
+
+def _list_scoped_paper_rows_with_conn(
+    conn: sqlite3.Connection,
+    paper_ids: list[int],
+    scope_sql: str,
+    scope_params: list[Any],
+) -> list[dict[str, Any]]:
+    if not paper_ids:
+        return []
+    placeholders = ",".join("?" for _ in paper_ids)
+    rows = conn.execute(
+        f"""
+        SELECT
+            pc.id AS paper_category_id,
+            pc.category,
+            pc.crawl_date,
+            pc.rank,
+            pc.reading_stars,
+            pc.pdf_clicks,
+            pc.kimi_clicks,
+            p.*
+        FROM paper_categories pc
+        JOIN papers p ON p.id = pc.paper_id
+        WHERE {scope_sql} AND p.id IN ({placeholders})
+        """,
+        [*scope_params, *paper_ids],
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _hydrate_paper_rows(
+    rows: list[dict[str, Any]],
+    attention: str | None = None,
+) -> list[dict[str, Any]]:
+    paper_ids = [int(row["id"]) for row in rows]
+    latest_abstract_evals = list_latest_evaluations(paper_ids, "abstract_review")
+    latest_fulltext_evals = list_latest_evaluations(paper_ids, "fulltext_review")
+    latest_successful_fulltext_evals = list_latest_evaluations(
+        paper_ids,
+        "fulltext_review",
+        success_only=True,
+    )
     hydrated = []
     for row in rows:
         paper_id = int(row["id"])
@@ -785,7 +1088,7 @@ def list_fulltext_reviewed_papers(sort: str = "evaluated_desc") -> list[dict[str
         paper_id = int(row["id"])
         row["authors_list"] = loads_json(row.get("authors"), [])
         row["subjects_list"] = loads_json(row.get("subjects"), [])
-        row["fulltext_result"] = loads_json(row.get("fulltext_result_json"), {})
+        row["fulltext_result"] = loads_json_object(row.get("fulltext_result_json"))
         row["categories"] = categories_by_paper.get(paper_id, [])
         row["latest_category"] = row["categories"][0] if row["categories"] else {}
         hydrated.append(row)
@@ -827,6 +1130,32 @@ def get_paper(paper_id: int) -> dict[str, Any] | None:
     return paper
 
 
+def list_papers_for_abstract_audit(
+    limit: int = 200,
+    offset: int = 0,
+    path: Path | None = None,
+) -> list[dict[str, Any]]:
+    limit = min(1000, max(1, int(limit)))
+    offset = max(0, int(offset))
+    with connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, arxiv_id, title, authors, abstract, subjects, updated_at
+            FROM papers
+            ORDER BY id
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+    papers = []
+    for row in rows:
+        paper = dict(row)
+        paper["authors_list"] = loads_json(paper.get("authors"), [])
+        paper["subjects_list"] = loads_json(paper.get("subjects"), [])
+        papers.append(paper)
+    return papers
+
+
 def get_paper_categories(paper_id: int) -> list[dict[str, Any]]:
     with connect() as conn:
         return [
@@ -861,22 +1190,50 @@ def list_paper_categories_for_papers(paper_ids: Iterable[int]) -> dict[int, list
     return categories
 
 
-def list_papers_missing_evaluation(eval_type: str, limit: int = 200) -> list[int]:
+def list_papers_missing_evaluation(
+    eval_type: str,
+    limit: int = 200,
+    include_terminal_failures: bool = False,
+) -> list[int]:
+    terminal_filter = ""
+    if eval_type == "fulltext_review" and not include_terminal_failures:
+        terminal_filter = """
+          AND NOT (
+              latest_eval.error_code = 'preparation_failed'
+              AND latest_eval.error_retryable = 0
+          )
+        """
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
+            WITH latest_eval AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        e.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY e.paper_id
+                            ORDER BY e.created_at DESC, e.id DESC
+                        ) AS rn
+                    FROM evaluations e
+                    WHERE e.evaluation_type = ?
+                )
+                WHERE rn = 1
+            )
             SELECT DISTINCT p.id
             FROM papers p
             JOIN paper_categories pc ON pc.paper_id = p.id
+            LEFT JOIN latest_eval ON latest_eval.paper_id = p.id
             WHERE pc.crawl_date = COALESCE((SELECT MAX(crawl_date) FROM paper_categories), pc.crawl_date)
               AND NOT EXISTS (
                   SELECT 1 FROM evaluations e
                   WHERE e.paper_id = p.id AND e.evaluation_type = ? AND e.status = 'success'
               )
+              {terminal_filter}
             ORDER BY pc.category, pc.rank
             LIMIT ?
             """,
-            (eval_type, limit),
+            (eval_type, eval_type, limit),
         ).fetchall()
     return [int(row["id"]) for row in rows]
 
@@ -888,6 +1245,11 @@ def loads_json(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return default
+
+
+def loads_json_object(value: str | None) -> dict[str, Any]:
+    parsed = loads_json(value, {})
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def list_llm_profiles(enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -936,7 +1298,7 @@ def save_llm_profile(data: dict[str, Any]) -> int:
             data["model"],
             data.get("encrypted_api_key_ref"),
             data.get("custom_headers") or "{}",
-            float(data.get("temperature") or 0.2),
+            float(data["temperature"] if data.get("temperature") is not None else 0.2),
             int(data.get("max_output_tokens") or 2000),
             int(data.get("context_window_tokens") or 128000),
             int(data.get("timeout_seconds") or 120),
@@ -1122,15 +1484,18 @@ def create_evaluation(
     result: dict[str, Any] | None,
     raw_output: str | None,
     error_message: str | None,
+    error_code: str | None = None,
+    error_retryable: bool = False,
 ) -> int:
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO evaluations(
                 paper_id, evaluation_type, prompt_id, prompt_version, llm_profile_id,
-                model, status, result_json, raw_output, error_message, created_at
+                model, status, result_json, raw_output, error_message,
+                error_code, error_retryable, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 paper_id,
@@ -1143,6 +1508,8 @@ def create_evaluation(
                 json.dumps(result, ensure_ascii=False) if result is not None else None,
                 raw_output,
                 error_message,
+                error_code,
+                1 if error_retryable else 0,
                 now_iso(),
             ),
         )
@@ -1153,7 +1520,13 @@ def _hydrate_evaluation_row(row: sqlite3.Row | dict[str, Any] | None) -> dict[st
     item = row_to_dict(row) if isinstance(row, sqlite3.Row) else (dict(row) if row else None)
     if item:
         item.pop("rn", None)
-        item["result"] = loads_json(item.get("result_json"), {})
+        item["result"] = loads_json_object(item.get("result_json"))
+        item["error_retryable"] = bool(item.get("error_retryable"))
+        item["outcome"] = {
+            "status": item.get("status"),
+            "error_code": item.get("error_code"),
+            "retryable": item["error_retryable"],
+        }
     return item
 
 
@@ -1252,7 +1625,7 @@ def list_evaluations(paper_id: int) -> list[dict[str, Any]]:
                 profiles.update({row["id"]: row for row in rows})
 
     for item in items:
-        item["result"] = loads_json(item.get("result_json"), {})
+        item["result"] = loads_json_object(item.get("result_json"))
         profile = profiles.get(item.get("llm_profile_id"))
         item["llm_profile_name"] = profile["name"] if profile else None
     return items

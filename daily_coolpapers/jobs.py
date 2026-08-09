@@ -26,44 +26,64 @@ class JobRunner:
         self._last_reconcile_at = 0.0
 
     def start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        self._worker_thread = threading.Thread(target=self._worker_loop, name="job-worker", daemon=True)
-        self._worker_thread.start()
-        self._scheduler_thread = threading.Thread(target=self._scheduler_loop, name="job-scheduler", daemon=True)
-        self._scheduler_thread.start()
+        with self._state_lock:
+            if self._started:
+                return
+            self._stop_event.clear()
+            self._started = True
+            self._worker_thread = threading.Thread(target=self._worker_loop, name="job-worker", daemon=True)
+            self._scheduler_thread = threading.Thread(target=self._scheduler_loop, name="job-scheduler", daemon=True)
+            self._worker_thread.start()
+            self._scheduler_thread.start()
         logger.info("Job runner started")
 
-    def enqueue(self, job_type: str, payload: dict[str, Any] | None = None) -> int:
-        job_id = db.create_job(job_type, payload or {})
-        db.update_job_progress(job_id, 0, 1, "等待执行")
+    def stop(self, timeout_seconds: float = 5.0) -> None:
         with self._state_lock:
+            if not self._started:
+                return
+            self._started = False
+            self._stop_event.set()
+            threads = [self._worker_thread, self._scheduler_thread]
+        for thread in threads:
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout_seconds)
+        with self._state_lock:
+            self._worker_thread = None
+            self._scheduler_thread = None
+        logger.info("Job runner stopped")
+
+    def enqueue(self, job_type: str, payload: dict[str, Any] | None = None) -> int:
+        with self._state_lock:
+            job_id = db.create_job(job_type, payload or {})
+            db.update_job_progress(job_id, 0, 1, "等待执行")
             self._queued_job_ids.add(job_id)
-        self.queue.put(job_id)
+            self.queue.put(job_id)
         logger.info("Enqueued job id=%s type=%s", job_id, job_type)
         return job_id
 
     def active_job_ids(self) -> set[int]:
         with self._state_lock:
-            ids = set(self._queued_job_ids)
-            if self._running_job_id is not None:
-                ids.add(self._running_job_id)
-            return ids
+            return self._active_job_ids_locked()
+
+    def _active_job_ids_locked(self) -> set[int]:
+        ids = set(self._queued_job_ids)
+        if self._running_job_id is not None:
+            ids.add(self._running_job_id)
+        return ids
 
     def reconcile_orphaned_pending_jobs(self, min_interval_seconds: float = 0) -> int:
         if not self._started:
             return 0
-        if min_interval_seconds > 0:
-            now = time.monotonic()
-            with self._state_lock:
+        with self._state_lock:
+            if min_interval_seconds > 0:
+                now = time.monotonic()
                 if now - self._last_reconcile_at < min_interval_seconds:
                     return 0
                 self._last_reconcile_at = now
-        marked = db.mark_pending_jobs_interrupted_except(
-            self.active_job_ids(),
-            "任务不在当前服务队列中，已标记为中断",
-        )
+            marked = db.mark_pending_jobs_interrupted_except(
+                self._active_job_ids_locked(),
+                "任务不在当前服务队列中，已标记为中断",
+            )
         if marked:
             logger.warning("Marked %s orphaned pending jobs interrupted", marked)
         return marked
@@ -91,7 +111,7 @@ class JobRunner:
                 self._maybe_schedule_daily_work()
             except Exception:
                 logger.exception("Scheduler loop failed")
-            time.sleep(30)
+            self._stop_event.wait(30)
 
     def _maybe_schedule_daily_work(self) -> None:
         if not db.get_bool_setting("scheduler.enabled", True):

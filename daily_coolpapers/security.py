@@ -4,14 +4,13 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from .config import INSTANCE_DIR, ensure_directories
+from .config import INSTANCE_DIR
 
 logger = logging.getLogger(__name__)
 
 
 class SecretStore:
     def __init__(self, key_path: Path | None = None) -> None:
-        ensure_directories()
         self.key_path = key_path or (INSTANCE_DIR / "fernet.key")
 
     def encrypt(self, value: str | None) -> str | None:
@@ -46,6 +45,7 @@ class SecretStore:
 
     def _fernet(self) -> Fernet:
         if not self.key_path.exists():
+            self.key_path.parent.mkdir(parents=True, exist_ok=True)
             self.key_path.write_bytes(Fernet.generate_key())
         return Fernet(self.key_path.read_bytes())
 
