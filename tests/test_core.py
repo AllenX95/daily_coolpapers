@@ -885,6 +885,15 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("sk-test-secret", encrypted)
             self.assertEqual(store.decrypt(encrypted), "sk-test-secret")
 
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI is only available on Windows")
+    def test_secret_store_uses_dpapi_on_windows(self):
+        with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
+            store = SecretStore(Path(tmp) / "key")
+            encrypted = store.encrypt("sk-test-secret")
+
+            self.assertTrue(encrypted.startswith("dpapi:"))
+            self.assertEqual(store.decrypt(encrypted), "sk-test-secret")
+
     def test_llm_profiles_migrated_to_separate_db(self):
         with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
             main_db = Path(tmp) / "main.sqlite3"
