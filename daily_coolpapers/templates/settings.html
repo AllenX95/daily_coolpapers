@@ -2,12 +2,15 @@
 {% block title %}设置{% endblock %}
 {% block content %}
 <section>
-  <h1>缓存与调度设置</h1>
+  <h1>流水线、缓存与调度设置</h1>
   <form method="post" action="{{ url_for('save_settings') }}" class="form-grid settings-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>PDF 保留天数 <input name="pdf_retention_days" type="number" min="0" value="{{ settings.pdf_retention_days }}"></label>
     <label>Markdown 保留天数 <input name="markdown_retention_days" type="number" min="0" value="{{ settings.markdown_retention_days }}"></label>
     <label>摘要评估并发数 <input name="abstract_concurrency" type="number" min="1" max="20" value="{{ settings.abstract_concurrency }}"></label>
+    <label>摘要额外重试次数 <input name="abstract_retries" type="number" min="0" max="5" value="{{ settings.abstract_retries }}"><span class="small muted">仅重试可恢复的模型错误</span></label>
+    <label>结构化事件保留天数 <input name="event_retention_days" type="number" min="1" max="3650" value="{{ settings.event_retention_days }}"><span class="small muted">清理过期事件，不删除任务汇总；活跃任务保留</span></label>
+    <label>关键字段缺失率警告阈值 <input name="missing_field_warning_rate" type="number" min="0" max="1" step="0.01" value="{{ settings.missing_field_warning_rate }}"><span class="small muted">0–1，超过阈值时记录警告</span></label>
     <label>PDF 下载超时秒数 <input name="pdf_download_timeout_seconds" type="number" min="30" value="{{ settings.pdf_download_timeout_seconds }}"></label>
     <label>PDF 下载重试次数 <input name="pdf_download_retries" type="number" min="0" max="5" value="{{ settings.pdf_download_retries }}"></label>
     <label>抓取/PDF 代理 URL <input name="crawler_proxy_url" value="{{ settings.crawler_proxy_url }}" placeholder="http://127.0.0.1:7897"></label>
@@ -16,7 +19,7 @@
     <label class="check"><input type="checkbox" name="cleanup_daily" value="1" {% if settings.cleanup_daily %}checked{% endif %}> 每日清理缓存</label>
     <label class="check"><input type="checkbox" name="crawler_trust_env_proxy" value="1" {% if settings.crawler_trust_env_proxy %}checked{% endif %}> 抓取和 PDF 下载使用系统代理</label>
     <label class="check"><input type="checkbox" name="llm_trust_env_proxy" value="1" {% if settings.llm_trust_env_proxy %}checked{% endif %}> LLM API 使用系统代理</label>
-    <label class="check"><input type="checkbox" name="scheduler_enabled" value="1" {% if settings.scheduler_enabled %}checked{% endif %}> 启用每日抓取</label>
+    <label class="check"><input type="checkbox" name="scheduler_enabled" value="1" {% if settings.scheduler_enabled %}checked{% endif %}> 启用每日抓取并摘要评估（北京时间）</label>
     <button type="submit">保存设置</button>
   </form>
   <form method="post" action="{{ url_for('run_cleanup') }}" class="inline-actions">
@@ -32,7 +35,7 @@
       <tbody>
         {% for job in jobs %}
           <tr>
-            <td>#{{ job.id }}</td>
+            <td><a href="{{ job.detail_url }}">#{{ job.id }}</a></td>
             <td>{{ job.type_label }}</td>
             <td><span class="badge {{ job.status }}">{{ job.status_label }}</span></td>
             <td>{{ job.created_at }}</td>

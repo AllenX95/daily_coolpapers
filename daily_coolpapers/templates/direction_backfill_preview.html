@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block title %}历史补分类预览{% endblock %}
+{% block content %}
+<section class="result-panel"><span class="eyebrow">History / 显式补分类</span><h1>确认历史补分类</h1>
+  <h2>{{ preview.direction.name }} · #{{ preview.direction.id }}</h2><p class="theme-description">{{ preview.direction.scope_text }}</p>
+  <p>抓取日期：{{ preview.date_from }} 至 {{ preview.date_to }}（包含两端）。类目取该范围内的并集；不会使用已有中文摘要或全文结果做分类。</p>
+  <div class="run-scoreboard">
+    <div><span>去重论文总数</span><strong>{{ preview.counts.total }}</strong><p>可执行分类 {{ preview.counts.executable }} · 输入不完整 {{ preview.counts.input_incomplete }}</p></div>
+    <div><span>已有本方向成功分类</span><strong>{{ preview.counts.already_classified }}</strong><p>幂等跳过，不覆盖原结果</p></div>
+    <div><span>最多新增摘要评估</span><strong>{{ preview.counts.max_additional_abstract }}</strong><p>已有成功摘要 {{ preview.counts.already_abstract }}</p></div>
+  </div>
+  <p class="run-notice">这是成本上限预览，不保证匹配。每篇分类初次调用 + 最多 2 次重试；匹配或可能匹配后自动继续缺失摘要评估。分类与摘要分开计费，已有成功摘要或正在运行的评估会跳过。提交时重新计算并冻结候选。</p>
+  <form method="post" action="{{ url_for('direction_backfill',direction_id=preview.direction.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="confirmed" value="1">
+    <input type="hidden" name="date_from" value="{{ preview.date_from }}"><input type="hidden" name="date_to" value="{{ preview.date_to }}">
+    <button type="submit">确认执行分类并自动补评</button><a class="button secondary" href="{{ url_for('attention_directions') }}">返回修改范围</a>
+  </form>
+</section>
+{% endblock %}

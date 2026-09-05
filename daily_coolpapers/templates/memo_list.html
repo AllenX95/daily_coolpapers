@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block title %}研究备忘录 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">Research memos / 研究底稿</span><h1>研究备忘录</h1><p class="muted">将已收藏论文综合为有引用的研究假设。AI 草稿按版本保存，“我的投资判断”由你单独维护。</p></div><a class="button" href="{{ url_for('memo_new') }}">新建研究备忘录</a></section>
+<p><a href="{{ url_for('memo_list',archived='1') }}">查看全部与归档系列</a></p>
+{% for series in series_list %}
+<article class="theme-record"><header><h2><a href="{{ url_for('memo_series',series_id=series.id) }}">{{ series.title }}</a></h2><span class="decision-badge">{{ series.status }}</span></header>
+  <p>{{ {'manual':'手工选论文','attention_direction':'关注方向','investment_theme':'投资主题'}[series.source_mode] }}{% if series.source_name %}：{{ series.source_name }}{% endif %} · 创建 {{ series.created_at }} · 更新 {{ series.updated_at }}</p>
+  {% if series.latest_success_id %}<a href="{{ url_for('memo_version',series_id=series.id,version_id=series.latest_success_id) }}">最新成功 v{{ series.latest_success_no }} · {{ series.paper_count }} 篇论文 →</a>{% else %}<p class="muted">尚无成功版本</p>{% endif %}
+</article>
+{% else %}<p class="empty">先收藏你认可的论文，再创建研究备忘录。仅使用本地已有评估，不接入外部市场信号。</p>{% endfor %}
+{% endblock %}

@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}任务 #{{ job.id }} · 运行记录{% endblock %}
+{% block content %}
+<div class="run-record" data-active="{{ 1 if job.status in ['pending', 'running'] else 0 }}">
+  <section class="detail-head">
+    <div><span class="eyebrow">Run record / 运行记录</span><h1>任务 #{{ job.id }}</h1><p class="muted">{{ job.type_label }} · 时间均为北京时间</p></div>
+    <div class="inline-actions"><a class="button secondary" href="{{ url_for('index') }}">返回论文</a><a class="button secondary" href="{{ request.full_path }}">刷新记录</a></div>
+  </section>
+  {% include 'partials/job_card.html' %}
+  {% if pipeline %}
+    {% if pipeline.classification.available %}
+    <section class="run-notice" aria-label="分类阶段汇总">
+      <h2>关注方向分类</h2>
+      {% if pipeline.classification.no_directions %}<p>当前未启用关注方向，将对全部新论文执行摘要评估。</p>
+      {% else %}<p>方向 {{ pipeline.classification.direction_count }} · 候选 {{ pipeline.classification.candidate_count }} · matched {{ pipeline.classification.matched }} · possible {{ pipeline.classification.possible }} · unmatched {{ pipeline.classification.unmatched }} · 失败论文 {{ pipeline.classification.failed_papers }}（本次失败 {{ pipeline.classification.failed }}）</p>
+      <p class="small">调用 {{ pipeline.classification.calls }} · 重试 {{ pipeline.classification.retry_count }} · 跳过已有／历史 {{ pipeline.classification.already_classified }} · 输入不完整 {{ pipeline.classification.input_incomplete }} · 输入 / 输出 token {{ pipeline.classification.input_tokens }} / {{ pipeline.classification.output_tokens }}</p>
+      {% if pipeline.classification.has_partial_failure %}<p>至少一个方向分类失败，不被其他方向的匹配结果掩盖。请查看失败记录，配置完成后明确重试。</p>{% endif %}
+      {% endif %}
+    </section>
+    {% endif %}
+    <section class="run-scoreboard" aria-label="任务阶段汇总">
+      {% if not pipeline.is_backfill %}
+      <div><span class="eyebrow">01 / 抓取单元</span><strong>{{ pipeline.completed_units }} <small>/ {{ pipeline.planned_units }}</small></strong><p>日期 × 类目；合法空 {{ pipeline.crawl.empty_success }}</p></div>
+      <div><span class="eyebrow">02 / 入库</span><strong>{{ pipeline.counts.persisted_count if pipeline.counts.persisted_count is not none else '—' }} <small>条</small></strong><p>新增 {{ pipeline.counts.new_count if pipeline.counts.new_count is not none else '—' }} · 更新 {{ pipeline.counts.updated_count if pipeline.counts.updated_count is not none else '—' }} · 重复 {{ pipeline.counts.duplicate_count if pipeline.counts.duplicate_count is not none else '—' }}</p></div>
+      {% endif %}
+      <div><span class="eyebrow">03 / 摘要</span><strong>{{ pipeline.abstract.success }} <small>/ {{ pipeline.abstract.unique_count }} 篇</small></strong><p>失败 {{ pipeline.abstract.failed }} · 重试 {{ pipeline.abstract.retry_count }} · 跳过 {{ pipeline.skipped }}</p></div>
+    </section>
+    {% if pipeline.is_backfill and job.status not in ['pending','running'] %}
+    <form method="post" action="{{ url_for('direction_backfill',direction_id=pipeline.direction_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="date_from" value="{{ pipeline.start_date }}"><input type="hidden" name="date_to" value="{{ pipeline.end_date }}">
+      <button class="secondary" type="submit">重新预览此范围／显式重试失败</button>
+    </form>
+    {% endif %}
+    <p class="small muted">入库计数按类目记录，跨类目论文可能重复；摘要按论文去重。跳过：已有成功 {{ pipeline.abstract.already_successful }}、正在评估 {{ pipeline.abstract.evaluation_already_running }}、输入不完整 {{ pipeline.abstract.input_incomplete }}。</p>
+    {% if pipeline.retry_of_job_id %}<p>本任务重试自 <a href="{{ url_for('job_detail', job_id=pipeline.retry_of_job_id) }}">#{{ pipeline.retry_of_job_id }}</a>。</p>{% endif %}
+    {% if pipeline.events_unavailable %}<p class="run-notice">明细事件已清理或历史任务未记录事件。任务汇总仍保留；缺失指标显示为“—”。无法安全规划重试，请使用首页抓取或“评估缺失摘要”。</p>{% endif %}
+    {% if pipeline.retry_history_unavailable and not pipeline.events_unavailable %}<p class="run-notice">部分明细事件已清理，以下记录不完整。保留最终汇总，但已关闭关联重试，以免重复执行成功单元；请使用首页抓取或“评估缺失摘要”。</p>{% endif %}
+    {% if pipeline.can_retry and not pipeline.events_unavailable %}
+      <section class="run-recovery">
+        <div><h2>恢复这次运行</h2><p class="small muted">新建关联任务，不覆盖历史。已成功的对象会跳过；重试可能产生模型调用费用。</p></div>
+        <div class="inline-actions">
+          <form method="post" action="{{ url_for('retry_pipeline', job_id=job.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="mode" value="all">
+            <button type="submit">重试异常抓取并补评</button>
+          </form>
+          <form method="post" action="{{ url_for('retry_pipeline', job_id=job.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="mode" value="abstract_only">
+            <button type="submit" class="secondary">只补评缺失摘要</button>
+          </form>
+        </div>
+        <p class="small muted">“只补评”不会发起抓取；原有抓取警告或失败会保留在新任务中。外部调用结果未知的论文，重试可能额外计费。</p>
+      </section>
+    {% endif %}
+  {% endif %}
+  <section class="run-events">
+    <div class="detail-head"><div><h2>阶段记录</h2><p class="muted small">默认只看警告与失败；切换“全部事件”可追溯完整时间线。</p></div>
+      <div class="inline-actions"><button type="button" class="secondary" id="copy-diagnostic" data-url="{{ url_for('job_diagnostic', job_id=job.id, page=event_page.page, **filters) }}">复制本页安全诊断</button><a href="{{ url_for('job_diagnostic', job_id=job.id, page=event_page.page, **filters) }}" target="_blank" rel="noopener">查看诊断 JSON</a></div>
+    </div>
+    <p id="copy-status" class="small muted" role="status"></p>
+    <form method="get" class="filters run-filters">
+      <label>级别<select name="severity">{% for value,label in [('issues','警告与失败'),('error','只看失败'),('warning','只看警告'),('all','全部事件')] %}<option value="{{ value }}" {% if filters.severity == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+      <label>类目<select name="category"><option value="">全部类目</option>{% for name in pipeline.categories if pipeline %}<option value="{{ name }}" {% if filters.category == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></label>
+      <label>目标日期<input name="crawl_date" type="date" value="{{ filters.crawl_date }}"></label>
+      <label>阶段<select name="stage"><option value="">全部阶段</option>{% for value,label in stages.items() %}<option value="{{ value }}" {% if filters.stage == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+      <label>排列<select name="view"><option value="grouped" {% if filters.view == 'grouped' %}selected{% endif %}>日期 / 类目 / 阶段</option><option value="timeline" {% if filters.view == 'timeline' %}selected{% endif %}>时间线</option></select></label>
+      <button type="submit">筛选记录</button><a href="{{ url_for('job_detail', job_id=job.id, severity='all', view='timeline') }}">完整时间线</a>
+    </form>
+    <p class="event-scroll-hint small muted">左右滑动表格，可查看阶段、错误与指标。</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="阶段事件记录（可横向滚动）"><table class="event-table"><thead><tr><th>时间 / 尝试</th><th>日期 / 类目</th><th>阶段 / 事件</th><th>结果与指标</th></tr></thead><tbody>
+      {% for event in event_page['items'] %}
+        <tr class="event-{{ event.level }}">
+          <td><time>{{ event.created_at }}</time><div class="small muted">#{{ event.id }} · 第 {{ event.attempt }} 次</div></td>
+          <td>{{ event.crawl_date or '—' }}<div>{{ event.category or '流水线 / 论文' }}</div></td>
+          <td><span class="eyebrow">{{ event.stage_label }}</span><div>{{ event.type_label }}</div><span class="badge {{ event.level }}">{{ event.level_label }}</span></td>
+          <td>{% if event.paper_id %}<a href="{{ url_for('paper_detail', paper_id=event.paper_id) }}">{{ event.arxiv_id or '论文' }} · {{ event.paper_title }}</a>{% endif %}
+            {% if event.error_code %}<p class="event-error">{{ event.error_label }}<br><code>{{ event.error_code }}</code></p>{% endif %}
+            <div class="event-metrics">{% for metric in event.metric_rows %}<span><b>{{ metric.label }}</b> {{ metric.value }}</span>{% endfor %}</div>
+          </td>
+        </tr>
+      {% else %}<tr><td colspan="4" class="empty">当前筛选没有事件。{% if filters.severity != 'all' %}没有警告记录不等于任务已完成，请结合上方状态查看。{% endif %}</td></tr>{% endfor %}
+    </tbody></table></div>
+    <nav class="pagination" aria-label="事件分页"><span>共 {{ event_page.total }} 条 · 第 {{ event_page.page }} / {{ event_page.pages }} 页</span>
+      {% if event_page.page > 1 %}<a class="button secondary" href="{{ url_for('job_detail', job_id=job.id, page=event_page.page-1, **filters) }}">上一页</a>{% endif %}
+      {% if event_page.page < event_page.pages %}<a class="button secondary" href="{{ url_for('job_detail', job_id=job.id, page=event_page.page+1, **filters) }}">下一页</a>{% endif %}
+    </nav>
+  </section>
+</div>
+<script src="{{ url_for('static', filename='job_detail.js') }}" defer></script>
+{% endblock %}

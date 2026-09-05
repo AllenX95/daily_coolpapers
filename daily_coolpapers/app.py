@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import secrets
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from flask import (
 )
 
 from . import db
+from . import job_views
+from . import memos, memo_db
 from .cache_manager import cleanup_caches, has_markdown, has_pdf, markdown_path, pdf_path
 from .config import CURRENT_LOG, INSTANCE_DIR, ensure_directories
 from .form_commands import (
@@ -36,6 +39,7 @@ from .form_commands import (
     parse_json_object,
     parse_optional_int,
     parse_required_text,
+    parse_theme_ids,
 )
 from .jobs import JobRunner, job_runner
 from .llm import test_profile
@@ -46,8 +50,17 @@ from .services import (
     build_paper_evaluation_export,
     evaluation_prompt_options,
     evaluation_result_view,
+    favorite_papers_page_model,
+    reviewed_papers_page_model,
+    paper_decision_model,
+    paper_themes_model,
+    investment_theme_papers_model,
+    team_form_model,
+    research_entities_model,
+    safe_arxiv_abstract_url,
     paper_evaluation_result_model,
     resolve_evaluation_config,
+    direction_backfill_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,9 +115,97 @@ def create_app(
 
     @app.errorhandler(FormValidationError)
     def handle_form_validation(error: FormValidationError):
-        return {"errors": error.errors}, 400
+        if request.endpoint and request.endpoint.startswith('memo_'):
+            return _memo_error_response({'errors':error.errors},400)
+        if request.endpoint in DIRECTION_ENDPOINTS:
+            return _direction_error_response({'errors': error.errors}, 400)
+        if request.endpoint in TEAM_WRITE_ENDPOINTS:
+            return _team_error_response({'errors': error.errors}, 400)
+        return _theme_form_error_response({'errors': error.errors}, 400)
+
+    @app.errorhandler(db.InvestmentThemeNotFoundError)
+    @app.errorhandler(db.DirectionNotFoundError)
+    @app.errorhandler(db.ResearchEntityNotFoundError)
+    @app.errorhandler(db.PaperNotFoundError)
+    def handle_missing_organization_entity(error):
+        if request.endpoint in DIRECTION_ENDPOINTS:
+            return _direction_error_response({'error': str(error)}, 404)
+        if request.endpoint in TEAM_WRITE_ENDPOINTS:
+            return _team_error_response({'error': str(error)}, 404)
+        return _theme_form_error_response({'error': str(error)}, 404)
+
+    @app.errorhandler(db.ArchivedThemeError)
+    @app.errorhandler(db.DirectionConflictError)
+    @app.errorhandler(db.FulltextRequiredError)
+    def handle_organization_conflict(error):
+        if request.endpoint in DIRECTION_ENDPOINTS:
+            return _direction_error_response({'error': str(error)}, 409)
+        if request.endpoint in TEAM_WRITE_ENDPOINTS:
+            return _team_error_response({'error': str(error)}, 409)
+        return _theme_form_error_response({'error': str(error)}, 409)
+
+    @app.errorhandler(db.ResearchEntityConflictError)
+    def handle_research_conflict(error):
+        return _team_error_response({'error': str(error), 'conflicts': error.conflicts}, 409)
+
+    @app.errorhandler(memo_db.MemoNotFoundError)
+    def missing_memo(error):
+        return _memo_error_response({'error':str(error)},404)
+
+    @app.errorhandler(memo_db.MemoConflictError)
+    def conflict_memo(error):
+        return _memo_error_response({'error':str(error)},409)
 
     return app
+
+
+TEAM_WRITE_ENDPOINTS = {'save_team_tracking', 'archive_team_tracking', 'update_research_author', 'update_research_organization'}
+DIRECTION_ENDPOINTS = {'create_attention_direction', 'archive_attention_direction', 'direction_backfill', 'save_direction_decision'}
+
+
+def _direction_error_response(payload, status):
+    if request.accept_mimetypes.best_match(['application/json', 'text/html']) != 'text/html':
+        return payload, status
+    return render_template('theme_form_error.html', errors=payload.get('errors', {}),
+                           message=payload.get('error'), return_url=url_for('attention_directions'),
+                           return_label='返回关注方向设置'), status
+
+
+def _memo_error_response(payload,status):
+    if request.accept_mimetypes.best_match(['application/json','text/html']) != 'text/html':
+        return payload,status
+    return render_template('theme_form_error.html',errors=payload.get('errors',{}),message=payload.get('error'),
+                           return_url=url_for('memo_new'),return_label='返回研究备忘录，重新确认论文与配置'),status
+
+
+def _team_error_response(payload: dict, status: int):
+    if request.accept_mimetypes.best_match(['application/json', 'text/html']) != 'text/html':
+        return payload, status
+    paper_id = (request.view_args or {}).get('paper_id')
+    paper = db.get_paper(paper_id) if paper_id and paper_id <= 2**63-1 else None
+    form = team_form_model(paper, submitted=request.form) if paper and request.endpoint == 'save_team_tracking' and db.has_successful_fulltext(paper_id) else None
+    return render_template('team_form_page.html', paper=paper, team_form=form, errors=payload.get('errors', {}),
+                           message=payload.get('error'), conflicts=payload.get('conflicts', [])), status
+
+
+def _theme_form_error_response(payload: dict, status: int):
+    """Keep machine-readable errors while providing safe browser recovery links."""
+    theme_forms = {'create_investment_theme', 'update_investment_theme',
+                   'save_paper_investment_themes', 'remove_paper_investment_theme'}
+    if (request.endpoint not in theme_forms or
+            request.accept_mimetypes.best_match(['application/json', 'text/html']) != 'text/html'):
+        return payload, status
+    values = request.view_args or {}
+    if 'paper_id' in values:
+        return_url = url_for('paper_detail', paper_id=values['paper_id'], _anchor='fulltext-result')
+        return_label = '返回论文并刷新主题选项'
+    else:
+        anchor = f"theme-{values['theme_id']}" if 'theme_id' in values else None
+        return_url = url_for('investment_themes', _anchor=anchor)
+        return_label = '返回投资主题设置'
+    return render_template('theme_form_error.html', errors=payload.get('errors', {}),
+                           message=payload.get('error'), return_url=return_url,
+                           return_label=return_label), status
 
 
 def _flask_secret() -> str:
@@ -115,6 +216,8 @@ def _flask_secret() -> str:
 
 
 def register_template_helpers(app: Flask) -> None:
+    app.add_template_filter(safe_arxiv_abstract_url, 'safe_arxiv_url')
+
     @app.template_global()
     def csrf_token() -> str:
         return _csrf_token()
@@ -170,8 +273,8 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/")
     def index():
-        runtime_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
         digest_query = _paper_digest_query_from_request()
+        direction_filters = _direction_filters()
         page_number = _query_int(request.args.get("page"), 1, 1)
         page_size = _query_int(request.args.get("page_size"), 50, 1, 100)
         paper_page = db.list_paper_page(
@@ -183,15 +286,16 @@ def register_routes(app: Flask) -> None:
             sort=digest_query.sort,
             page=page_number,
             page_size=page_size,
+            **direction_filters,
         )
         jobs = _job_status_payloads(db.list_job_summaries(12))
         active_jobs = [job for job in jobs if job["status"] in {"pending", "running"}]
-        progress_jobs = active_jobs
-        if not progress_jobs and jobs and jobs[0]["status"] == "failed":
-            progress_jobs = [jobs[0]]
+        progress_jobs = (active_jobs + [job for job in jobs if job not in active_jobs])[:4]
         return render_template(
             "index.html",
             papers=paper_page["items"],
+            directions=db.list_attention_directions(),
+            direction_filters=direction_filters,
             paper_page=paper_page,
             categories=db.list_categories(),
             digest_query=digest_query,
@@ -202,12 +306,12 @@ def register_routes(app: Flask) -> None:
             selected_category=digest_query.category,
             attention=digest_query.attention,
             sort=digest_query.sort,
-            export_csv_url=url_for("export_csv", **digest_query.url_args()),
+            export_csv_url=url_for("export_csv", **digest_query.url_args(), **direction_filters),
             rank_sort_url=url_for(
-                "index", **digest_query.url_args(sort="rank_desc"), page_size=page_size
+                "index", **digest_query.url_args(sort="rank_desc"), page_size=page_size, **direction_filters
             ),
             stars_sort_url=url_for(
-                "index", **digest_query.url_args(sort="stars_desc"), page_size=page_size
+                "index", **digest_query.url_args(sort="stars_desc"), page_size=page_size, **direction_filters
             ),
             jobs=jobs[:8],
             has_active_jobs=bool(active_jobs),
@@ -216,14 +320,117 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/favorites")
     def favorites():
-        sort = request.args.get("sort") or "evaluated_desc"
-        if sort not in {"evaluated_desc", "score_desc", "rank", "title"}:
-            sort = "evaluated_desc"
+        page_model = favorite_papers_page_model(request.args.get("sort"))
         return render_template(
             "favorites.html",
-            papers=db.list_fulltext_reviewed_papers(sort=sort),
-            sort=sort,
+            **page_model,
         )
+
+    @app.get('/reviewed-papers')
+    def reviewed_papers():
+        decision = parse_choice(request.args.get('decision', 'all'), 'decision', db.PAPER_DECISION_FILTERS)
+        return render_template('favorites.html', **reviewed_papers_page_model(request.args.get('sort'), decision))
+
+    def theme_return_paper(value):
+        if not value:
+            return None
+        paper_id = parse_int(value, 'paper_id', minimum=1, maximum=2**63-1)
+        paper = db.get_paper(paper_id)
+        if not paper:
+            abort(404, description='返回的论文不存在')
+        return paper
+
+    @app.get('/investment-themes')
+    def investment_themes():
+        return_paper = theme_return_paper(request.args.get('paper_id'))
+        return render_template('investment_themes.html', themes=db.list_investment_themes(), return_paper=return_paper)
+
+    @app.post('/investment-themes')
+    def create_investment_theme():
+        return_paper = theme_return_paper(request.form.get('paper_id'))
+        theme_id = db.create_investment_theme(request.form.get('name'), request.form.get('description'))
+        flash('投资主题已创建；请回到论文手动选择加入' if return_paper else '投资主题已创建')
+        return redirect(url_for('investment_themes', paper_id=return_paper['id'] if return_paper else None, _anchor=f'theme-{theme_id}'))
+
+    @app.post('/investment-themes/<int:theme_id>')
+    def update_investment_theme(theme_id: int):
+        return_paper = theme_return_paper(request.form.get('paper_id'))
+        action = parse_choice(request.form.get('action'), 'action', {'update','archive','restore'})
+        db.update_investment_theme(theme_id, action, request.form.get('name'), request.form.get('description'))
+        flash({'update': '投资主题已更新，论文关系保持不变', 'archive': '主题已归档，历史论文关系保留', 'restore': '主题已恢复，可重新加入论文'}[action])
+        return redirect(url_for('investment_themes', paper_id=return_paper['id'] if return_paper else None, _anchor=f'theme-{theme_id}'))
+
+    @app.get('/investment-themes/<int:theme_id>/papers')
+    def investment_theme_papers(theme_id: int):
+        return render_template('favorites.html', **investment_theme_papers_model(theme_id, request.args.get('sort')))
+
+    @app.post('/api/papers/<int:paper_id>/investment-themes')
+    def save_paper_investment_themes(paper_id: int):
+        ids = parse_theme_ids(request.form.getlist('theme_ids'))
+        db.set_paper_investment_themes(paper_id, ids)
+        flash('投资主题已保存；已有归档主题关系保持不变', 'themes')
+        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+
+    @app.post('/api/papers/<int:paper_id>/investment-themes/<int:theme_id>/remove')
+    def remove_paper_investment_theme(paper_id: int, theme_id: int):
+        db.remove_paper_investment_theme(paper_id, theme_id)
+        flash('已从论文移除该主题，其他关系和个人决策不变', 'themes')
+        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+
+    @app.post('/api/papers/<int:paper_id>/decision')
+    def save_paper_decision(paper_id: int):
+        decision = parse_choice(request.form.get('decision'), 'decision', db.PAPER_DECISIONS)
+        try:
+            db.set_paper_decision(paper_id, decision)
+        except db.PaperNotFoundError as exc:
+            abort(404, description=str(exc))
+        except db.FulltextRequiredError as exc:
+            abort(409, description=str(exc))
+        flash({'favorite': '已收藏此论文', 'skipped': '已跳过此论文；论文和评估记录均保留',
+               'clear': '已恢复未处理'}[decision], 'decision')
+        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+
+    @app.post('/api/papers/<int:paper_id>/team-tracking')
+    def save_team_tracking(paper_id: int):
+        db.save_paper_team_tracking(paper_id, request.form)
+        flash('团队跟踪已保存，作者与机构均按你的选择记录', 'team')
+        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+
+    @app.get('/research-entities')
+    def research_entities():
+        return render_template('research_entities.html', **research_entities_model(request.args))
+
+    @app.post('/api/papers/<int:paper_id>/team-tracking/archive')
+    def archive_team_tracking(paper_id: int):
+        db.archive_paper_team_tracking(paper_id)
+        flash('已停止跟踪；作者、机构和历史关系保留', 'team')
+        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+
+    def save_research_entity(kind, entity_id):
+        action = parse_choice(request.form.get('action'), 'action', {'update', 'archive', 'restore'})
+        return_paper = None
+        if request.form.get('return_paper_id'):
+            return_id = parse_int(request.form.get('return_paper_id'), 'return_paper_id', minimum=1, maximum=2**63-1)
+            return_paper = db.get_paper(return_id)
+            if return_paper is None:
+                raise db.PaperNotFoundError('返回的论文不存在')
+        if return_paper and action != 'restore':
+            raise FormValidationError({'action': '论文冲突处理仅支持显式恢复实体'})
+        db.update_research_entity(kind, entity_id, action, request.form)
+        if return_paper:
+            flash('实体已恢复；尚未保存团队关系，请核对作者、机构及备注后重新提交', 'team')
+            return redirect(url_for('paper_detail', paper_id=return_paper['id'],
+                **{'team_'+kind+'_id': entity_id}, _anchor='fulltext-result'))
+        flash({'update': '研究对象已更新', 'archive': '实体已归档，论文跟踪状态不变', 'restore': '实体已恢复，论文跟踪状态不变'}[action])
+        return redirect(url_for('research_entities', view='authors' if kind == 'author' else 'organizations', status='all'))
+
+    @app.post('/research-authors/<int:author_id>')
+    def update_research_author(author_id: int):
+        return save_research_entity('author', author_id)
+
+    @app.post('/research-organizations/<int:organization_id>')
+    def update_research_organization(organization_id: int):
+        return save_research_entity('organization', organization_id)
 
     @app.post("/api/shutdown")
     def shutdown():
@@ -251,22 +458,27 @@ def register_routes(app: Flask) -> None:
     @app.post("/api/crawl/run")
     def run_crawl():
         category_ids = [parse_int(item, "category_ids", minimum=1) for item in request.form.getlist("category_ids") if item]
-        payload: dict[str, Any] = {}
-        if category_ids:
-            payload["category_ids"] = category_ids
-        job_id = runtime_runner.enqueue("crawl", payload)
-        flash(f"已创建 metadata 抓取任务 #{job_id}")
-        return redirect(url_for("index"))
+        try:
+            job_id, created = runtime_runner.enqueue_pipeline('manual_latest', category_ids or None)
+        except ValueError as exc:
+            flash(f'无法创建流水线：{exc}')
+            return redirect(url_for('index'))
+        flash(f"已创建抓取并摘要评估任务 #{job_id}" if created else f"已有抓取任务 #{job_id}，本次未重复创建")
+        return redirect(url_for('job_detail', job_id=job_id))
 
     @app.post("/api/crawl/catch-up")
     def run_crawl_catch_up():
         category_ids = [parse_int(item, "category_ids", minimum=1) for item in request.form.getlist("category_ids") if item]
-        payload: dict[str, Any] = {}
-        if category_ids:
-            payload["category_ids"] = category_ids
-        job_id = runtime_runner.enqueue("crawl_catch_up", payload)
-        flash(f"已创建 metadata 补抓到最新任务 #{job_id}")
-        return redirect(url_for("index"))
+        try:
+            job_id, created = runtime_runner.enqueue_pipeline(
+                'manual_catch_up', category_ids or None,
+                start_date=request.form.get('start_date') or None, end_date=request.form.get('end_date') or None,
+            )
+        except ValueError as exc:
+            flash(f'无法创建流水线：{exc}')
+            return redirect(url_for('index'))
+        flash(f"已创建补抓并摘要评估任务 #{job_id}" if created else f"已有抓取任务 #{job_id}，本次未重复创建")
+        return redirect(url_for('job_detail', job_id=job_id))
 
     @app.post("/api/abstract-evaluations/run")
     def run_abstract_evaluations():
@@ -303,11 +515,17 @@ def register_routes(app: Flask) -> None:
         if not paper:
             flash("论文不存在")
             return redirect(url_for("index"))
+        personal_decision = paper_decision_model(paper_id)
         return render_template(
             "paper_detail.html",
             paper=paper,
+            direction_results=db.paper_direction_results([paper_id]).get(paper_id,[]),
+            attention_directions=db.list_attention_directions(active_only=True),
             categories=db.get_paper_categories(paper_id),
             evaluation_results=paper_evaluation_result_model(paper_id),
+            personal_decision=personal_decision,
+            paper_themes=paper_themes_model(paper_id) if personal_decision['eligible'] else None,
+            team_form=team_form_model(paper, selections=request.args) if personal_decision['eligible'] else None,
             evaluation_actions=_paper_evaluation_actions(paper_id),
             has_pdf=has_pdf(paper["arxiv_id"]),
             has_markdown=has_markdown(paper["arxiv_id"]),
@@ -357,7 +575,7 @@ def register_routes(app: Flask) -> None:
     @app.get("/export.csv")
     def export_csv():
         digest_query = _paper_digest_query_from_request()
-        body = build_paper_digest_csv(db.list_paper_rows(digest_query))
+        body = build_paper_digest_csv(db.filter_papers_by_directions(db.list_paper_rows(digest_query), **_direction_filters()))
         return Response(
             body,
             mimetype="text/csv; charset=utf-8",
@@ -382,6 +600,121 @@ def register_routes(app: Flask) -> None:
         flash("类目已保存")
         return redirect(url_for("categories"))
 
+    @app.get('/investment-memos')
+    def memo_list():
+        return render_template('memo_list.html',series_list=memo_db.list_series(request.args.get('archived')=='1'))
+
+    @app.get('/investment-memos/new')
+    def memo_new():
+        mode = parse_choice(request.args.get('source_mode','manual'),'source_mode',{'manual','attention_direction','investment_theme'})
+        source_id = request.args.get('source_id') or request.args.get('source_direction_id' if mode=='attention_direction' else 'source_theme_id')
+        entity_id = memos.optional_id(source_id,'source_id') if mode!='manual' else None
+        command = memos.MemoRequest('',mode,entity_id,[],None,None)
+        filters = memos.parse_candidate_filters(request.args)
+        model = memos.candidate_page(command,filters)
+        return render_template('memo_new.html',**model,command=command,filters=filters,
+            selected_ids=[p['id'] for p in model['candidates'] if p['preselected']],
+            directions=db.list_attention_directions(active_only=True),themes=[t for t in db.list_investment_themes() if t['status']=='active'],
+            prompts=db.list_prompts('investment_memo',enabled_only=True),profiles=db.list_llm_profiles(enabled_only=True))
+
+    @app.post('/investment-memos/preview')
+    def memo_preview():
+        command = memos.MemoRequest.from_form(request.form)
+        return render_template('memo_preview.html',preview=memos.preview_memo(command),command=command,disclaimer=memos.DISCLAIMER)
+
+    @app.post('/investment-memos')
+    def memo_create():
+        command = memos.MemoRequest.from_form(request.form,creating=True)
+        created = runtime_runner.enqueue_memo(command)
+        flash('已创建备忘录版本，后台将仅调用一次模型。' if created['created'] else '此提交已处理，返回原版本，未重复调用。')
+        return redirect(url_for('memo_version',series_id=created['series_id'],version_id=created['id']))
+
+    @app.get('/investment-memos/<int:series_id>')
+    def memo_series(series_id):
+        series,versions = memo_db.get_series(series_id)
+        return render_template('memo_series.html',series=series,versions=versions)
+
+    @app.get('/investment-memos/<int:series_id>/versions/<int:version_id>')
+    def memo_version(series_id,version_id):
+        series,version,papers = memo_db.get_version(series_id,version_id)
+        return render_template('memo_version.html',series=series,version=version,papers=papers,
+                               disclaimer=memos.DISCLAIMER,sections=memos.SECTIONS,claim_labels=memos.CLAIM_LABELS)
+
+    @app.post('/investment-memos/<int:series_id>/versions/<int:version_id>/personal-judgment')
+    def memo_personal_judgment(series_id,version_id):
+        if set(request.form)-{'csrf_token','personal_judgment_markdown'} or 'personal_judgment_markdown' not in request.form:
+            raise FormValidationError({'personal_judgment_markdown':'此入口只允许保存个人判断，不能修改 AI 或版本字段'})
+        memo_db.save_personal_judgment(series_id,version_id,request.form['personal_judgment_markdown'])
+        logger.info('Memo personal judgment saved series_id=%s version_id=%s',series_id,version_id)
+        flash('个人判断已保存；AI 草稿和生成输入未改变，没有调用模型。')
+        return redirect(url_for('memo_version',series_id=series_id,version_id=version_id,_anchor='personal-judgment'))
+
+    @app.get('/investment-memos/<int:series_id>/versions/<int:version_id>/new-version')
+    def memo_new_version(series_id,version_id):
+        filters = memos.parse_candidate_filters(request.args)
+        model = memos.new_version_editor(series_id,version_id,filters)
+        prompts = db.list_prompts('investment_memo',enabled_only=True)
+        profiles = db.list_llm_profiles(enabled_only=True)
+        command = model['command']
+        for entries,key in ((prompts,command.prompt_id),(profiles,command.profile_id)):
+            if key and not any(item['id']==key for item in entries):
+                entries.append({'id':key,'name':'原配置已不可用，请重新选择','model':'不可用','version':'不可用'})
+        return render_template('memo_new.html',**model,filters=filters,prompts=prompts,profiles=profiles,
+            directions=db.list_attention_directions(active_only=True),themes=[t for t in db.list_investment_themes() if t['status']=='active'])
+
+    @app.post('/investment-memos/<int:series_id>/archive')
+    def memo_archive(series_id):
+        if set(request.form)-{'csrf_token'}:
+            raise FormValidationError({'series':'此入口仅允许归档，不接受恢复或修改'})
+        memo_db.archive_series(series_id)
+        flash('系列已归档；历史版本和个人判断保留，不再接受新版本。')
+        return redirect(url_for('memo_series',series_id=series_id))
+
+    @app.get('/investment-memos/<int:series_id>/versions/<int:version_id>/export.md')
+    def memo_export(series_id,version_id):
+        markdown = memos.export_memo(series_id,version_id)
+        logger.info('Memo exported series_id=%s version_id=%s',series_id,version_id)
+        return Response(markdown,content_type='text/markdown; charset=utf-8',headers={
+            'Content-Disposition':f'attachment; filename="investment-memo-{series_id}-version-{version_id}.md"',
+            'X-Content-Type-Options':'nosniff'})
+
+    @app.get('/attention-directions')
+    def attention_directions():
+        return render_template('attention_directions.html', directions=db.list_attention_directions(),
+                               show_archived=request.args.get('archived') == '1')
+
+    @app.post('/attention-directions')
+    def create_attention_direction():
+        direction_id = db.create_attention_direction(request.form.get('name'), request.form.get('scope_text'))
+        flash('关注方向已创建；历史论文不会自动重跑。名称和范围保存后不可修改。')
+        return redirect(url_for('attention_directions', _anchor=f'direction-{direction_id}'))
+
+    @app.post('/attention-directions/<int:direction_id>/archive')
+    def archive_attention_direction(direction_id):
+        if any(key in request.form for key in ('name', 'scope_text', 'action', 'status')):
+            raise FormValidationError({'direction': '此入口只允许归档，不接受内容修改或恢复'})
+        db.archive_attention_direction(direction_id)
+        flash('关注方向已归档；历史结果保留，此方向不可恢复。')
+        return redirect(url_for('attention_directions', archived='1', _anchor=f'direction-{direction_id}'))
+
+    @app.post('/attention-directions/<int:direction_id>/backfill')
+    def direction_backfill(direction_id):
+        confirmed = parse_bool(request.form.get('confirmed'),'confirmed')
+        date_from,date_to = request.form.get('date_from'),request.form.get('date_to')
+        if not confirmed:
+            preview = direction_backfill_preview(direction_id,date_from,date_to)
+            return render_template('direction_backfill_preview.html',preview=preview)
+        job_id = runtime_runner.enqueue_direction_backfill(direction_id,date_from,date_to)
+        flash(f'已创建历史补分类任务 #{job_id}，匹配／可能匹配后自动继续缺失摘要评估。')
+        return redirect(url_for('job_detail',job_id=job_id))
+
+    @app.post('/api/papers/<int:paper_id>/direction-decisions')
+    def save_direction_decision(paper_id):
+        direction_id = parse_int(request.form.get('direction_id'),'direction_id',minimum=1,maximum=2**63-1)
+        db.set_direction_decision(paper_id,direction_id,request.form.get('decision'))
+        flash('人工分类已保存；模型原始判断未被覆盖，不触发模型评估。')
+        return redirect(url_for('paper_detail',paper_id=paper_id,_anchor='paper-directions'))
+
     @app.get("/prompts")
     def prompts():
         return render_template(
@@ -395,7 +728,7 @@ def register_routes(app: Flask) -> None:
         prompt_type = parse_choice(
             request.form.get("type"),
             "type",
-            {"abstract_review", "fulltext_review"},
+            {"abstract_review", "fulltext_review", "direction_classification", "investment_memo"},
         )
         data = {
             "id": _optional_int(request.form.get("id")),
@@ -469,6 +802,8 @@ def register_routes(app: Flask) -> None:
             "enabled": parse_bool(request.form.get("enabled"), "enabled"),
             "is_default_abstract": parse_bool(request.form.get("is_default_abstract"), "is_default_abstract"),
             "is_default_fulltext": parse_bool(request.form.get("is_default_fulltext"), "is_default_fulltext"),
+            "is_default_classification": parse_bool(request.form.get('is_default_classification'), 'is_default_classification'),
+            "is_default_memo": parse_bool(request.form.get('is_default_memo'),'is_default_memo'),
         }
         db.save_llm_profile(data)
         flash("LLM Profile 已保存")
@@ -527,25 +862,96 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/logs")
     def logs():
-        log_text = CURRENT_LOG.read_text(encoding="utf-8") if CURRENT_LOG.exists() else ""
+        log_text = _current_log_text()
         return render_template("logs.html", log_text=log_text, jobs=_job_status_payloads(db.list_job_summaries(80)))
 
     @app.get("/api/logs/current")
     def current_log():
-        log_text = CURRENT_LOG.read_text(encoding="utf-8") if CURRENT_LOG.exists() else ""
-        return Response(log_text, mimetype="text/plain; charset=utf-8")
+        return Response(_current_log_text(), mimetype="text/plain; charset=utf-8", headers={'Cache-Control': 'no-store'})
 
     @app.get("/api/jobs/progress")
     def jobs_progress():
-        runtime_runner.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
         jobs = _job_status_payloads(db.list_active_job_progress(12))
         return {
             "jobs": jobs
         }
 
+    @app.get('/jobs/<int:job_id>')
+    def job_detail(job_id: int):
+        job, card, filters, event_page = job_detail_data(job_id)
+        return render_template('job_detail.html', job=job, pipeline=card, filters=filters,
+                               event_page=event_page, stages=job_views.STAGES)
+
+    def job_detail_data(job_id: int):
+        raw = db.get_job(job_id)
+        if not raw:
+            abort(404)
+        severity = request.args.get('severity', 'issues')
+        view = request.args.get('view', 'grouped')
+        stage = request.args.get('stage', '')
+        if severity not in {'issues', 'all', 'warning', 'error'} or view not in {'grouped', 'timeline'} or (stage and stage not in job_views.STAGES):
+            abort(400)
+        filters = {'severity': severity, 'view': view, 'stage': stage,
+                   'category': request.args.get('category', '')[:64], 'crawl_date': request.args.get('crawl_date', '')[:16]}
+        if filters['category'] and not re.fullmatch(r'[A-Za-z][A-Za-z.-]{0,30}', filters['category']):
+            abort(400)
+        if filters['crawl_date'] and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', filters['crawl_date']):
+            abort(400)
+        job = _job_status_payloads([raw])[0]
+        card = job.get('pipeline')
+        events = db.list_job_event_page(job_id, **filters, page=_query_int(request.args.get('page'), 1, 1))
+        events['items'] = [job_views.event_view(event) for event in events['items']]
+        return job, card, filters, events
+
+    @app.get('/api/jobs/<int:job_id>/diagnostic')
+    def job_diagnostic(job_id: int):
+        job, card, filters, events = job_detail_data(job_id)
+        # Only safe display models leave this endpoint, never raw payloads or messages.
+        result = {'job_id': job_id, 'status': job['status'], 'timezone': 'Asia/Shanghai',
+                  'summary': card, 'filters': filters, 'events': events,
+                  'scope': '仅包含当前筛选和当前页；完整时间线请逐页查看'}
+        return Response(json.dumps(result, ensure_ascii=False, indent=2), mimetype='application/json',
+                        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+    @app.post('/api/jobs/<int:job_id>/retry')
+    def retry_pipeline(job_id: int):
+        original = db.get_job(job_id)
+        if not original:
+            abort(404)
+        if original['type'] != db.DAILY_PIPELINE_JOB_TYPE or original['status'] not in db.JOB_TERMINAL_STATUSES:
+            abort(409)
+        mode = request.form.get('mode', 'all')
+        if mode not in {'all', 'abstract_only'}:
+            abort(400)
+        try:
+            target_id, created = runtime_runner.enqueue_pipeline('manual_latest', retry_of_job_id=job_id, retry_mode=mode)
+        except (ValueError, KeyError):
+            flash('无法重试：计划或事件不可用。事件已清理时，请使用新的抓取或“评估缺失摘要”入口。')
+            return redirect(url_for('job_detail', job_id=job_id))
+        flash(f'已创建重试任务 #{target_id}' if created else f'已有抓取任务 #{target_id}，未重复创建')
+        return redirect(url_for('job_detail', job_id=target_id))
+
+
+def _current_log_text() -> str:
+    if not CURRENT_LOG.exists():
+        return ''
+    with CURRENT_LOG.open('rb') as stream:
+        size = stream.seek(0, 2)
+        stream.seek(max(0, size - 256 * 1024))
+        value = stream.read().decode('utf-8', errors='replace')
+    return job_views.redact_text(value)
+
 
 def _optional_int(value: str | None) -> int | None:
     return parse_optional_int(value, "id")
+
+
+def _direction_filters():
+    direction_id = parse_int(request.args.get('direction_id'),'direction_id',minimum=1,maximum=2**63-1) if request.args.get('direction_id') else None
+    filters = {'direction_id':direction_id,'model_state':request.args.get('model_state',''),
+               'manual_state':request.args.get('manual_state',''),'direction_view':request.args.get('direction_view','focused')}
+    db.direction_filter_sql('p.id',**filters)
+    return filters
 
 
 def _paper_digest_query_from_request() -> db.PaperDigestQuery:
@@ -585,6 +991,9 @@ def _settings_form_values() -> dict[str, Any]:
         "markdown_retention_days": _safe_setting_int(values, "cache.markdown_retention_days", 7, minimum=0),
         "cleanup_on_start": _safe_setting_bool(values, "cache.cleanup_on_start", True),
         "cleanup_daily": _safe_setting_bool(values, "cache.cleanup_daily", True),
+        "abstract_retries": _safe_setting_int(values, 'llm.abstract_retries', 2, minimum=0, maximum=5),
+        "event_retention_days": _safe_setting_int(values, 'job_events.retention_days', 30, minimum=1, maximum=3650),
+        "missing_field_warning_rate": values.get('crawler.missing_field_warning_rate', 0.0),
         "abstract_concurrency": _safe_setting_int(
             values,
             "llm.abstract_concurrency",
@@ -704,7 +1113,7 @@ def _paper_evaluation_actions(paper_id: int) -> list[dict[str, Any]]:
             "key": "abstract_review",
             "title": "摘要 Prompt",
             "action_url": url_for("evaluate_abstract", paper_id=paper_id),
-            "button_label": "重新摘要评估",
+            "button_label": "手动摘要评估（已有结果时重新评估）",
             "prompt_options": evaluation_prompt_options("abstract_review"),
             "force_markdown": False,
         },
@@ -744,6 +1153,9 @@ def _enqueue_paper_evaluation(
 
 def _job_type_label(job_type: str | None) -> str:
     return {
+        "daily_pipeline": "每日情报流水线",
+        "direction_backfill": "关注方向历史补分类",
+        "investment_memo_generation": "研究备忘录生成",
         "crawl": "抓取 Metadata",
         "crawl_catch_up": "补抓到最新",
         "abstract_eval": "摘要评估",
@@ -757,7 +1169,9 @@ def _job_status_label(status: str | None) -> str:
         "pending": "排队中",
         "running": "运行中",
         "success": "已完成",
+        "partial_success": "部分完成",
         "failed": "失败",
+        "interrupted": "已中断",
     }.get(str(status or ""), str(status or "未知"))
 
 
@@ -793,22 +1207,49 @@ def _job_progress_payload(job: dict[str, Any]) -> dict[str, Any]:
         "started_at": job.get("started_at") or "",
         "finished_at": job.get("finished_at") or "",
         "is_pending": status == "pending",
-        "is_failed": status == "failed",
+        "is_failed": status in {"failed", "interrupted"},
     }
 
 
 def _job_message(job: dict[str, Any]) -> str:
-    if job.get("status") == "failed" and job.get("error_message"):
+    if job.get("status") in {"failed", "interrupted"} and job.get("error_message"):
         return str(job.get("error_message") or "")
     return str(job.get("progress_message") or _job_progress_label(job))
 
 
 def _job_status_payloads(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [_job_progress_payload(job) for job in jobs]
+    cards = job_views.pipeline_cards(jobs)
+    result = []
+    for raw in jobs:
+        job = _job_progress_payload(raw)
+        job['detail_url'] = url_for('job_detail', job_id=job['id'])
+        for key in ('created_at', 'started_at', 'finished_at'):
+            job[key] = job_views.local_time(job[key])
+        if job['id'] in cards:
+            card = cards[job['id']]
+            job.update(pipeline=card, message=card['message'], progress_message=card['message'],
+                       error_message='', progress_details={},
+                       detail={'summary_lines': card['summary_lines'], 'item_rows': []})
+        else:
+            job['message'] = job_views.redact_text(job['message'])
+            job['error_message'] = job_views.redact_text(job['error_message'])
+            job['progress_message'] = job_views.redact_text(job['progress_message'])
+            # Legacy progress needs only a small, sanitized presentation model.
+            job['progress_details'] = {}
+            if job['detail']:
+                for item in job['detail']['item_rows']:
+                    item['line'] = job_views.redact_text(item['line'])
+                    item['title'] = job_views.redact_text(item['title'])
+                job['detail']['summary_lines'] = [job_views.redact_text(line) for line in job['detail']['summary_lines']]
+        result.append(job)
+    return result
 
 
 def _job_detail_payload(details: dict[str, Any]) -> dict[str, Any] | None:
     phase = details.get("phase")
+    if phase == 'investment_memo':
+        return {'summary_lines':[f"备忘录版本 #{details.get('version_id')} · {details.get('paper_count',0)} 篇论文",
+                                 f"输入 token {details.get('input_tokens')} / 输出 {details.get('output_tokens')}"], 'item_rows':[]}
     if phase == "crawl":
         summary = details.get("summary") or {}
         return {

@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+{% block title %}关注方向 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">Reading focus / 阅读前筛选</span><h1>关注方向</h1>
+  <p class="muted">你定义边界，模型依据原始摘要筛选。与阅读后手动归档的投资主题相互独立。</p>
+  <p>保存后不能修改；归档后不可恢复。新增方向不会自动重跑历史论文。</p>
+  {% if not directions|selectattr('status','equalto','active')|list %}<p role="status">当前未启用关注方向，将对全部新论文执行摘要评估。</p>{% endif %}
+  <a href="{{ url_for('attention_directions', archived='0' if show_archived else '1') }}">{{ '只看启用方向' if show_archived else '查看归档历史' }}</a>
+</div></section>
+<div class="theme-workspace">
+  <section class="theme-create"><h2>新增关注方向</h2>
+    <form method="post" action="{{ url_for('create_attention_direction') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>方向名称<input name="name" required></label>
+      <label>范围简介<textarea name="scope_text" required rows="6" placeholder="用自然语言描述你关心的范围，也可以加入排除项或例子。"></textarea></label>
+      <button type="submit">保存新方向</button>
+    </form>
+    <p class="small muted">分类使用独立模型。请在 <a href="{{ url_for('llm_profiles') }}">LLM 设置</a>选择默认分类模型，或在 <a href="{{ url_for('prompts') }}">Prompt 管理</a>单独绑定。</p>
+  </section>
+  <section class="theme-catalog" aria-label="关注方向目录">
+    {% for direction in directions if direction.status == 'active' or show_archived %}
+    <article class="theme-record {{ direction.status }}" id="direction-{{ direction.id }}">
+      <header><h2>{{ direction.name }}</h2><span class="decision-badge">{{ '启用' if direction.status == 'active' else '已归档（终态）' }}</span></header>
+      <p class="theme-description">{{ direction.scope_text }}</p><p class="small muted">#{{ direction.id }} · {{ direction.created_at }}</p>
+      {% if direction.status == 'active' %}
+      <details><summary>手动补分类历史论文</summary>
+        <p class="small muted">按抓取日期选择闭区间；跨类目去重，只处理本方向尚无成功结果的论文。先预览调用上限，再确认执行。</p>
+        <form method="post" action="{{ url_for('direction_backfill',direction_id=direction.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>开始日期<input name="date_from" type="date" required></label><label>结束日期<input name="date_to" type="date" required></label>
+          <button type="submit">预览历史补分类</button>
+        </form>
+      </details>
+      <form method="post" action="{{ url_for('archive_attention_direction', direction_id=direction.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">归档方向（不可恢复）</button>
+      </form>
+      {% endif %}
+    </article>
+    {% else %}<p class="empty">还没有关注方向。</p>{% endfor %}
+  </section>
+</div>
+{% endblock %}

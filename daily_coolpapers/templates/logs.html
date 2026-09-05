@@ -4,7 +4,7 @@
 <section class="detail-head">
   <div>
     <h1>当前运行日志</h1>
-    <p class="muted">服务启动时会清空上次日志。</p>
+    <p class="muted">显示最近 256 KB 文本，敏感字段和 URL 已隐藏。流水线计数及完整时间线请打开下方任务详情；原日志仍按已有设置保留。</p>
   </div>
   <a class="button secondary" href="{{ url_for('current_log') }}" target="_blank">打开纯文本</a>
 </section>
@@ -16,7 +16,7 @@
     <tbody>
       {% for job in jobs %}
         <tr>
-          <td>#{{ job.id }}</td>
+          <td><a href="{{ job.detail_url }}">#{{ job.id }} · 详情</a></td>
           <td>{{ job.type_label }}</td>
           <td><span class="badge {{ job.status }}">{{ job.status_label }}</span></td>
           <td>{{ job.started_at or "" }}</td>

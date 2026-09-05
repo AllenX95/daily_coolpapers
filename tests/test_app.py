@@ -142,8 +142,8 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("stars_desc".encode(), response.data)
         self.assertIn('name="date_from"'.encode(), response.data)
         self.assertIn('name="date_to"'.encode(), response.data)
-        self.assertIn("抓取最新 Metadata".encode("utf-8"), response.data)
-        self.assertIn("补抓到最新".encode("utf-8"), response.data)
+        self.assertIn("抓取并摘要评估".encode("utf-8"), response.data)
+        self.assertIn("补抓并摘要评估".encode("utf-8"), response.data)
         self.assertIn("评估缺失摘要".encode("utf-8"), response.data)
         self.assertIn("全文评估".encode("utf-8"), response.data)
 
@@ -213,7 +213,7 @@ class AppSmokeTests(unittest.TestCase):
 
     def test_management_pages_load(self):
         client = self.app.test_client()
-        for path in ["/favorites", "/categories", "/prompts", "/llm-profiles", "/settings", "/logs"]:
+        for path in ["/favorites", "/reviewed-papers", "/categories", "/prompts", "/llm-profiles", "/settings", "/logs"]:
             response = client.get(path)
             self.assertEqual(response.status_code, 200, path)
 
@@ -221,8 +221,69 @@ class AppSmokeTests(unittest.TestCase):
         client = self.app.test_client()
         response = client.get("/favorites")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("fulltext-favorites".encode(), response.data)
+        self.assertIn("personal-favorites".encode(), response.data)
         self.assertIn("score_desc".encode(), response.data)
+
+    def test_favorites_route_uses_page_model(self):
+        client = self.app.test_client()
+        page_model = {
+            "papers": [],
+            "sort": "evaluated_desc",
+            "sort_options": [
+                {"value": "evaluated_desc", "label": "评估时间", "selected": True},
+                {"value": "score_desc", "label": "全文评分", "selected": False},
+            ],
+        }
+        with (
+            patch("daily_coolpapers.app.favorite_papers_page_model", return_value=page_model) as model,
+            patch("daily_coolpapers.app.db.list_fulltext_reviewed_papers") as list_reviewed,
+            patch("daily_coolpapers.app.render_template", return_value="ok") as render,
+        ):
+            response = client.get("/favorites?sort=bad")
+
+        self.assertEqual(response.status_code, 200)
+        model.assert_called_once_with("bad")
+        list_reviewed.assert_not_called()
+        self.assertEqual(render.call_args.args[0], "favorites.html")
+        self.assertEqual(render.call_args.kwargs, page_model)
+
+    def test_favorites_page_renders_card_model(self):
+        client = self.app.test_client()
+        page_model = {
+            "sort": "score_desc",
+            "sort_options": [
+                {"value": "evaluated_desc", "label": "评估时间", "selected": False},
+                {"value": "score_desc", "label": "全文评分", "selected": True},
+            ],
+            "papers": [
+                {
+                    "id": 7,
+                    "title": "Favorite Paper",
+                    "arxiv_id": "2606.00007",
+                    "abs_url": "https://arxiv.org/abs/2606.00007",
+                    "category_label": "cs.AI / Rank 1 / Stars 9",
+                    "evaluation_label": "2026-06-30 12:00:00 / model-x",
+                    "score_text": "91",
+                    "attention": "must_read",
+                    "one_sentence_summary": "One line",
+                    "summary_excerpt": "Detailed summary",
+                    "vc_summary": "Strong impact",
+                    "market_relevance": "High",
+                    "recommended_action": "Read deeply",
+                    "novelty_assessment": "Novel",
+                    "tags": ["agent", "infra"],
+                }
+            ],
+        }
+        with patch("daily_coolpapers.app.favorite_papers_page_model", return_value=page_model):
+            response = client.get("/favorites?sort=score_desc")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Favorite Paper".encode(), response.data)
+        self.assertIn("cs.AI / Rank 1 / Stars 9".encode(), response.data)
+        self.assertIn("Detailed summary".encode(), response.data)
+        self.assertIn("Strong impact".encode(), response.data)
+        self.assertIn("agent".encode(), response.data)
 
     def test_settings_has_abstract_concurrency(self):
         client = self.app.test_client()
@@ -520,7 +581,7 @@ class AppSmokeTests(unittest.TestCase):
             response = client.get("/api/jobs/progress")
 
         self.assertEqual(response.status_code, 200)
-        reconcile.assert_called_once_with(min_interval_seconds=30)
+        reconcile.assert_not_called()
         list_progress.assert_called_once_with(12)
         data = response.get_json()
         self.assertEqual(len(data["jobs"]), 1)
@@ -535,16 +596,23 @@ class AppSmokeTests(unittest.TestCase):
     def test_split_crawl_and_eval_routes_enqueue(self):
         client = self.app.test_client()
         csrf_data = self.csrf_data(client)
-        with patch("daily_coolpapers.app.job_runner.enqueue", return_value=999) as enqueue:
+        with (
+            patch("daily_coolpapers.app.job_runner.enqueue", return_value=999) as enqueue,
+            patch("daily_coolpapers.app.job_runner.enqueue_pipeline", return_value=(998, True)) as pipeline,
+        ):
             for path, text in [
-                ("/api/crawl/run", "metadata 抓取任务"),
-                ("/api/crawl/catch-up", "metadata 补抓到最新任务"),
+                ("/api/crawl/run", "抓取并摘要评估任务"),
+                ("/api/crawl/catch-up", "补抓并摘要评估任务"),
                 ("/api/abstract-evaluations/run", "摘要评估任务"),
             ]:
-                response = client.post(path, data=csrf_data, follow_redirects=True)
-                self.assertEqual(response.status_code, 200, path)
-                self.assertIn(text.encode("utf-8"), response.data)
-            self.assertEqual(enqueue.call_count, 3)
+                response = client.post(path, data=csrf_data)
+                self.assertEqual(response.status_code, 302, path)
+                with client.session_transaction() as session:
+                    self.assertTrue(any(text in message for _, message in session.get('_flashes', [])))
+                if path.startswith('/api/crawl/'):
+                    self.assertTrue(response.location.endswith('/jobs/998'))
+            self.assertEqual(enqueue.call_count, 1)
+            self.assertEqual(pipeline.call_count, 2)
 
     def test_health_endpoint(self):
         client = self.app.test_client()

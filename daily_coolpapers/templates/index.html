@@ -9,6 +9,7 @@
   </div>
   <div class="hero-signal"><span></span>Local workspace</div>
 </section>
+{% if not directions|selectattr('status','equalto','active')|list %}<p class="run-notice">当前未启用关注方向，将对全部新论文执行摘要评估。</p>{% endif %}
 <section class="toolbar">
   <form method="get" class="filters toolbar-primary">
     <input type="hidden" name="page_size" value="{{ paper_page.page_size }}">
@@ -40,6 +41,10 @@
         <option value="updated" {% if sort == "updated" %}selected{% endif %}>更新时间</option>
       </select>
     </label>
+    <label>阅读范围<select name="direction_view"><option value="focused" {% if direction_filters.direction_view == 'focused' %}selected{% endif %}>有效分类与待确认</option><option value="all" {% if direction_filters.direction_view == 'all' %}selected{% endif %}>全部入库论文</option></select></label>
+    <label>关注方向<select name="direction_id"><option value="">全部方向</option>{% for direction in directions %}<option value="{{ direction.id }}" {% if direction_filters.direction_id == direction.id %}selected{% endif %}>{{ direction.name }}{{ '（归档）' if direction.status == 'archived' else '' }} · #{{ direction.id }}</option>{% endfor %}</select></label>
+    <label>模型分类<select name="model_state"><option value="">不限</option>{% for state,label in [('matched','matched / 明确匹配'),('possible','possible / 可能匹配'),('unmatched','unmatched / 未匹配'),('failed','failed / 分类失败')] %}<option value="{{ state }}" {% if direction_filters.model_state == state %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label>人工分类<select name="manual_state"><option value="">不限</option>{% for state,label in [('confirmed','已确认'),('rejected','已否决'),('pending','待确认 possible')] %}<option value="{{ state }}" {% if direction_filters.manual_state == state %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
     <button type="submit">筛选</button>
     <a class="button secondary" href="{{ export_csv_url }}">导出 CSV</a>
   </form>
@@ -48,11 +53,11 @@
       <span class="toolbar-group-label">数据任务</span>
       <form method="post" action="{{ url_for('run_crawl') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit">抓取最新 Metadata</button>
+        <button type="submit">抓取并摘要评估</button>
       </form>
       <form method="post" action="{{ url_for('run_crawl_catch_up') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="secondary">补抓到最新</button>
+        <button type="submit" class="secondary">补抓并摘要评估</button>
       </form>
       <form method="post" action="{{ url_for('run_abstract_evaluations') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -81,57 +86,13 @@
   <div class="progress-panel-head">
     <div>
       <strong>任务中心</strong>
-      <div class="muted small">只跟踪当前服务队列中的排队/运行任务；最近失败任务会保留原因。</div>
+      <div class="muted small">保留最近运行结果；展开详情可按日期、类目和阶段排查。</div>
     </div>
-    <span class="muted small">每 1.5 秒自动刷新</span>
+    <a class="small" href="{{ url_for('logs') }}">更多运行记录 →</a>
   </div>
   <div id="job-progress-list" class="job-progress-list">
     {% for job in progress_jobs %}
-      <article class="job-progress-card {{ job.status }}">
-        <div class="job-card-head">
-          <div class="job-title-line">
-            <strong>{{ job.type_label }}</strong>
-            <span class="badge {{ job.status }}">{{ job.status_label }}</span>
-          </div>
-          <span class="job-id">#{{ job.id }}</span>
-        </div>
-        <div class="job-message {% if job.is_failed %}danger{% endif %}">{{ job.message }}</div>
-        {% if job.is_pending %}
-          <div class="queued-line"><span></span>等待 worker 接收任务</div>
-        {% else %}
-          <div class="progress-bar" aria-label="任务进度">
-            <div style="width: {{ job.progress_percent }}%"></div>
-          </div>
-        {% endif %}
-        <div class="job-meta-row">
-          <span>{{ job.progress_label }}</span>
-          <span>创建 {{ job.created_at }}</span>
-          {% if job.started_at %}<span>开始 {{ job.started_at }}</span>{% endif %}
-          {% if job.finished_at %}<span>结束 {{ job.finished_at }}</span>{% endif %}
-        </div>
-        {% if job.detail %}
-          <div class="job-detail-block">
-            <div class="crawl-progress-summary">
-              {% for line in job.detail.summary_lines %}
-                <span>{{ line }}</span>
-              {% endfor %}
-            </div>
-            {% if job.detail.item_rows %}
-              <div class="crawl-progress-grid">
-                {% for item in job.detail.item_rows %}
-                  <div class="crawl-progress-item {{ item.status }}">
-                    <div class="crawl-progress-title">
-                      <strong>{{ item.title }}</strong>
-                      <span class="badge {{ item.status }}">{{ item.status_label }}</span>
-                    </div>
-                    <div class="small muted">{{ item.line|truncate_text(160) }}</div>
-                  </div>
-                {% endfor %}
-              </div>
-            {% endif %}
-          </div>
-        {% endif %}
-      </article>
+      {% include 'partials/job_card.html' %}
     {% endfor %}
   </div>
 </section>
@@ -195,6 +156,7 @@
           <td class="paper-main">
             <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
             <div class="muted small">{{ paper.authors_list|join(", ")|truncate_text(160) }}</div>
+            <div class="tag-list">{% for direction in paper.direction_results if direction.direction_status == 'active' and (direction.effective or direction.pending) %}<span>{{ direction.name }} · {{ '待确认分类' if direction.pending else '有效关注方向' }}</span>{% endfor %}</div>
             <details>
               <summary>Abstract</summary>
               <p>{{ paper.abstract }}</p>
@@ -244,7 +206,7 @@
         </tr>
       {% else %}
         <tr>
-          <td colspan="8" class="empty">暂无论文。点击“抓取最新 Metadata”开始。</td>
+          <td colspan="8" class="empty">暂无论文。点击“抓取并摘要评估”开始。</td>
         </tr>
       {% endfor %}
     </tbody>
@@ -253,11 +215,11 @@
 {% if paper_page.pages > 1 %}
   <nav class="pagination" aria-label="论文分页">
     {% if paper_page.has_previous %}
-      <a class="button secondary" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort, page=paper_page.page - 1, page_size=paper_page.page_size) }}">上一页</a>
+      <a class="button secondary" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort, page=paper_page.page - 1, page_size=paper_page.page_size, **direction_filters) }}">上一页</a>
     {% endif %}
     <span>第 {{ paper_page.page }} / {{ paper_page.pages }} 页</span>
     {% if paper_page.has_next %}
-      <a class="button secondary" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort, page=paper_page.page + 1, page_size=paper_page.page_size) }}">下一页</a>
+      <a class="button secondary" href="{{ url_for('index', date=selected_date, date_from=date_from, date_to=date_to, category=selected_category, attention=attention, sort=sort, page=paper_page.page + 1, page_size=paper_page.page_size, **direction_filters) }}">下一页</a>
     {% endif %}
   </nav>
 {% endif %}
@@ -280,7 +242,9 @@
       pending: "排队中",
       running: "运行中",
       success: "已完成",
+      partial_success: "部分完成",
       failed: "失败",
+      interrupted: "已中断",
     }[status] || status || "未知";
   }
 
@@ -295,12 +259,17 @@
     titleLine.appendChild(text("strong", "", job.type_label || job.type || "任务"));
     titleLine.appendChild(text("span", `badge ${job.status || ""}`, job.status_label || statusLabel(job.status)));
     head.appendChild(titleLine);
-    head.appendChild(text("span", "job-id", `#${job.id}`));
+    const link = text("a", "job-id", `#${job.id} · 查看详情 →`);
+    link.href = job.detail_url;
+    head.appendChild(link);
 
     const mainMessage = job.message || job.progress_message || job.progress_label || "任务准备中";
-    const message = text("div", job.status === "failed" ? "job-message danger" : "job-message", mainMessage);
+    const message = text("div", ["failed", "interrupted"].includes(job.status) ? "job-message danger" : "job-message", mainMessage);
 
     card.appendChild(head);
+    if (job.pipeline) {
+      card.appendChild(text('div', 'job-meta-row', `${job.pipeline.source} · ${job.pipeline.date_range} · ${job.pipeline.stage_label} · 耗时 ${job.pipeline.duration}`));
+    }
     card.appendChild(message);
     if (job.status === "pending") {
       const queued = document.createElement("div");
@@ -312,6 +281,11 @@
       const bar = document.createElement("div");
       bar.className = "progress-bar";
       const fill = document.createElement("div");
+      bar.setAttribute('role', 'progressbar');
+      bar.setAttribute('aria-label', '当前阶段进度');
+      bar.setAttribute('aria-valuenow', job.progress_percent || 0);
+      bar.setAttribute('aria-valuemin', 0);
+      bar.setAttribute('aria-valuemax', 100);
       fill.style.width = `${job.progress_percent || 0}%`;
       bar.appendChild(fill);
       card.appendChild(bar);
@@ -372,8 +346,7 @@
       const data = await response.json();
       const active = data.jobs.filter((job) => job.status === "pending" || job.status === "running");
       if (active.length === 0) {
-        panel.hidden = true;
-        if (hadActive) window.location.reload();
+        if (hadActive) { hadActive = false; window.location.reload(); }
         return;
       }
       hadActive = true;
@@ -384,12 +357,7 @@
     }
   }
 
-  if (hadActive) {
-    const timer = window.setInterval(async () => {
-      await refreshProgress();
-      if (panel.hidden && !hadActive) window.clearInterval(timer);
-    }, 1500);
-  }
+  window.setInterval(() => { if (!document.hidden) refreshProgress(); }, 3000);
 })();
 </script>
 {% endblock %}

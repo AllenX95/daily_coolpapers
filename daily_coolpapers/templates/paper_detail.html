@@ -15,7 +15,8 @@
   </div>
   <div class="detail-actions">
     <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">打开 PDF</a>
-    {% if paper.abs_url %}<a class="button secondary" href="{{ paper.abs_url }}" target="_blank">打开 arXiv</a>{% endif %}
+    {% set abs_url = paper.abs_url|safe_arxiv_url %}
+    {% if abs_url %}<a class="button secondary" href="{{ abs_url }}" target="_blank" rel="noopener noreferrer">打开 arXiv</a>{% endif %}
     <a class="button secondary" href="{{ url_for('export_paper_markdown', paper_id=paper.id) }}">导出评估</a>
   </div>
 </section>
@@ -62,6 +63,8 @@
     </div>
   </aside>
 </section>
+
+{% include 'partials/paper_directions.html' %}
 
 <section id="fulltext-result" class="result-panel">
   <h2>全文评估结果</h2>
@@ -115,6 +118,25 @@
     <p class="danger">{{ latest_failure.error_message or "全文评估失败" }}</p>
   {% else %}
     <p class="empty">还没有成功的全文评估。点击右侧“全文阅读”后会显示在这里。</p>
+  {% endif %}
+  {% if personal_decision.eligible %}
+    <div class="personal-decision" aria-labelledby="personal-decision-heading" data-testid="personal-decision">
+      <div class="personal-decision-head">
+        <div><span class="eyebrow">Your decision / 个人判断</span><h3 id="personal-decision-heading">后续操作</h3></div>
+        <span class="decision-badge {{ personal_decision.decision }}">{{ personal_decision.label }}</span>
+      </div>
+      <p class="small muted">收藏和跳过代表你的个人选择，不改变模型评分；跳过不会删除论文和评估记录。</p>
+      {% for message in get_flashed_messages(category_filter=['decision']) %}<p class="decision-feedback" role="status">{{ message }}</p>{% endfor %}
+      <form method="post" action="{{ url_for('save_paper_decision', paper_id=paper.id) }}" class="decision-actions">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" name="decision" value="favorite" aria-pressed="{{ 'true' if personal_decision.decision == 'favorite' else 'false' }}" class="{{ 'selected' if personal_decision.decision == 'favorite' else 'secondary' }}">{{ '已收藏' if personal_decision.decision == 'favorite' else '收藏' }}</button>
+        <button type="submit" name="decision" value="skipped" aria-pressed="{{ 'true' if personal_decision.decision == 'skipped' else 'false' }}" class="secondary {{ 'selected' if personal_decision.decision == 'skipped' else '' }}">{{ '已跳过' if personal_decision.decision == 'skipped' else '跳过' }}</button>
+        {% if personal_decision.decision != 'undecided' %}<button type="submit" name="decision" value="clear" class="secondary">{{ '取消收藏，恢复未处理' if personal_decision.decision == 'favorite' else '恢复未处理' }}</button>{% endif %}
+      </form>
+      <div class="small library-links"><a href="{{ url_for('favorites') }}">查看收藏</a><a href="{{ url_for('reviewed_papers') }}">返回全文库</a></div>
+    </div>
+    {% include 'partials/paper_themes.html' %}
+    {% include 'partials/paper_team.html' %}
   {% endif %}
 </section>
 

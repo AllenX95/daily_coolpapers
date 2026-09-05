@@ -9,7 +9,7 @@ from daily_coolpapers.llm import LLMError
 
 class EvaluationOutcomeTests(unittest.TestCase):
     def _inputs(self, evaluation_type):
-        paper = {"id": 1, "title": "Paper", "subjects_list": [], "abstract": "A"}
+        paper = {"id": 1, "arxiv_id": "2609.00001", "title": "Paper", "subjects_list": [], "abstract": "A"}
         prompt = {
             "id": 2,
             "version": 1,
@@ -52,6 +52,9 @@ class EvaluationOutcomeTests(unittest.TestCase):
         paper, prompt, profile = self._inputs("abstract_review")
         prompt["template"] = "{{ title }}"
         with (
+            patch.object(services.db, 'claim_abstract_evaluation', return_value=('test', None)),
+            patch.object(services.db, 'release_evaluation_claim'),
+            patch.object(services.db, 'mark_evaluation_provider_started'),
             patch.object(services.db, "get_paper", return_value=paper),
             patch.object(services.db, "get_default_prompt", return_value=prompt),
             patch.object(services.db, "get_llm_profile", return_value=profile),

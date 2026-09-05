@@ -533,6 +533,76 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[1][4:6], ["99", "read"])
         self.assertEqual(rows[2][4:6], ["", ""])
 
+    def test_favorite_papers_page_model_prepares_template_cards(self):
+        with tempfile.TemporaryDirectory(dir=self.tmp_root) as tmp:
+            with patch.object(db, "DB_PATH", Path(tmp) / "test.sqlite3"):
+                db.init_db()
+                paper_id = db.upsert_papers(
+                    [
+                        {
+                            "arxiv_id": "2606.00008",
+                            "title": "Favorite Paper",
+                            "authors": ["Ada"],
+                            "abstract": "Fallback abstract.",
+                            "subjects": ["cs.AI"],
+                            "published_at": "2026-06-05",
+                            "pdf_url": "https://arxiv.org/pdf/2606.00008",
+                            "abs_url": "https://arxiv.org/abs/2606.00008",
+                            "papers_cool_url": "https://papers.cool/arxiv/2606.00008",
+                            "rank": 1,
+                            "reading_stars": 9,
+                            "pdf_clicks": 4,
+                            "kimi_clicks": 5,
+                        }
+                    ],
+                    "cs.AI",
+                    "2026-06-05",
+                )[0]
+                db.create_evaluation(
+                    paper_id,
+                    "fulltext_review",
+                    None,
+                    None,
+                    None,
+                    "model-x",
+                    "success",
+                    {
+                        "score": 91,
+                        "attention": "must_read",
+                        "one_sentence_summary": "One line",
+                        "detailed_summary_zh": "Detailed summary",
+                        "vc_perspective": {
+                            "impact": "Strong impact",
+                            "market_relevance": "High",
+                        },
+                        "recommended_action": "Read deeply",
+                        "novelty_assessment": "Novel",
+                        "tags": ["agent", "infra"],
+                    },
+                    "{}",
+                    None,
+                )
+
+                self.assertEqual(services.favorite_papers_page_model()['papers'], [])
+                db.set_paper_decision(paper_id, 'favorite')
+                page_model = services.favorite_papers_page_model("bad-sort")
+
+        self.assertEqual(page_model["sort"], "evaluated_desc")
+        self.assertTrue(page_model["sort_options"][0]["selected"])
+        card = page_model["papers"][0]
+        self.assertEqual(card["title"], "Favorite Paper")
+        self.assertEqual(card["score_text"], "91")
+        self.assertEqual(card["attention"], "must_read")
+        self.assertEqual(card["one_sentence_summary"], "One line")
+        self.assertEqual(card["summary_excerpt"], "Detailed summary")
+        self.assertEqual(card["vc_summary"], "Strong impact")
+        self.assertEqual(card["market_relevance"], "High")
+        self.assertEqual(card["recommended_action"], "Read deeply")
+        self.assertEqual(card["novelty_assessment"], "Novel")
+        self.assertEqual(card["tags"], ["agent", "infra"])
+        self.assertEqual(card["category_label"], "cs.AI / Rank 1 / Stars 9")
+        self.assertIn("model-x", card["evaluation_label"])
+
     def test_evaluation_runner_uses_preloaded_config_without_prompt_profile_reads(self):
         config = services.EvaluationConfig(
             evaluation_type="abstract_review",

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}投资主题 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head">
+  <div><span class="eyebrow">Research folders / 研究归档</span><h1>投资主题</h1>
+    <p class="muted">记录你阅读后形成的投资主题。手动归档论文，不承担阅读前的自动筛选。</p>
+    {% if return_paper %}<a href="{{ url_for('paper_detail', paper_id=return_paper.id, _anchor='fulltext-result') }}">返回论文选择主题：{{ return_paper.title }}</a>{% endif %}
+  </div>
+  <div class="theme-totals"><strong>{{ themes|selectattr('status','equalto','active')|list|length }}</strong> 活跃主题 <span class="muted">/ {{ themes|selectattr('status','equalto','archived')|list|length }} 已归档</span></div>
+</section>
+<div class="theme-workspace">
+  <section class="theme-create" aria-labelledby="create-theme-heading">
+    <h2 id="create-theme-heading">创建投资主题</h2>
+    <p class="small muted">名称 1–80 字，说明最多 500 字。名称忽略全角／半角、大小写与连续空白的差异，归档后仍保留名称。</p>
+    <form method="post" action="{{ url_for('create_investment_theme') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if return_paper %}<input type="hidden" name="paper_id" value="{{ return_paper.id }}">{% endif %}
+      <label>主题名称<input name="name" aria-label="主题名称" required maxlength="80" placeholder="例如：面向企业的 Agent 基础设施"></label>
+      <label>主题说明（可选）<textarea name="description" aria-label="主题说明（可选）" maxlength="500" rows="4" placeholder="记录这个主题的投资假设或研究范围"></textarea></label>
+      <button type="submit">创建主题</button>
+    </form>
+  </section>
+  <section class="theme-catalog" aria-label="投资主题目录">
+    {% for theme in themes %}
+      <article class="theme-record {{ theme.status }}" id="theme-{{ theme.id }}" data-testid="theme-record">
+        <header><div><span class="decision-badge">{{ '活跃' if theme.status == 'active' else '已归档' }}</span><h2>{{ theme.name }}</h2></div>
+          <a href="{{ url_for('investment_theme_papers', theme_id=theme.id) }}">查看 {{ theme.paper_count }} 篇论文 →</a>
+        </header>
+        {% if theme.description %}<p class="theme-description">{{ theme.description }}</p>{% endif %}
+        {% if theme.status == 'archived' %}<p class="small muted">不再出现在论文选择器中，历史关系与同名占用保留。</p>{% endif %}
+        <div class="theme-maintenance">
+          <details><summary>编辑名称与说明</summary>
+            <form method="post" action="{{ url_for('update_investment_theme', theme_id=theme.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="update">
+              {% if return_paper %}<input type="hidden" name="paper_id" value="{{ return_paper.id }}">{% endif %}
+              <label>主题名称<input name="name" aria-label="主题名称" required maxlength="80" value="{{ theme.name }}"></label>
+              <label>主题说明（可选）<textarea name="description" aria-label="主题说明（可选）" maxlength="500" rows="3">{{ theme.description }}</textarea></label>
+              <button type="submit">保存修改</button>
+            </form>
+          </details>
+          <form method="post" action="{{ url_for('update_investment_theme', theme_id=theme.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="{{ 'archive' if theme.status == 'active' else 'restore' }}">
+            {% if return_paper %}<input type="hidden" name="paper_id" value="{{ return_paper.id }}">{% endif %}
+            <button type="submit" class="secondary">{{ '归档主题' if theme.status == 'active' else '恢复主题' }}</button>
+          </form>
+        </div>
+      </article>
+    {% else %}<p class="empty">还没有投资主题。先创建主题，再到论文全文结果下方选择加入。</p>{% endfor %}
+  </section>
+</div>
+{% endblock %}

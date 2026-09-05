@@ -6,6 +6,8 @@
   <meta name="theme-color" content="#f4f7ff">
   <title>{% block title %}Daily Cool Papers{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='job_center.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='personal_library.css') }}">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -18,6 +20,11 @@
       <nav class="main-nav" aria-label="主导航">
         <a class="nav-link {% if request.endpoint == 'index' %}active{% endif %}" {% if request.endpoint == 'index' %}aria-current="page"{% endif %} href="{{ url_for('index') }}">论文</a>
         <a class="nav-link {% if request.endpoint == 'favorites' %}active{% endif %}" {% if request.endpoint == 'favorites' %}aria-current="page"{% endif %} href="{{ url_for('favorites') }}">收藏</a>
+        <a class="nav-link {% if request.endpoint == 'reviewed_papers' %}active{% endif %}" {% if request.endpoint == 'reviewed_papers' %}aria-current="page"{% endif %} href="{{ url_for('reviewed_papers') }}">全文库</a>
+        <a class="nav-link {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}active{% endif %}" {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}aria-current="page"{% endif %} href="{{ url_for('investment_themes') }}">投资主题</a>
+        <a class="nav-link {% if request.endpoint == 'research_entities' %}active{% endif %}" {% if request.endpoint == 'research_entities' %}aria-current="page"{% endif %} href="{{ url_for('research_entities') }}">研究对象</a>
+        <a class="nav-link {% if request.endpoint == 'attention_directions' %}active{% endif %}" href="{{ url_for('attention_directions') }}">关注方向</a>
+        <a class="nav-link {% if request.endpoint and request.endpoint.startswith('memo_') %}active{% endif %}" href="{{ url_for('memo_list') }}">备忘录</a>
         <a class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}" {% if request.endpoint == 'categories' %}aria-current="page"{% endif %} href="{{ url_for('categories') }}">类目</a>
         <a class="nav-link {% if request.endpoint == 'prompts' %}active{% endif %}" {% if request.endpoint == 'prompts' %}aria-current="page"{% endif %} href="{{ url_for('prompts') }}">Prompt</a>
         <a class="nav-link {% if request.endpoint == 'llm_profiles' %}active{% endif %}" {% if request.endpoint == 'llm_profiles' %}aria-current="page"{% endif %} href="{{ url_for('llm_profiles') }}">LLM</a>

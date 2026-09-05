@@ -1,0 +1,19 @@
+<article class="job-progress-card {{ job.status }}">
+  <div class="job-card-head">
+    <div class="job-title-line"><strong>{{ job.type_label }}</strong><span class="badge {{ job.status }}">{{ job.status_label }}</span></div>
+    <a class="job-id" href="{{ job.detail_url }}">#{{ job.id }} · 查看详情 →</a>
+  </div>
+  {% if job.pipeline %}
+    <div class="job-meta-row"><span>{{ job.pipeline.source }}</span><span>{{ job.pipeline.date_range }}</span><span>{{ job.pipeline.stage_label }}</span><span>耗时 {{ job.pipeline.duration }}</span></div>
+  {% endif %}
+  <div class="job-message {% if job.is_failed %}danger{% endif %}">{{ job.message }}</div>
+  {% if job.is_pending %}<div class="queued-line"><span></span>等待执行</div>{% else %}
+    <div class="progress-bar" role="progressbar" aria-label="当前阶段进度" aria-valuenow="{{ job.progress_percent }}" aria-valuemin="0" aria-valuemax="100"><div style="width: {{ job.progress_percent }}%"></div></div>
+  {% endif %}
+  <div class="job-meta-row"><span>当前阶段 {{ job.progress_label }}</span><span>创建 {{ job.created_at }}（北京时间）</span></div>
+  {% if job.detail %}
+    <div class="job-detail-block"><div class="crawl-progress-summary">
+      {% for line in job.detail.summary_lines %}<span>{{ line }}</span>{% endfor %}
+    </div></div>
+  {% endif %}
+</article>

@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block title %}选择备忘录论文{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">01 / Select evidence</span><h1>{{ series.title if series else '新建研究备忘录' }}</h1><p>只选择已收藏且有成功全文评估的论文。先筛选，再勾选与调整顺序；更改筛选会重新选择初始候选。</p></div></section>
+{% if omitted_papers %}<p class="run-notice">以下旧版论文因当前资格或筛选条件未被预选，请核对后重新确认：{{ omitted_papers|join('；') }}。旧版本证据不受影响。</p>{% endif %}
+<form method="get" action="{{ url_for('memo_new_version',series_id=series.id,version_id=command.previous_version_id) if series else url_for('memo_new') }}" class="filters">
+  {% if not series %}
+  <label>来源模式<select name="source_mode">{% for value,label in [('manual','从收藏手工选择'),('attention_direction','按一个关注方向预选'),('investment_theme','按一个投资主题预选')] %}<option value="{{ value }}" {% if source.mode==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label>关注方向来源<select name="source_direction_id"><option value="">请选择</option>{% for d in directions %}<option value="{{ d.id }}" {% if source.mode=='attention_direction' and source.id==d.id %}selected{% endif %}>{{ d.name }}</option>{% endfor %}</select></label>
+  <label>投资主题来源<select name="source_theme_id"><option value="">请选择</option>{% for t in themes %}<option value="{{ t.id }}" {% if source.mode=='investment_theme' and source.id==t.id %}selected{% endif %}>{{ t.name }}</option>{% endfor %}</select></label>
+  {% endif %}
+  <label>标题／arXiv ID<input name="query" value="{{ filters.query or '' }}"></label>
+  <label>收藏开始<input type="date" name="favorite_from" value="{{ filters.favorite_from or '' }}"></label><label>收藏结束<input type="date" name="favorite_to" value="{{ filters.favorite_to or '' }}"></label>
+  <label>有效关注方向<select name="filter_direction_id"><option value="">不限</option>{% for d in directions %}<option value="{{ d.id }}" {% if filters.direction_id==d.id %}selected{% endif %}>{{ d.name }}</option>{% endfor %}</select></label>
+  <label>投资主题筛选<select name="filter_theme_id"><option value="">不限</option>{% for t in themes %}<option value="{{ t.id }}" {% if filters.theme_id==t.id %}selected{% endif %}>{{ t.name }}</option>{% endfor %}</select></label>
+  <label>人工作者<input name="author" value="{{ filters.author or '' }}"></label><label>人工机构<input name="organization" value="{{ filters.organization or '' }}"></label>
+  <label>最低全文分数<input type="number" name="min_score" min="0" max="100" value="{{ filters.min_score if filters.min_score is not none else '' }}"></label>
+  <label>排序<select name="sort">{% for value,label in [('favorite_desc','最新收藏'),('favorite_asc','最早收藏'),('score_desc','全文评分'),('title','标题')] %}<option value="{{ value }}" {% if filters.sort==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <button type="submit">更新候选</button>
+</form>
+{% if source.mode!='manual' %}<section class="run-notice"><h2>{{ source.name }}</h2><p class="theme-description">{{ source.scope }}</p>
+  <p>来源关联 {{ counts.source_total }} · 已收藏 {{ counts.source_favorites }} · 预选 {{ counts.preselected }}</p>
+  <p class="small">未收藏 {{ counts.not_favorite }} · 待确认 possible {{ counts.pending_possible }} · 人工否决 {{ counts.rejected }} · 缺少全文成功 {{ counts.missing_fulltext }} · 非有效分类 {{ counts.not_effective }}（排除原因可能重叠）。下方其他收藏可人工追加。</p></section>{% endif %}
+<form method="post" action="{{ url_for('memo_preview') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if series %}<input type="hidden" name="series_id" value="{{ series.id }}">{% if command.previous_version_id %}<input type="hidden" name="previous_version_id" value="{{ command.previous_version_id }}">{% endif %}
+  {% else %}<input type="hidden" name="source_mode" value="{{ source.mode }}">{% if source.id %}<input type="hidden" name="source_id" value="{{ source.id }}">{% endif %}
+  <label>系列标题（保存后不可修改）<input name="title" maxlength="120" required value="{{ command.title }}" placeholder="例如：Agent 长期记忆的产品机会"></label>{% endif %}
+  <div class="form-row"><label>研究备忘录 Prompt<select name="prompt_id"><option value="">使用默认备忘录 Prompt</option>{% for prompt in prompts %}<option value="{{ prompt.id }}" {% if command.prompt_id==prompt.id %}selected{% endif %}>{{ prompt.name }} · v{{ prompt.version }}</option>{% endfor %}</select></label>
+    <label>本次 Profile<select name="profile_id"><option value="">使用 Prompt 绑定或默认备忘录模型</option>{% for profile in profiles %}<option value="{{ profile.id }}" {% if command.profile_id==profile.id %}selected{% endif %}>{{ profile.name }} / {{ profile.model }}</option>{% endfor %}</select></label></div>
+  <p class="small muted">勾选论文，并用不同的顺序数字决定 [P1]、[P2] 编号。取消勾选只影响本版本，不改变收藏或主题。</p>
+  {% for paper in candidates %}
+  <article class="theme-record memo-candidate" data-testid="memo-candidate">
+    <label class="check"><input type="checkbox" name="paper_ids" value="{{ paper.id }}" {% if paper.id in selected_ids %}checked{% endif %}>{{ paper.title }}</label>
+    <p class="small">{{ paper.arxiv_id }} · 全文 {{ paper.score }} · 收藏 {{ paper.favorited_at }} · {{ '来源预选' if paper.preselected else ('人工追加候选' if source.mode!='manual' else '手工选择') }}</p>
+    <div class="tag-list">{% for d in paper.directions if d.effective %}<span>方向：{{ d.name }}</span>{% endfor %}{% for t in paper.themes %}<span>主题：{{ t.name }}</span>{% endfor %}</div>
+    {% if paper.team %}<p class="small">人工记录：{{ paper.team.author_name }} / {{ paper.team.organization_name }}</p>{% endif %}
+    <label>论文 {{ paper.id }} 顺序<input name="order_{{ paper.id }}" type="number" min="1" value="{{ selected_ids.index(paper.id)+1 if paper.id in selected_ids else loop.index+selected_ids|length }}"></label>
+  </article>
+  {% else %}<p class="empty">当前没有可选收藏论文。请先阅读、收藏论文，或放宽筛选条件。</p>{% endfor %}
+  {% if series %}<label class="check"><input type="checkbox" name="copy_judgment" value="1" {% if command.copy_judgment %}checked{% endif %}>复制所选旧版本的“我的投资判断”（不发送给模型）</label>{% endif %}
+  <button type="submit">预览输入与调用预算</button>
+</form>
+{% endblock %}

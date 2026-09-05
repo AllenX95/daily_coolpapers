@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block title %}确认研究备忘录{% endblock %}
+{% block content %}
+<section class="result-panel"><span class="eyebrow">02 / Confirm frozen evidence</span><h1>{{ preview.title }}</h1><p class="run-notice">{{ disclaimer }}</p>
+  <p>来源：{{ preview.source.name or '从收藏手工选择' }} · {{ preview.papers|length }} 篇论文</p><p class="theme-description">{{ preview.source.scope }}</p>
+  <p>预计输入 {{ preview.estimated_input_tokens }} tokens · 上下文 {{ preview.context_window }} · 输出预算 {{ preview.output_budget }} · 预计剩余输出空间 {{ preview.available_output_space }}</p>
+  <p>Prompt：{{ preview.config.prompt.name }} v{{ preview.config.prompt.version }} · 模型 {{ preview.config.profile.model }}。估算不是费用承诺；确认后只调用一次模型，失败不静默重试。</p>
+  <ol>{% for item in preview.papers %}<li><strong>[{{ item.evidence_ref }}] {{ item.paper.title }}</strong><p class="small">{{ item.paper.arxiv_id }} · 全文评估 #{{ item.fulltext_evaluation.id }} · 摘要评估 #{{ item.abstract_evaluation.id if item.abstract_evaluation else '无' }} · {{ {'preselected':'来源预选','manual_added':'人工追加','manual_selected':'手工选择'}[item.selection_origin] }}</p></li>{% endfor %}</ol>
+  <p>本次预览未创建任务。提交时重新检查收藏与来源资格，并冻结当时最新成功评估；之后的改动不影响该版本。</p>
+  <form method="post" action="{{ url_for('memo_create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="idempotency_key" value="{{ preview.idempotency_key }}">
+    {% if command.series_id %}<input type="hidden" name="series_id" value="{{ command.series_id }}">{% else %}<input type="hidden" name="title" value="{{ preview.title }}"><input type="hidden" name="source_mode" value="{{ preview.source.mode }}">{% if preview.source.id %}<input type="hidden" name="source_id" value="{{ preview.source.id }}">{% endif %}{% endif %}
+    {% if command.previous_version_id %}<input type="hidden" name="previous_version_id" value="{{ command.previous_version_id }}">{% endif %}
+    {% if command.copy_judgment %}<input type="hidden" name="copy_judgment" value="1">{% endif %}
+    {% for item in preview.papers %}<input type="hidden" name="paper_ids" value="{{ item.paper.id }}">{% endfor %}
+    <input type="hidden" name="prompt_id" value="{{ preview.config.prompt.id }}"><input type="hidden" name="profile_id" value="{{ preview.config.profile.id }}">
+    <button type="submit">确认生成新版本（一次调用）</button><a class="button secondary" href="{{ url_for('memo_new_version',series_id=command.series_id,version_id=command.previous_version_id) if command.series_id and command.previous_version_id else url_for('memo_new') }}">重新选择</a>
+  </form>
+</section>
+{% endblock %}

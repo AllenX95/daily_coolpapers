@@ -94,6 +94,15 @@ class LLMContractTests(unittest.TestCase):
         self.assertNotIn("response_format", client.calls[1][1]["json"])
         self.assertFalse(client.closed)
 
+    def test_strict_call_budget_disables_response_format_fallback_and_preserves_zero_temperature(self):
+        client = FakeClient([FakeResponse(400,{'error':{'message':'response_format is unsupported'}},'response_format is unsupported')])
+        profile = {'provider':'openai_compatible','base_url':'https://example.test/v1','model':'fixture',
+                   'temperature':0,'allow_response_format_fallback':False}
+        with patch('daily_coolpapers.llm._api_key',return_value='fixture'),self.assertRaises(LLMHTTPError):
+            call_llm(profile,'prompt',client=client)
+        self.assertEqual(len(client.calls),1)
+        self.assertEqual(client.calls[0][1]['json']['temperature'],0)
+
     def test_openai_does_not_retry_authentication_failure(self):
         client = FakeClient(
             [FakeResponse(401, {"error": {"message": "invalid key"}}, "invalid key")]
@@ -145,6 +154,7 @@ class LLMContractTests(unittest.TestCase):
     def test_evaluate_paper_records_schema_failure(self):
         paper = {
             "id": 1,
+            "arxiv_id": "2609.00001",
             "title": "Paper",
             "published_at": "2026-01-01",
             "subjects_list": [],
@@ -161,6 +171,9 @@ class LLMContractTests(unittest.TestCase):
         profile = {"id": 3, "model": "model-x", "enabled": 1}
 
         with (
+            patch.object(services.db, 'claim_abstract_evaluation', return_value=('test', None)),
+            patch.object(services.db, 'release_evaluation_claim'),
+            patch.object(services.db, 'mark_evaluation_provider_started'),
             patch.object(services.db, "get_paper", return_value=paper),
             patch.object(services.db, "get_default_prompt", return_value=prompt),
             patch.object(services.db, "get_llm_profile", return_value=profile),

@@ -1,0 +1,38 @@
+{% extends 'base.html' %}
+{% block title %}团队整理未保存 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="result-panel team-error">
+  <h1>团队整理未保存</h1>
+  <div role="alert">
+    {% if message %}<p>{{ message }}</p>{% endif %}
+    {% if errors %}<ul>{% for field, error in errors.items() %}<li>{{ field }}：{{ error }}</li>{% endfor %}</ul>{% endif %}
+  </div>
+  <p class="muted">本次操作零写入。请检查以下信息，明确选择后再保存，不会自动合并或恢复实体。</p>
+  <p><a href="{{ url_for('research_entities', view='authors' if request.endpoint == 'update_research_author' else ('organizations' if request.endpoint == 'update_research_organization' else 'tracking'), status='all') }}">返回研究对象</a></p>
+  {% for conflict in conflicts %}
+    <article class="entity-conflict" data-testid="entity-conflict">
+      <h2>{{ '作者' if conflict.kind == 'author' else '机构' }} #{{ conflict.id }} · {{ conflict.name }}</h2>
+      <p>状态：{{ '活跃' if conflict.status == 'active' else '已归档' }}</p>
+      <p><a href="{{ url_for('research_entities', view='authors' if conflict.kind == 'author' else 'organizations', status='all', _anchor=conflict.kind ~ '-' ~ conflict.id) }}">查看冲突记录</a></p>
+      {% if paper and team_form %}
+        {% if conflict.status == 'active' %}
+          <form method="post" action="{{ url_for('save_team_tracking', paper_id=paper.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            {% for key, value in team_form['values'].items() %}<input type="hidden" name="{{ key }}" value="{{ 'existing' if key == conflict.kind ~ '_mode' else (conflict.id if key == conflict.kind ~ '_id' else value) }}">{% endfor %}
+            <button type="submit">使用该{{ '作者' if conflict.kind == 'author' else '机构' }}记录并重试</button>
+          </form>
+        {% else %}
+          <form method="post" action="{{ url_for('update_research_author', author_id=conflict.id) if conflict.kind == 'author' else url_for('update_research_organization', organization_id=conflict.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="restore"><input type="hidden" name="return_paper_id" value="{{ paper.id }}">
+            <button type="submit">恢复该{{ '作者' if conflict.kind == 'author' else '机构' }}记录</button>
+          </form>
+          <p class="small muted">恢复后返回论文并选中该记录，但不会自动保存跟踪；其他未保存的新建信息和备注请重新核对填写。</p>
+        {% endif %}
+      {% endif %}
+    </article>
+  {% endfor %}
+  {% if paper %}<p><a href="{{ url_for('paper_detail', paper_id=paper.id, _anchor='fulltext-result') }}">返回论文并刷新</a></p>{% endif %}
+  {% if team_form %}<h2>核对并重新提交</h2>{% include 'partials/team_form.html' %}{% endif %}
+</section>
+<script src="{{ url_for('static', filename='team_tracking.js') }}" defer></script>
+{% endblock %}

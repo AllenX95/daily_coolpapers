@@ -20,7 +20,9 @@ DEFAULT_SETTINGS = {
     "crawler.user_agent": "DailyCoolPapers/0.1",
     "crawler.trust_env_proxy": False,
     "crawler.proxy_url": "",
+    "crawler.missing_field_warning_rate": 0.0,
     "llm.abstract_concurrency": 4,
+    "llm.abstract_retries": 2,
     "llm.trust_env_proxy": False,
     "llm.pdf_download_timeout_seconds": 300,
     "llm.pdf_download_retries": 2,
@@ -29,6 +31,7 @@ DEFAULT_SETTINGS = {
     "cache.cleanup_on_start": True,
     "cache.cleanup_daily": True,
     "logs.clear_on_start": True,
+    "job_events.retention_days": 30,
     "scheduler.enabled": True,
     "scheduler.daily_times": "10:30,12:00",
 }

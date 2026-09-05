@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block title %}{{ series.title }} v{{ version.version_no }}{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">Research memo / 版本快照</span><h1>{{ series.title }} · v{{ version.version_no }}</h1><p>{{ version.status }} · {{ version.created_at }} · {{ papers|length }} 篇论文</p></div><a href="{{ url_for('memo_series',series_id=series.id) }}">版本历史 →</a></section>
+<p class="run-notice">{{ disclaimer }}</p>
+<div class="actions">{% if series.status=='active' %}<a class="button" href="{{ url_for('memo_new_version',series_id=series.id,version_id=version.id) }}">{{ '重新确认并创建新版本' if version.status in ['failed','interrupted'] else '基于此版本创建新版本' }}</a>{% endif %}{% if version.status=='success' %}<a class="button secondary" href="{{ url_for('memo_export',series_id=series.id,version_id=version.id) }}">导出 Markdown</a>{% endif %}</div>
+<section class="result-panel"><h2>本次生成配置</h2><p>来源 {{ version.source_mode_snapshot }} / {{ version.source_name_snapshot or '手工选择' }}<br>Prompt #{{ version.prompt_id or '原配置已删除' }} · Profile #{{ version.profile_id }} · {{ version.provider }} / {{ version.model }}</p><p class="theme-description">{{ version.source_scope_snapshot }}</p>
+  <p>预计输入 {{ version.estimated_input_tokens }} tokens · 实际输入 {{ version.input_tokens if version.input_tokens is not none else '未提供' }} / 输出 {{ version.output_tokens if version.output_tokens is not none else '未提供' }}</p>
+  <p class="small">温度 {{ version.profile_snapshot.temperature }} · 输出预算 {{ version.profile_snapshot.max_output_tokens }} · 上下文 {{ version.profile_snapshot.context_window_tokens }}{% if version.input_snapshot.prompt_config %} · 原始 Prompt：{{ version.input_snapshot.prompt_config.name }} v{{ version.input_snapshot.prompt_config.version }}{% endif %}</p>
+  <details><summary>查看冻结的生成指令与参数</summary><pre class="memo-json">{{ version.prompt_snapshot }}</pre><pre class="memo-json">{{ version.profile_snapshot|json_pretty }}</pre></details>
+  {% if version.job_id %}<a href="{{ url_for('job_detail',job_id=version.job_id) }}">后台任务 #{{ version.job_id }}</a>{% endif %}
+  {% if version.status in ['pending','running'] %}<p>后台生成中。此版本最多执行一次模型调用。<a href="{{ request.path }}">刷新查看结果</a></p>{% elif version.status in ['failed','interrupted'] %}<p class="danger">{{ version.error_code }}：{{ version.error_message or '生成未完成' }}。未保存部分 AI 草稿。</p>{% endif %}
+</section>
+{% if version.status=='success' %}
+<section class="result-panel memo-draft" aria-labelledby="memo-draft-title"><span class="eyebrow">AI draft / 不可变研究底稿</span><h2 id="memo-draft-title">AI 草稿</h2><p class="muted">以下为论文引用，不代表引用与结论的语义支持已经核验。商业机会、产业链和中国市场判断均需另行尽调。</p>
+  {% for key,title in sections.items() %}{% set section=version.result.sections[key] %}
+  <section class="memo-section"><h3>{{ loop.index }}. {{ title }}</h3>
+    {% if section.status=='insufficient_evidence' %}<span class="decision-badge">证据不足</span>{% endif %}
+    {% if key in ['product_and_startup_opportunities','value_chain_beneficiaries','china_market_hypotheses'] %}<p class="small muted">待验证研究假设，非已核验市场事实。</p>{% endif %}
+    <p class="theme-description">{{ section.summary }}</p>
+    {% for claim in section.claims %}<article class="memo-claim"><span class="decision-badge">{{ claim_labels[claim.claim_type] }}</span><p>{{ claim.claim_text }}</p><p class="small muted">推理／证据说明：{{ claim.reasoning }}</p><p class="small">论文引用：{% for ref in claim.evidence_refs %}<a href="#evidence-{{ ref }}">[{{ ref }}]</a> {% else %}无，待补充证据{% endfor %}</p></article>{% endfor %}
+  </section>{% endfor %}
+  <section class="memo-section"><h3>12. 下一步尽调问题</h3><ol>{% for q in version.result.diligence_questions %}<li><p>{{ q.question_text }}</p><p class="small muted">{{ q.reason }}</p>{% for ref in q.evidence_refs %}<a href="#evidence-{{ ref }}">[{{ ref }}]</a> {% endfor %}</li>{% endfor %}</ol></section>
+</section>
+{% endif %}
+<section class="result-panel" id="personal-judgment"><span class="eyebrow">Your judgment / 独立于 AI 草稿</span><h2>我的投资判断</h2><p class="muted">仅保存到当前版本，不发送给模型、不改写 AI 草稿。支持 Markdown 文本；页面以原文安全展示。导出保留标题、列表和强调，链接及图片作为文字处理。</p>
+  <form method="post" action="{{ url_for('memo_personal_judgment',series_id=series.id,version_id=version.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>个人判断 Markdown<textarea name="personal_judgment_markdown" rows="10" placeholder="我的技术判断、投资假设和待验证问题…">{{ version.personal_judgment_markdown }}</textarea></label><button type="submit">保存我的投资判断</button></form>
+  {% if version.personal_judgment_updated_at %}<p class="small muted">最近保存 {{ version.personal_judgment_updated_at }}</p>{% endif %}
+</section>
+<section class="result-panel"><h2>13. 论文证据索引</h2><p class="muted">论文与评估内容来自本版本冻结快照；下方链接仅用于打开当前源记录。</p><ol>{% for paper in papers %}<li id="evidence-P{{ paper.display_order }}">[P{{ paper.display_order }}] {{ paper.snapshot.paper.title }} · {{ paper.paper_arxiv_id_snapshot }}<p class="small">摘要评估 #{{ paper.snapshot.abstract_evaluation.id if paper.snapshot.abstract_evaluation else '无' }} · 全文评估 #{{ paper.snapshot.fulltext_evaluation.id }}{% if paper.paper_id %} · <a href="{{ url_for('paper_detail',paper_id=paper.paper_id) }}">当前源论文</a>{% else %} · 当前源论文已不存在，历史证据保留{% endif %}{% if not paper.fulltext_evaluation_id %} · 当前源全文评估已不存在{% endif %}</p><details><summary>查看冻结论文输入</summary><pre class="memo-json">{{ paper.snapshot|json_pretty }}</pre></details></li>{% endfor %}</ol></section>
+{% endblock %}

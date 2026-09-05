@@ -57,6 +57,8 @@
       <label class="check"><input type="checkbox" name="is_default_abstract" value="1"> 默认摘要模型 <span class="field-help inline">未单独绑定模型的摘要 Prompt 会使用它。</span></label>
       <label class="check"><input type="checkbox" name="is_default_fulltext" value="1"> 默认全文模型 <span class="field-help inline">未单独绑定模型的全文 Prompt 会使用它。</span></label>
       <button type="submit">新增 Profile</button>
+      <label class="check"><input type="checkbox" name="is_default_classification" value="1"> 默认分类模型（独立于摘要模型）</label>
+      <label class="check"><input type="checkbox" name="is_default_memo" value="1"> 默认研究备忘录模型</label>
     </div>
   </form>
 </section>
@@ -180,6 +182,8 @@
           <label class="check"><input type="checkbox" name="is_default_abstract" value="1" {% if profile.is_default_abstract %}checked{% endif %}> 默认摘要模型</label>
           <label class="check"><input type="checkbox" name="is_default_fulltext" value="1" {% if profile.is_default_fulltext %}checked{% endif %}> 默认全文模型</label>
           <button type="submit">保存</button>
+          <label class="check"><input type="checkbox" name="is_default_classification" value="1" {% if profile.is_default_classification %}checked{% endif %}> 默认分类模型</label>
+          <label class="check"><input type="checkbox" name="is_default_memo" value="1" {% if profile.is_default_memo %}checked{% endif %}> 默认研究备忘录模型</label>
         </div>
       </form>
       <form method="post" action="{{ url_for('test_llm_profile', profile_id=profile.id) }}">

@@ -1,0 +1,48 @@
+/* Module A: a restrained operational ledger within the existing application. */
+.job-progress-card.partial_success, .job-progress-card.interrupted { border-left: 4px solid var(--warn); }
+.job-progress-card.failed { border-left: 4px solid var(--danger); }
+.badge.warning, .badge.partial_success { color: #92400e; background: #fff1cd; }
+.badge.error { color: var(--danger); background: var(--danger-soft); }
+.badge.empty_success, .badge.info { color: var(--ok); background: var(--ok-soft); }
+.run-record { max-width: 1320px; margin: 0 auto; }
+.run-record h1 { font-family: 'Bahnschrift', 'Microsoft YaHei', sans-serif; font-weight: 600; letter-spacing: -.04em; }
+.run-record .eyebrow { font-family: 'Cascadia Code', Consolas, 'Microsoft YaHei', monospace; font-size: 11px; letter-spacing: .08em; }
+.run-scoreboard { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin-top: 20px; padding: 0; border: 1px solid var(--line-strong); border-top: 3px solid #24364b; border-radius: 6px; background: var(--surface); box-shadow: none; }
+.run-scoreboard > div { min-width: 0; padding: 24px; }
+.run-scoreboard > div + div { border-left: 1px solid var(--line-strong); }
+.run-scoreboard strong { display: block; margin: 8px 0; color: #24364b; font-family: 'Bahnschrift', 'Microsoft YaHei', sans-serif; font-size: 34px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.run-scoreboard small { font-family: inherit; font-size: 15px; color: var(--muted); font-weight: 400; }
+.run-scoreboard p { color: var(--muted); margin: 0; font-size: 12px; }
+.run-notice { padding: 15px 20px; background: var(--warn-soft); border-left: 3px solid var(--warn); }
+.run-recovery { margin: 24px 0; padding: 20px 24px; border: 1px solid var(--line-strong); border-radius: 6px; background: #f9fbfd; box-shadow: none; }
+.run-recovery h2 { margin-top: 0; font-size: 18px; }
+.run-events { padding: 24px; margin-top: 24px; border-radius: 6px; }
+.run-events h2 { font-size: 20px; }
+.run-filters { padding: 16px 0; align-items: flex-end; flex-wrap: wrap; }
+.run-filters label { min-width: 130px; }
+.event-table { width: 100%; table-layout: fixed; }
+.event-table th:nth-child(1) { width: 175px; }
+.event-table th:nth-child(2) { width: 145px; }
+.event-table th:nth-child(3) { width: 155px; }
+.event-table td { vertical-align: top; overflow-wrap: anywhere; white-space: normal; }
+.event-table time { font-size: 12px; font-variant-numeric: tabular-nums; }
+.event-warning td:first-child { border-left: 3px solid var(--warn); }
+.event-error td:first-child { border-left: 3px solid var(--danger); }
+.event-error { color: var(--danger); margin: 8px 0; }
+.event-metrics { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin: 8px 0; }
+.event-metrics b { font-weight: 500; color: var(--ink); }
+.run-events .pagination { display: flex; gap: 12px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+.run-record .job-meta-row { flex-wrap: wrap; }
+.event-scroll-hint { display: none; }
+@media (max-width: 760px) {
+  .run-scoreboard { grid-template-columns: 1fr; }
+  .run-scoreboard > div { padding: 16px 20px; }
+  .run-scoreboard > div + div { border-left: 0; border-top: 1px solid var(--line); }
+  .run-events, .run-recovery { padding: 16px; }
+  .run-filters { display: grid; grid-template-columns: 1fr; align-items: stretch; }
+  .run-filters label { width: 100%; min-width: 0; }
+  .run-filters input, .run-filters select { width: 100%; }
+  .event-scroll-hint { display: block; }
+  .event-table { min-width: 750px; }
+  .run-record .detail-head { align-items: flex-start; flex-wrap: wrap; gap: 12px; }
+}

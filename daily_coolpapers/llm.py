@@ -48,6 +48,20 @@ class LLMHTTPError(LLMError):
 class LLMResponse:
     raw_text: str
     result_json: dict[str, Any] | None
+    usage: dict[str, Any] | None = None
+
+
+class _ProviderText(str):
+    def __new__(cls, value: str, usage: Any = None):
+        instance = super().__new__(cls, value)
+        def counts_only(item):
+            if not isinstance(item, dict):
+                return None
+            return {key: counts_only(value) if isinstance(value, dict) else value
+                    for key, value in item.items()
+                    if isinstance(value, (dict, int, float)) and not isinstance(value, bool)}
+        instance.usage = counts_only(usage)
+        return instance
 
 
 def parse_json_response(text: str) -> dict[str, Any] | None:
@@ -136,7 +150,7 @@ def call_llm(profile: dict[str, Any], prompt: str, client: httpx.Client | None =
         raw = _call_anthropic(profile, prompt, client=client)
     else:
         raise LLMError(f"不支持的 LLM provider: {provider}")
-    return LLMResponse(raw_text=raw, result_json=parse_json_response(raw))
+    return LLMResponse(raw_text=str(raw), result_json=parse_json_response(raw), usage=getattr(raw, 'usage', None))
 
 
 def test_profile(profile: dict[str, Any]) -> str:
@@ -190,11 +204,11 @@ def _call_openai_compatible(
         "messages": [
             {
                 "role": "system",
-                "content": "You are a careful research paper analyst. Return valid JSON only.",
+                "content": profile.get('system_prompt') or "You are a careful research paper analyst. Return valid JSON only.",
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": float(profile.get("temperature") or 0.2),
+        "temperature": float(profile['temperature'] if profile.get('temperature') is not None else 0.2),
         "max_tokens": int(profile.get("max_output_tokens") or 2000),
         "response_format": {"type": "json_object"},
     }
@@ -203,7 +217,7 @@ def _call_openai_compatible(
         client = make_llm_client(profile)
     try:
         response = client.post(url, headers=headers, json=payload)
-        if _response_format_unsupported(response) and "response_format" in payload:
+        if profile.get('allow_response_format_fallback', True) and _response_format_unsupported(response) and "response_format" in payload:
             fallback_payload = dict(payload)
             fallback_payload.pop("response_format", None)
             response = client.post(url, headers=headers, json=fallback_payload)
@@ -212,7 +226,7 @@ def _call_openai_compatible(
     except LLMError:
         raise
     except httpx.HTTPError as exc:
-        logger.exception("OpenAI-compatible LLM call failed")
+        logger.warning("OpenAI-compatible LLM call failed error_type=%s", type(exc).__name__)
         retryable = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
         raise LLMError(str(exc), code="transport_error", retryable=retryable) from exc
     finally:
@@ -223,7 +237,7 @@ def _call_openai_compatible(
         content = data["choices"][0]["message"]["content"]
         if not isinstance(content, str):
             raise TypeError("message.content is not text")
-        return content
+        return _ProviderText(content, data.get('usage'))
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError(
             f"无法解析 OpenAI-compatible 响应: {data}",
@@ -247,8 +261,8 @@ def _call_anthropic(
     payload = {
         "model": profile["model"],
         "max_tokens": int(profile.get("max_output_tokens") or 2000),
-        "temperature": float(profile.get("temperature") or 0.2),
-        "system": "You are a careful research paper analyst. Return valid JSON only.",
+        "temperature": float(profile['temperature'] if profile.get('temperature') is not None else 0.2),
+        "system": profile.get('system_prompt') or "You are a careful research paper analyst. Return valid JSON only.",
         "messages": [{"role": "user", "content": prompt}],
     }
     owns_client = client is None
@@ -261,7 +275,7 @@ def _call_anthropic(
     except LLMError:
         raise
     except httpx.HTTPError as exc:
-        logger.exception("Anthropic LLM call failed")
+        logger.warning("Anthropic LLM call failed error_type=%s", type(exc).__name__)
         retryable = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
         raise LLMError(str(exc), code="transport_error", retryable=retryable) from exc
     finally:
@@ -272,11 +286,11 @@ def _call_anthropic(
         parts = data["content"]
         if not isinstance(parts, list):
             raise TypeError("content is not a list")
-        return "".join(
+        return _ProviderText("".join(
             str(part.get("text", ""))
             for part in parts
             if isinstance(part, dict) and part.get("type") == "text"
-        )
+        ), data.get('usage'))
     except (KeyError, TypeError) as exc:
         raise LLMError(f"无法解析 Anthropic 响应: {data}", code="provider_response") from exc
 

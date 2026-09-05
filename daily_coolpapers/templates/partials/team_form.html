@@ -1,0 +1,42 @@
+{% set values = team_form['values'] %}
+<form method="post" action="{{ url_for('save_team_tracking', paper_id=paper.id) }}" data-team-form>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="team-fields">
+    <fieldset class="team-entity" data-team-entity="author">
+      <legend>第一作者 · 由你确认</legend>
+      <p class="small muted">元数据首位作者：{{ team_form.first_author or '未提供' }}。抓取顺序不证明第一作者身份，请核对。</p>
+      <div class="team-modes">
+        <label><input type="radio" name="author_mode" value="existing" {% if values.author_mode == 'existing' %}checked{% endif %}> 复用已有作者</label>
+        <label><input type="radio" name="author_mode" value="new" {% if values.author_mode != 'existing' %}checked{% endif %}> 新建作者</label>
+      </div>
+      <div data-mode-fields="existing">
+        <label>已有作者<select name="author_id" aria-label="已有作者"><option value="">请选择作者</option>{% for entity in team_form.author_options %}<option value="{{ entity.id }}" {% if values.author_id == entity.id|string %}selected{% endif %}>#{{ entity.id }} · {{ entity.name }}</option>{% endfor %}</select></label>
+      </div>
+      <div data-mode-fields="new">
+        <label>第一作者姓名<input name="author_name" aria-label="第一作者姓名" value="{{ values.author_name }}"></label>
+        <label>作者分类<select name="author_category" aria-label="作者分类">{% for key, label in team_form.author_categories.items() %}<option value="{{ key }}" {% if values.author_category == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+        <label>作者备注（可选）<textarea name="author_notes" aria-label="作者备注（可选）" rows="2">{{ values.author_notes }}</textarea></label>
+      </div>
+    </fieldset>
+    <fieldset class="team-entity" data-team-entity="organization">
+      <legend>主要机构 / 企业</legend>
+      <p class="small muted">每篇论文记录一个主要机构。请手工确认，不自动识别 PDF 或推断任职关系。</p>
+      <div class="team-modes">
+        <label><input type="radio" name="organization_mode" value="existing" {% if values.organization_mode == 'existing' %}checked{% endif %}> 复用已有机构</label>
+        <label><input type="radio" name="organization_mode" value="new" {% if values.organization_mode != 'existing' %}checked{% endif %}> 新建机构</label>
+      </div>
+      <div data-mode-fields="existing">
+        <label>已有机构<select name="organization_id" aria-label="已有机构"><option value="">请选择机构</option>{% for entity in team_form.organization_options %}<option value="{{ entity.id }}" {% if values.organization_id == entity.id|string %}selected{% endif %}>#{{ entity.id }} · {{ entity.name }}</option>{% endfor %}</select></label>
+      </div>
+      <div data-mode-fields="new">
+        <label>机构名称<input name="organization_name" aria-label="机构名称" value="{{ values.organization_name }}"></label>
+        <label>机构类型<select name="organization_type" aria-label="机构类型"><option value="">请选择类型（必填）</option>{% for key, label in team_form.organization_types.items() %}<option value="{{ key }}" {% if values.organization_type == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+        <label>国家/地区（可选）<input name="organization_region" aria-label="国家/地区（可选）" value="{{ values.organization_region }}"></label>
+        <label>机构备注（可选）<textarea name="organization_notes" aria-label="机构备注（可选）" rows="2">{{ values.organization_notes }}</textarea></label>
+      </div>
+    </fieldset>
+  </div>
+  <label>论文跟踪备注（可选）<textarea name="tracking_notes" aria-label="论文跟踪备注（可选）" rows="3">{{ values.tracking_notes }}</textarea></label>
+  <p class="small muted">保存表示你确认所选第一作者和主要机构；不会改写论文原始作者元数据。</p>
+  <button type="submit">确认并保存团队跟踪</button>
+</form>
