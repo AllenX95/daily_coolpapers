@@ -1,83 +1,98 @@
 {% extends "base.html" %}
-{% block title %}收藏 - Daily Cool Papers{% endblock %}
+{% set is_reviewed = collection_kind|default('favorites') == 'reviewed' %}
+{% set is_theme = collection_kind|default('favorites') == 'theme' %}
+{% block title %}{{ theme.name if is_theme else ('全文库' if is_reviewed else '收藏') }} - Daily Cool Papers{% endblock %}
 {% block content %}
 <section class="favorites-head">
   <div>
-    <h1>收藏</h1>
-    <p class="muted">已完成全文评估的论文会自动汇总到这里。</p>
+    {% if is_theme %}
+    <span class="eyebrow">Research folder / 投资主题</span>
+    <h1>{{ theme.name }}</h1>
+    <p class="theme-description">{{ theme.description }}</p>
+    <p class="muted">{{ papers|length }} 篇论文 · 包含收藏、跳过与未处理论文{% if theme.status == 'archived' %} · 此主题已归档，历史关系保留{% endif %}</p>
+    <a href="{{ url_for('investment_themes', _anchor='theme-' ~ theme.id) }}">管理此主题 →</a>
+    {% else %}
+    <span class="eyebrow">{{ 'Reviewed / 已评估' if is_reviewed else 'Selected / 个人精选' }}</span>
+    <h1>{{ '全文库' if is_reviewed else '收藏' }}</h1>
+    <p class="muted">{{ '这里保留所有曾成功完成全文评估的论文。完成评估不等于收藏，旧论文默认未处理。' if is_reviewed else '这里只保留你手动收藏的论文，跳过或取消收藏后不再显示。' }}</p>
+    <a href="{{ url_for('favorites' if is_reviewed else 'reviewed_papers') }}">{{ '查看我的收藏 →' if is_reviewed else '到全文库整理已评估论文 →' }}</a>
+    {% endif %}
   </div>
   <form method="get" class="filters">
+    {% if is_reviewed %}
+      <label class="select-field">个人决策
+        <select name="decision" aria-label="个人决策筛选">
+          {% for option in decision_options %}<option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>{% endfor %}
+        </select>
+      </label>
+    {% endif %}
     <label class="select-field">排序
-      <select name="sort">
-        <option value="evaluated_desc" {% if sort == "evaluated_desc" %}selected{% endif %}>评估时间</option>
-        <option value="score_desc" {% if sort == "score_desc" %}selected{% endif %}>全文评分</option>
-        <option value="rank" {% if sort == "rank" %}selected{% endif %}>类目排名</option>
-        <option value="title" {% if sort == "title" %}selected{% endif %}>标题</option>
+      <select name="sort" aria-label="排序">
+        {% for option in sort_options %}
+          <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
       </select>
     </label>
     <button type="submit">应用</button>
   </form>
 </section>
 
-<section class="favorite-list" data-testid="fulltext-favorites">
+<section class="favorite-list" data-testid="{{ 'theme-papers' if is_theme else ('reviewed-papers' if is_reviewed else 'personal-favorites') }}">
   {% for paper in papers %}
-    {% set result = paper.fulltext_result or {} %}
-    {% set vc = result.vc_perspective or {} %}
-    {% set latest = paper.latest_category or {} %}
-    {% set score = result.get("score") %}
-    {% set attention = result.get("attention") or "pending" %}
-    {% set market_relevance = vc.get("market_relevance") %}
     <article class="favorite-item">
       <header class="favorite-item-head">
         <div>
           <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
           <div class="favorite-meta">
+            <span class="decision-badge {{ paper.decision|default('undecided') }}">{{ paper.decision_label|default('未处理') }}</span>
             <span class="mono">{{ paper.arxiv_id }}</span>
-            {% if latest.category %}
-              <span>{{ latest.category }} / Rank {{ latest.rank or "-" }} / Stars {{ latest.reading_stars or 0 }}</span>
+            {% if paper.category_label %}
+              <span>{{ paper.category_label }}</span>
             {% endif %}
-            <span>{{ paper.fulltext_evaluated_at }}{% if paper.fulltext_model %} / {{ paper.fulltext_model }}{% endif %}</span>
+            <span>{{ paper.evaluation_label }}</span>
+            {% if is_theme %}<span>加入时间：{{ paper.theme_added_at }}</span>{% if not paper.has_fulltext %}<span>成功全文评估已不可用，历史归档保留</span>{% endif %}{% endif %}
           </div>
         </div>
         <div class="favorite-score">
-          <div class="score compact">{{ score if score is not none else "-" }}</div>
-          <div class="badge {{ attention }}">{{ attention }}</div>
+          <div class="score compact">{{ paper.score_text }}</div>
+          <div class="badge {{ paper.attention }}">{{ paper.attention }}</div>
         </div>
       </header>
+      {% if paper.investment_themes %}<div class="paper-theme-tags" aria-label="投资主题">{% for item in paper.investment_themes %}<a class="theme-tag {{ item.status }}" href="{{ url_for('investment_theme_papers', theme_id=item.id) }}">{{ item.name }}{% if item.status == 'archived' %} · 已归档{% endif %}</a>{% endfor %}</div>{% endif %}
 
-      {% if result.one_sentence_summary %}
-        <p class="result-lead">{{ result.one_sentence_summary }}</p>
+      {% if paper.one_sentence_summary %}
+        <p class="result-lead">{{ paper.one_sentence_summary }}</p>
       {% endif %}
 
       <div class="favorite-content">
         <section>
           <h3>全文摘要</h3>
-          <p>{{ (result.detailed_summary_zh or result.problem or paper.abstract)|truncate_text(520) }}</p>
+          <p>{{ paper.summary_excerpt|truncate_text(520) }}</p>
         </section>
         <section>
           <h3>VC 视角</h3>
-          <p>{{ (vc.impact or vc.commercialization_path or "暂无 VC 视角字段")|truncate_text(420) }}</p>
-          {% if market_relevance is not none %}
-            <p class="small muted">Market relevance: {{ market_relevance }}</p>
+          <p>{{ paper.vc_summary|truncate_text(420) }}</p>
+          {% if paper.market_relevance %}
+            <p class="small muted">Market relevance: {{ paper.market_relevance }}</p>
           {% endif %}
         </section>
-        {% if result.recommended_action %}
+        {% if paper.recommended_action %}
           <section>
             <h3>建议动作</h3>
-            <p>{{ result.recommended_action }}</p>
+            <p>{{ paper.recommended_action }}</p>
           </section>
         {% endif %}
-        {% if result.novelty_assessment %}
+        {% if paper.novelty_assessment %}
           <section>
             <h3>新颖性</h3>
-            <p>{{ result.novelty_assessment|truncate_text(360) }}</p>
+            <p>{{ paper.novelty_assessment|truncate_text(360) }}</p>
           </section>
         {% endif %}
       </div>
 
       <footer class="favorite-footer">
         <div class="tag-list">
-          {% for tag in result.tags or [] %}
+          {% for tag in paper.tags %}
             <span>{{ tag }}</span>
           {% endfor %}
         </div>
@@ -87,14 +102,15 @@
           {% if markdown_cached(paper.arxiv_id) %}
             <a class="button secondary" href="{{ url_for('view_markdown', paper_id=paper.id) }}">Markdown</a>
           {% endif %}
-          {% if paper.abs_url %}
-            <a class="button secondary" href="{{ paper.abs_url }}" target="_blank">arXiv</a>
+          {% set abs_url = paper.abs_url|safe_arxiv_url %}
+          {% if abs_url %}
+            <a class="button secondary" href="{{ abs_url }}" target="_blank" rel="noopener noreferrer">arXiv</a>
           {% endif %}
         </div>
       </footer>
     </article>
   {% else %}
-    <p class="empty">还没有成功完成全文评估的论文。</p>
+    <p class="empty">{{ '该主题还没有论文，请到论文全文结果下方手动选择加入。' if is_theme else ('当前筛选下没有已全文评估的论文。' if is_reviewed else '还没有手动收藏的论文。请在全文评估结果下方点击“收藏”。') }}</p>
   {% endfor %}
 </section>
 {% endblock %}

@@ -1,0 +1,29 @@
+<section class="result-panel" id="paper-directions" aria-labelledby="paper-directions-title">
+  <span class="eyebrow">Reading focus / 阅读前筛选</span><h2 id="paper-directions-title">关注方向与人工分类</h2>
+  <p class="muted">possible 只进入摘要评估，尚不属于正式分类。你的确认／否决优先于模型；投资主题仍需在全文结果下方另行归档。</p>
+  {% for direction in direction_results %}
+  <article class="theme-record" data-testid="direction-result">
+    <header><h3>{{ direction.name }} · #{{ direction.direction_id }}</h3><span class="decision-badge">{{ '已归档 · 历史记录' if direction.direction_status == 'archived' else ('有效分类' if direction.effective else ('待确认分类' if direction.pending else '非有效分类')) }}</span></header>
+    <p>模型原始判断：<strong>{{ direction.model_decision or '尚无模型判断' }}</strong></p>
+    <p class="theme-description">{{ direction.model_reason }}</p>
+    <p>人工判断：{{ {'confirmed':'已确认','rejected':'已否决'}.get(direction.manual_decision,'尚未处理') }}{% if direction.manual_updated_at %} · {{ direction.manual_updated_at }}{% endif %}</p>
+    <details><summary>定义与审计信息</summary><p class="theme-description">{{ direction.scope_text }}</p>
+      <p class="small muted">分类 evaluation #{{ direction.classification_evaluation_id or '—' }} · {{ direction.classified_at or '—' }} · {{ direction.classification_source or '仅人工分类' }}<br>Prompt #{{ direction.prompt_id or '—' }} v{{ direction.prompt_version or '—' }} · Profile #{{ direction.llm_profile_id or '—' }} · {{ direction.model or '—' }}</p>
+    </details>
+    {% if direction.direction_status == 'active' %}
+    <form method="post" action="{{ url_for('save_direction_decision',paper_id=paper.id) }}" class="inline-actions">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="direction_id" value="{{ direction.direction_id }}">
+      <button name="decision" value="confirmed" type="submit">确认属于此方向</button><button class="secondary" name="decision" value="rejected" type="submit">否决此方向／不相关</button>
+    </form>
+    {% endif %}
+  </article>
+  {% else %}<p class="empty">暂无分类结果。新方向对历史论文不会自动重跑，可在关注方向设置中手动补分类。</p>{% endfor %}
+  {% if attention_directions %}
+  <form method="post" action="{{ url_for('save_direction_decision',paper_id=paper.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="decision" value="confirmed">
+    <label>手动选择其他关注方向（可逐个确认多个方向）<select name="direction_id" required><option value="">请选择</option>{% for direction in attention_directions %}<option value="{{ direction.id }}">{{ direction.name }}</option>{% endfor %}</select></label>
+    <button type="submit">确认加入关注方向</button>
+  </form>
+  {% endif %}
+  <p class="small muted">未匹配或分类失败也可使用上方“手动摘要评估”，不会覆盖分类结果。<a href="{{ url_for('attention_directions') }}">管理关注方向 →</a></p>
+</section>

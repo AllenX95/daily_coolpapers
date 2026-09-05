@@ -1,0 +1,27 @@
+<div class="paper-team" data-testid="paper-team" aria-labelledby="paper-team-heading">
+  <span class="eyebrow">Research people / 研究对象</span>
+  <h3 id="paper-team-heading">是否跟踪团队</h3>
+  <a href="{{ url_for('research_entities') }}">查看研究对象 →</a>
+  <p class="small muted">与收藏、跳过、投资主题相互独立。停止跟踪只归档关系，不删除作者或机构。</p>
+  {% for message in get_flashed_messages(category_filter=['team']) %}<p class="decision-feedback" role="status">{{ message }}</p>{% endfor %}
+  {% set tracking = team_form.tracking %}
+  {% if tracking %}
+    <div class="team-summary">
+      <span class="decision-badge {{ 'favorite' if tracking.status == 'tracking' else 'skipped' }}">{{ '跟踪中' if tracking.status == 'tracking' else '已停止跟踪' }}</span>
+      <p>第一作者：<strong>{{ tracking.author_name }}</strong>{% if tracking.author_status == 'archived' %} · 作者已归档{% endif %}</p>
+      <p>主要机构：<strong>{{ tracking.organization_name }}</strong>{% if tracking.organization_status == 'archived' %} · 机构已归档{% endif %}</p>
+      <p class="small muted">开始跟踪：{{ tracking.created_at }}</p>
+      {% if tracking.notes %}<p class="team-notes">{{ tracking.notes }}</p>{% endif %}
+      {% if tracking.author_status == 'archived' or tracking.organization_status == 'archived' %}<p class="small muted">实体归档不改变这篇论文的跟踪状态。重新保存前请先恢复实体，或明确选择其他对象。</p>{% endif %}
+    </div>
+  {% endif %}
+  <details class="team-editor"><summary>{{ '编辑团队跟踪' if tracking and tracking.status == 'tracking' else ('重新跟踪团队' if tracking else '跟踪团队') }}</summary>
+    {% include 'partials/team_form.html' %}
+  </details>
+  {% if tracking and tracking.status == 'tracking' %}
+    <form method="post" action="{{ url_for('archive_team_tracking', paper_id=paper.id) }}" class="team-stop">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" class="secondary">停止跟踪</button>
+    </form>
+  {% endif %}
+</div>
+<script src="{{ url_for('static', filename='team_tracking.js') }}" defer></script>

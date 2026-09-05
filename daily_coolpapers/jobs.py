@@ -3,14 +3,27 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from . import db
 from .cache_manager import cleanup_caches
-from .services import crawl_all_categories, crawl_to_latest, evaluate_missing_abstracts, evaluate_paper
+from .services import (SHANGHAI_TZ, build_daily_pipeline_plan, run_daily_pipeline,
+                       crawl_all_categories, crawl_to_latest, evaluate_missing_abstracts, evaluate_paper,
+                       safe_evaluation_error)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class JobExecutionResult:
+    result: dict[str, Any]
+    status: str = "success"
+
+    def __post_init__(self) -> None:
+        if self.status not in {"success", "partial_success", "failed"}:
+            raise ValueError(f"无效的正常任务终态: {self.status}")
 
 
 class JobProgressWriter:
@@ -120,6 +133,64 @@ class JobRunner:
         with self._state_lock:
             return self._active_job_ids_locked()
 
+    def enqueue_direction_backfill(self,direction_id,date_from,date_to):
+        from .services import build_direction_backfill_plan
+        plan = build_direction_backfill_plan(direction_id,date_from,date_to)
+        with self._state_lock:
+            job_id = db.create_direction_backfill_job(plan)
+            self._queued_job_ids.add(job_id)
+            self.queue.put(job_id)
+        return job_id
+
+    def enqueue_memo(self,command):
+        from .memos import create_memo_version
+        with self._state_lock:
+            created = create_memo_version(command)
+            if created['created']:
+                self._queued_job_ids.add(created['job_id'])
+                self.queue.put(created['job_id'])
+        return created
+
+    def enqueue_pipeline(
+        self, trigger_source: str, category_ids: list[int] | None = None, *,
+        start_date: str | None = None, end_date: str | None = None,
+        retry_of_job_id: int | None = None, idempotency_key: str | None = None,
+        retry_mode: str = 'all',
+    ) -> tuple[int, bool]:
+        if retry_mode not in {'all', 'abstract_only'}:
+            raise ValueError('未知重试模式')
+        with self._state_lock:
+            active = db.get_active_crawl_job()
+            if active:
+                return int(active['id']), False
+            if idempotency_key:
+                with db.connect() as conn:
+                    existing = conn.execute('SELECT id FROM jobs WHERE idempotency_key=?', (idempotency_key,)).fetchone()
+                if existing:
+                    return int(existing['id']), False
+            original_plan = None
+            if retry_of_job_id is not None:
+                original = db.get_job(retry_of_job_id)
+                if not original or original['type'] != db.DAILY_PIPELINE_JOB_TYPE or original['status'] not in db.JOB_TERMINAL_STATUSES:
+                    raise ValueError('只能重试已结束的每日情报流水线')
+                original_plan = original['payload_data']
+                db.pipeline_retry_units(retry_of_job_id)
+            plan = build_daily_pipeline_plan(
+                trigger_source, category_ids, start_date=start_date, end_date=end_date,
+                category_snapshot=original_plan['categories'] if original_plan else None,
+            )
+            if original_plan:
+                plan.update({key: original_plan[key] for key in ('dates', 'start_date', 'end_date', 'target_date', 'categories')})
+                original_direction_ids = {item['id'] for item in original_plan.get('directions',[])}
+                plan['directions'] = [item for item in plan['directions'] if item['id'] in original_direction_ids]
+                plan['retry_mode'] = retry_mode
+            job_id, created = db.create_daily_pipeline_job(plan, idempotency_key=idempotency_key, retry_of_job_id=retry_of_job_id)
+            if created:
+                db.update_job_progress(job_id, 0, 1, '流水线等待执行')
+                self._queued_job_ids.add(job_id)
+                self.queue.put(job_id)
+            return job_id, created
+
     def _active_job_ids_locked(self) -> set[int]:
         ids = set(self._queued_job_ids)
         if self._running_job_id is not None:
@@ -163,6 +234,7 @@ class JobRunner:
     def _scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                self.reconcile_orphaned_pending_jobs(min_interval_seconds=30)
                 self._maybe_schedule_daily_work()
             except Exception:
                 logger.exception("Scheduler loop failed")
@@ -171,7 +243,7 @@ class JobRunner:
     def _maybe_schedule_daily_work(self) -> None:
         if not db.get_bool_setting("scheduler.enabled", True):
             return
-        now = datetime.now()
+        now = datetime.now(SHANGHAI_TZ)
         day_key = now.strftime("%Y-%m-%d")
         cutoff = (now - timedelta(days=3)).strftime("%Y-%m-%d")
         self._daily_runs = {key for key in self._daily_runs if key[:10] >= cutoff}
@@ -180,29 +252,68 @@ class JobRunner:
         current = now.strftime("%H:%M")
         run_key = f"{day_key} {current}"
         if current in wanted and run_key not in self._daily_runs:
+            self.enqueue_pipeline("scheduled", idempotency_key=f'scheduled:{run_key}')
             self._daily_runs.add(run_key)
-            self.enqueue("crawl", {})
             if db.get_bool_setting("cache.cleanup_daily", True):
                 self.enqueue("cleanup", {})
 
     def _run_job(self, job_id: int) -> None:
         job = db.get_job(job_id)
-        if not job:
+        if not job or job['status'] != 'pending':
             return
         payload = job.get("payload_data") or {}
-        db.update_job(job_id, "running")
+        if job['type'] == 'investment_memo_generation':
+            # Memo and job transitions must share one SQLite transaction.
+            from .memos import generate_memo
+            try:
+                result = generate_memo(job_id,int(payload['version_id']))
+                logger.info('Memo job id=%s finished status=%s',job_id,result['status'])
+            except Exception as exc:
+                # Persistent DB failure cannot be repaired with a separate job-only
+                # write. Leave the nonterminal pair for startup recovery, never call again.
+                logger.error('Memo persistence unavailable job=%s error_type=%s',job_id,type(exc).__name__)
+            return
+        if job['type'] == db.DAILY_PIPELINE_JOB_TYPE:
+            db.update_job_with_event(job_id, 'running', event_key=f'pipeline:{job_id}:started',
+                                     stage='plan', event_type='pipeline.started')
+        else:
+            db.update_job(job_id, "running")
         db.update_job_progress(job_id, 0, 1, "任务准备中")
-        logger.info("Running job id=%s type=%s payload=%s", job_id, job["type"], payload)
+        logger.info("Running job id=%s type=%s", job_id, job["type"])
         try:
-            result = self._dispatch(job_id, job["type"], payload)
+            dispatched = self._dispatch(job_id, job["type"], payload)
+            if isinstance(dispatched, JobExecutionResult):
+                result = dispatched.result
+                final_status = dispatched.status
+            else:
+                result = dispatched
+                final_status = "success"
             logger.info("Job id=%s finished result=%s", job_id, _summarize_result(result))
-            db.update_job(job_id, "success")
+            if job['type'] == db.DAILY_PIPELINE_JOB_TYPE:
+                db.update_job_with_event(job_id, final_status, event_key=f'pipeline:{job_id}:completed',
+                    stage='finalize', event_type='pipeline.completed', metrics=result,
+                    level='info' if final_status == 'success' else 'warning')
+            else:
+                db.update_job(job_id, final_status)
         except Exception as exc:
-            logger.exception("Job id=%s failed", job_id)
-            db.update_job(job_id, "failed", str(exc))
+            logger.error("Job id=%s failed error_type=%s", job_id, type(exc).__name__)
+            if job['type'] == db.DAILY_PIPELINE_JOB_TYPE:
+                db.update_job_with_event(job_id, 'failed', event_key=f'pipeline:{job_id}:completed',
+                    stage='finalize', event_type='pipeline.completed', level='error',
+                    error_code='pipeline_system_error', message='流水线系统错误，请检查配置或数据库',
+                    metrics={'status': 'failed', 'error_type': type(exc).__name__})
+            else:
+                message = safe_evaluation_error(exc) if job['type'] in {'abstract_eval', 'fulltext_eval'} else f"任务失败（{type(exc).__name__}）"
+                db.update_job(job_id, "failed", message)
 
-    def _dispatch(self, job_id: int, job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch(
+        self,
+        job_id: int,
+        job_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | JobExecutionResult:
         progress_writer = JobProgressWriter(job_id)
+        progress_lock = threading.RLock()
 
         def progress(
             current: int,
@@ -210,9 +321,17 @@ class JobRunner:
             message: str,
             details: dict[str, Any] | None = None,
         ) -> None:
-            progress_writer.update(current, total, message, details)
+            with progress_lock:
+                progress_writer.update(current, total, message, details)
 
         try:
+            if job_type == db.DAILY_PIPELINE_JOB_TYPE:
+                result = run_daily_pipeline(job_id, payload, progress=progress)
+                return JobExecutionResult(result, result['status'])
+            if job_type == 'direction_backfill':
+                from .services import run_direction_backfill
+                result = run_direction_backfill(job_id,payload,progress=progress)
+                return JobExecutionResult(result,result['status'])
             if job_type == "crawl":
                 return crawl_all_categories(
                     payload.get("category_ids"),
@@ -225,10 +344,12 @@ class JobRunner:
                 paper_id = payload.get("paper_id")
                 if paper_id:
                     progress(0, 1, "准备摘要评估")
-                    result = evaluate_paper(int(paper_id), "abstract_review", payload.get("prompt_id"))
+                    result = evaluate_paper(int(paper_id), "abstract_review", payload.get("prompt_id"), job_id=job_id)
                     progress(1, 1, "摘要评估完成")
                     return result
-                return evaluate_missing_abstracts(progress=progress)
+                result = evaluate_missing_abstracts(progress=progress, job_id=job_id)
+                status = 'partial_success' if result['failed'] and (result['success'] or result['skipped']) else ('failed' if result['failed'] else 'success')
+                return JobExecutionResult(result, status)
             if job_type == "fulltext_eval":
                 progress(0, 1, "准备全文阅读")
                 result = evaluate_paper(
@@ -246,7 +367,8 @@ class JobRunner:
                 return result
             raise ValueError(f"未知任务类型: {job_type}")
         finally:
-            progress_writer.flush()
+            with progress_lock:
+                progress_writer.flush()
 
 
 job_runner = JobRunner()

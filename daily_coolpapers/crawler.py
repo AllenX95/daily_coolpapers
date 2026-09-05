@@ -1,5 +1,7 @@
+import hashlib
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -70,6 +72,36 @@ class CrawledPaper:
 
 
 @dataclass(frozen=True)
+class ParsedPapersResult:
+    papers: list[CrawledPaper]
+    metrics: dict[str, int]
+
+
+@dataclass(frozen=True)
+class CategoryFetchResult:
+    papers: list[dict[str, Any]]
+    status: str
+    error_codes: tuple[str, ...]
+    metrics: dict[str, Any]
+    attempt_events: tuple[dict[str, Any], ...]
+
+
+class CrawlFetchError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        metrics: dict[str, Any] | None = None,
+        attempt_events: Iterable[dict[str, Any]] = (),
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.metrics = dict(metrics or {})
+        self.attempt_events = tuple(dict(event) for event in attempt_events)
+
+
+@dataclass(frozen=True)
 class _PaperBlock:
     text: str
     items: tuple[str, ...] = ()
@@ -103,8 +135,54 @@ def fetch_category(
     attempt_progress: Callable[[dict[str, Any]], None] | None = None,
     client: httpx.Client | None = None,
 ) -> list[dict]:
+    result = fetch_category_report(
+        category,
+        top_n=top_n,
+        sort_param=sort_param,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+        user_agent=user_agent,
+        trust_env_proxy=trust_env_proxy,
+        proxy_url=proxy_url,
+        crawl_date=crawl_date,
+        attempt_progress=attempt_progress,
+        client=client,
+    )
+    if result.status == "failed":
+        error_code = str(result.metrics.get("primary_error_code") or "parse_incomplete")
+        raise CrawlFetchError(
+            f"抓取 {category} 完整性检查失败（{error_code}）",
+            error_code=error_code,
+            metrics=result.metrics,
+            attempt_events=result.attempt_events,
+        )
+    return result.papers
+
+
+def fetch_category_report(
+    category: str,
+    top_n: int = 30,
+    sort_param: str = "sort=1",
+    timeout_seconds: int = 20,
+    retries: int = 2,
+    user_agent: str = "DailyCoolPapers/0.1",
+    trust_env_proxy: bool = False,
+    proxy_url: str = "",
+    crawl_date: str | None = None,
+    missing_field_warning_rate: float = 0.0,
+    attempt_progress: Callable[[dict[str, Any]], None] | None = None,
+    client: httpx.Client | None = None,
+) -> CategoryFetchResult:
     url = build_category_url(category, sort_param, top_n, crawl_date=crawl_date)
     last_error: Exception | None = None
+    last_error_code = "network_http_error"
+    last_metrics: dict[str, Any] = {
+        "target_date": crawl_date,
+        "category": category,
+        "request_url": _safe_url(url),
+        "top_n": int(top_n),
+    }
+    attempt_events: list[dict[str, Any]] = []
     max_attempts = retries + 1
     owns_client = client is None
     if client is None:
@@ -115,58 +193,188 @@ def fetch_category(
         client_kwargs.update(httpx_proxy_kwargs(proxy_url, trust_env_proxy))
         client = httpx.Client(**client_kwargs)
     for attempt in range(retries + 1):
+        attempt_number = attempt + 1
+        started = time.perf_counter()
+        _record_attempt_event(
+            attempt_events,
+            attempt_progress,
+            {
+                "event": "attempt",
+                "attempt": attempt_number,
+                "max_attempts": max_attempts,
+                "request_url": _safe_url(url),
+                "url": _safe_url(url),
+            },
+        )
         try:
-            logger.info("Fetching %s attempt=%s", url, attempt + 1)
-            if attempt_progress:
-                attempt_progress(
-                    {
-                        "event": "attempt",
-                        "attempt": attempt + 1,
-                        "max_attempts": max_attempts,
-                        "url": url,
-                    }
-                )
+            logger.info("Fetching %s attempt=%s", _safe_url(url), attempt_number)
             response = client.get(url, headers={"User-Agent": user_agent})
+            elapsed_ms = max(0, int(round((time.perf_counter() - started) * 1000)))
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            final_url = _safe_url(str(getattr(response, "url", url) or url))
+            response_bytes = _response_bytes(response)
+            last_metrics = {
+                **last_metrics,
+                "http_status": status_code,
+                "response_ms": elapsed_ms,
+                "final_url": final_url,
+                "response_bytes": len(response_bytes),
+                "content_sha256": hashlib.sha256(response_bytes).hexdigest(),
+                "retry_count": attempt,
+            }
             response.raise_for_status()
-            page_date = extract_page_date(response.text) or crawl_date
-            papers = parse_papers(response.text, category, top_n, url)
-            paper_dicts = [paper.to_dict() for paper in papers]
-            if page_date:
-                for paper in paper_dicts:
-                    paper["_crawl_date"] = page_date
-            logger.info("Fetched %s papers for %s", len(papers), category)
+            if not _is_allowed_category_url(final_url, category):
+                raise CrawlFetchError(
+                    f"抓取 {category} 被重定向到非预期页面",
+                    error_code="unexpected_redirect",
+                    metrics=last_metrics,
+                    attempt_events=attempt_events,
+                )
+            _record_attempt_event(
+                attempt_events,
+                attempt_progress,
+                {
+                    "event": "http_succeeded",
+                    "attempt": attempt_number,
+                    "max_attempts": max_attempts,
+                    "metrics": dict(last_metrics),
+                },
+            )
+            try:
+                result = _analyze_category_response(
+                    response.text,
+                    category=category,
+                    top_n=top_n,
+                    target_date=crawl_date,
+                    request_metrics=last_metrics,
+                    missing_field_warning_rate=missing_field_warning_rate,
+                    attempt_events=attempt_events,
+                )
+            except Exception as exc:
+                logger.warning("Parsing crawl response failed category=%s error_type=%s", category, type(exc).__name__)
+                result = CategoryFetchResult(
+                    papers=[],
+                    status="failed",
+                    error_codes=("parse_incomplete",),
+                    metrics={
+                        **last_metrics,
+                        "target_date": crawl_date,
+                        "category": category,
+                        "declared_total": None,
+                        "expected_count": None,
+                        "parsed_count": 0,
+                        "valid_arxiv_count": 0,
+                        "failed_count": 0,
+                        "error_codes": ["parse_incomplete"],
+                        "primary_error_code": "parse_incomplete",
+                        "integrity_status": "failed",
+                    },
+                    attempt_events=tuple(dict(event) for event in attempt_events),
+                )
+            logger.info(
+                "Fetched %s papers for %s integrity_status=%s",
+                len(result.papers),
+                category,
+                result.status,
+            )
             if owns_client:
                 client.close()
-            return paper_dicts
+            return result
         except Exception as exc:
             last_error = exc
-            logger.warning("Fetch failed for %s attempt=%s error=%s", category, attempt + 1, exc)
-            if attempt_progress:
-                attempt_progress(
-                    {
-                        "event": "attempt_failed",
-                        "attempt": attempt + 1,
-                        "max_attempts": max_attempts,
-                        "url": url,
-                        "error": str(exc),
-                    }
-                )
+            elapsed_ms = max(0, int(round((time.perf_counter() - started) * 1000)))
+            if isinstance(exc, CrawlFetchError):
+                last_error_code = exc.error_code
+                last_metrics = {**last_metrics, **exc.metrics}
+            else:
+                last_error_code = _network_error_code(exc)
+            last_metrics = {
+                **last_metrics,
+                "response_ms": elapsed_ms,
+                "retry_count": attempt,
+            }
+            logger.warning(
+                "Fetch failed for %s attempt=%s code=%s error_type=%s",
+                category,
+                attempt_number,
+                last_error_code,
+                type(exc).__name__,
+            )
+            _record_attempt_event(
+                attempt_events,
+                attempt_progress,
+                {
+                    "event": "attempt_failed",
+                    "attempt": attempt_number,
+                    "max_attempts": max_attempts,
+                    "error_code": last_error_code,
+                    "error": f"抓取失败（{last_error_code}）",
+                    "metrics": dict(last_metrics),
+                },
+            )
+            if last_error_code == "unexpected_redirect":
+                break
     if owns_client:
         client.close()
-    raise RuntimeError(f"抓取 {category} 失败: {last_error}") from last_error
+    raise CrawlFetchError(
+        f"抓取 {category} 失败（{last_error_code}）",
+        error_code=last_error_code,
+        metrics=last_metrics,
+        attempt_events=attempt_events,
+    ) from last_error
 
 
 def parse_papers(html: str, category: str, top_n: int, source_url: str) -> list[CrawledPaper]:
+    return parse_papers_with_diagnostics(html, category, top_n, source_url).papers
+
+
+def parse_papers_with_diagnostics(
+    html: str,
+    category: str,
+    top_n: int,
+    source_url: str,
+) -> ParsedPapersResult:
     soup = BeautifulSoup(html, "html.parser")
     headings = [heading for heading in soup.find_all("h2") if _rank_from_text(heading.get_text(" ", strip=True))]
     papers: list[CrawledPaper] = []
-    for heading in headings:
+    missing = {
+        "missing_arxiv_id": 0,
+        "missing_title": 0,
+        "missing_abstract": 0,
+        "missing_authors": 0,
+        "missing_published_at": 0,
+    }
+    critical_missing_entries = 0
+    considered = headings[: max(0, int(top_n))]
+    for heading in considered:
         paper = _parse_heading_block(heading, source_url)
-        if paper:
-            papers.append(paper)
-        if len(papers) >= top_n:
-            break
-    return papers
+        if not paper:
+            missing["missing_arxiv_id"] += 1
+            critical_missing_entries += 1
+            continue
+        entry_missing = False
+        for field_name, value in (
+            ("missing_title", paper.title),
+            ("missing_abstract", paper.abstract),
+            ("missing_authors", paper.authors),
+            ("missing_published_at", paper.published_at),
+        ):
+            if not value:
+                missing[field_name] += 1
+                entry_missing = True
+        if entry_missing:
+            critical_missing_entries += 1
+        papers.append(paper)
+    return ParsedPapersResult(
+        papers=papers,
+        metrics={
+            "heading_count": len(considered),
+            "parsed_count": len(considered),
+            "valid_arxiv_count": len(papers),
+            "critical_missing_entries": critical_missing_entries,
+            **missing,
+        },
+    )
 
 
 def extract_page_date(html: str) -> str | None:
@@ -177,6 +385,176 @@ def extract_page_date(html: str) -> str | None:
         if match:
             return match.group(0)
     return None
+
+
+def extract_declared_total(html: str) -> int | None:
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    match = re.search(r"\bTotal\s*[:：]\s*([\d,]+)\b", text, flags=re.I)
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+def _analyze_category_response(
+    html: str,
+    *,
+    category: str,
+    top_n: int,
+    target_date: str | None,
+    request_metrics: dict[str, Any],
+    missing_field_warning_rate: float,
+    attempt_events: list[dict[str, Any]],
+) -> CategoryFetchResult:
+    page_date = extract_page_date(html)
+    declared_total = extract_declared_total(html)
+    parsed = parse_papers_with_diagnostics(
+        html,
+        category,
+        top_n,
+        str(request_metrics.get("final_url") or request_metrics.get("request_url") or ""),
+    )
+    papers = [paper.to_dict() for paper in parsed.papers]
+    effective_date = page_date or target_date
+    if effective_date:
+        for paper in papers:
+            paper["_crawl_date"] = effective_date
+
+    expected_count = min(max(0, int(top_n)), declared_total) if declared_total is not None else None
+    candidate_count = max(1, int(parsed.metrics["heading_count"]))
+    missing_rate = parsed.metrics["critical_missing_entries"] / candidate_count
+    threshold = max(0.0, min(1.0, float(missing_field_warning_rate)))
+    error_codes: list[str] = []
+    failed = False
+
+    if target_date and page_date and page_date != target_date:
+        error_codes.append("page_date_mismatch")
+        failed = True
+    elif not page_date:
+        error_codes.append("page_date_unknown")
+
+    parsed_count = int(parsed.metrics["parsed_count"])
+    if declared_total is None:
+        error_codes.append("declared_total_unknown")
+        if parsed_count == 0:
+            error_codes.append("parse_zero_without_total")
+            failed = True
+    elif declared_total > 0 and parsed_count == 0:
+        error_codes.append("parse_zero_with_nonzero_total")
+        failed = True
+    elif declared_total == 0 and parsed_count > 0:
+        error_codes.append("declared_total_mismatch")
+    elif expected_count is not None and 0 < parsed_count < expected_count:
+        error_codes.append("parse_incomplete")
+
+    if parsed.metrics["missing_arxiv_id"]:
+        error_codes.append("missing_arxiv_id")
+        if parsed_count > 0 and parsed.metrics["valid_arxiv_count"] == 0:
+            failed = True
+    if parsed.metrics["critical_missing_entries"] and missing_rate > threshold:
+        error_codes.append("missing_critical_fields")
+
+    error_codes = list(dict.fromkeys(error_codes))
+    primary_error_code = _primary_integrity_error(error_codes)
+    if failed:
+        status = "failed"
+    elif error_codes:
+        status = "warning"
+    elif declared_total == 0 and parsed_count == 0:
+        status = "empty_success"
+    else:
+        status = "success"
+
+    metrics = {
+        **request_metrics,
+        "target_date": target_date,
+        "page_date": page_date,
+        "category": category,
+        "declared_total": declared_total,
+        "top_n": int(top_n),
+        "expected_count": expected_count,
+        **parsed.metrics,
+        "missing_field_rate": round(missing_rate, 6),
+        "missing_field_warning_rate": threshold,
+        "error_codes": error_codes,
+        "primary_error_code": primary_error_code,
+        "integrity_status": status,
+    }
+    return CategoryFetchResult(
+        papers=papers,
+        status=status,
+        error_codes=tuple(error_codes),
+        metrics=metrics,
+        attempt_events=tuple(dict(event) for event in attempt_events),
+    )
+
+
+def _record_attempt_event(
+    events: list[dict[str, Any]],
+    callback: Callable[[dict[str, Any]], None] | None,
+    event: dict[str, Any],
+) -> None:
+    safe_event = dict(event)
+    events.append(safe_event)
+    if callback:
+        try:
+            callback(dict(safe_event))
+        except Exception as exc:
+            logger.warning("Crawl attempt progress callback failed error_type=%s", type(exc).__name__)
+
+
+def _response_bytes(response: Any) -> bytes:
+    content = getattr(response, "content", None)
+    if isinstance(content, bytes):
+        return content
+    return str(getattr(response, "text", "")).encode("utf-8", errors="replace")
+
+
+def _safe_url(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    allowed_query = [
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if key in {"date", "show", "sort"}
+    ]
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc.rsplit('@', 1)[-1],
+            parsed.path,
+            "",
+            urlencode(allowed_query),
+            "",
+        )
+    )
+
+
+def _is_allowed_category_url(value: str, category: str) -> bool:
+    parsed = urlparse(value)
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme in {"http", "https"}
+        and (hostname == "papers.cool" or hostname.endswith(".papers.cool"))
+        and parsed.path.rstrip("/") == f"/arxiv/{category}"
+    )
+
+
+def _network_error_code(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "network_timeout"
+    return "network_http_error"
+
+
+def _primary_integrity_error(error_codes: list[str]) -> str | None:
+    priority = (
+        "page_date_mismatch",
+        "parse_zero_with_nonzero_total",
+        "parse_zero_without_total",
+        "parse_incomplete",
+        "missing_arxiv_id",
+        "declared_total_mismatch",
+        "declared_total_unknown",
+        "page_date_unknown",
+        "missing_critical_fields",
+    )
+    return next((code for code in priority if code in error_codes), None)
 
 
 def _parse_heading_block(heading: Tag, source_url: str) -> CrawledPaper | None:
@@ -305,7 +683,7 @@ def _extract_arxiv_id(text: str | None) -> str | None:
     match = ARXIV_ID_RE.search(text)
     if not match:
         return None
-    return match.group("id")
+    return re.sub(r"v\d+$", "", match.group("id"), flags=re.I)
 
 
 def _extract_label_count(text: str, label: str) -> int:

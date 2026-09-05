@@ -1,0 +1,7 @@
+{% extends 'base.html' %}
+{% block title %}{{ series.title }} - 备忘录版本{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">Version history / 版本历史</span><h1>{{ series.title }}</h1><p>来源 {{ series.source_mode }} · {{ series.status }} · 标题和来源不可修改</p></div><a href="{{ url_for('memo_list') }}">全部备忘录</a></section>
+{% if series.status=='active' %}<div class="actions">{% if versions %}<a class="button" href="{{ url_for('memo_new_version',series_id=series.id,version_id=versions[0].id) }}">从最新版本开始新版本</a>{% endif %}<form method="post" action="{{ url_for('memo_archive',series_id=series.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">归档系列（不可恢复）</button></form></div>{% else %}<p class="run-notice">系列已归档，不可恢复或新增版本。历史内容仍可查看，成功版本仍可导出。</p>{% endif %}
+{% for version in versions %}<article class="theme-record"><h2><a href="{{ url_for('memo_version',series_id=series.id,version_id=version.id) }}">v{{ version.version_no }} · {{ version.status }}</a></h2><p>{{ version.paper_count }} 篇论文 · {{ version.model }} · {{ version.created_at }}</p>{% if version.error_code %}<p class="danger">{{ version.error_code }}</p>{% endif %}</article>{% else %}<p class="empty">暂无版本</p>{% endfor %}
+{% endblock %}

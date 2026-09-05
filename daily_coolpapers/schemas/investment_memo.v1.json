@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:daily-coolpapers:investment_memo.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "language", "sections", "diligence_questions"],
+  "properties": {
+    "schema_version": {"const": "investment_memo.v1"},
+    "language": {"const": "zh-CN"},
+    "sections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["core_conclusions", "technical_scope", "technical_routes", "consensus_and_disagreements", "technical_changes", "product_and_startup_opportunities", "value_chain_beneficiaries", "key_people_and_organizations", "china_market_hypotheses", "risks", "counterevidence_and_gaps"],
+      "properties": {
+        "core_conclusions": {"$ref": "#/$defs/section"},
+        "technical_scope": {"$ref": "#/$defs/section"},
+        "technical_routes": {"$ref": "#/$defs/section"},
+        "consensus_and_disagreements": {"$ref": "#/$defs/section"},
+        "technical_changes": {"$ref": "#/$defs/section"},
+        "product_and_startup_opportunities": {"$ref": "#/$defs/section"},
+        "value_chain_beneficiaries": {"$ref": "#/$defs/section"},
+        "key_people_and_organizations": {"$ref": "#/$defs/section"},
+        "china_market_hypotheses": {
+          "allOf": [
+            {"$ref": "#/$defs/section"},
+            {"properties": {"claims": {"items": {"properties": {"claim_type": {"enum": ["cross_paper_inference", "insufficient_evidence"]}}}}}}
+          ]
+        },
+        "risks": {"$ref": "#/$defs/section"},
+        "counterevidence_and_gaps": {"$ref": "#/$defs/section"}
+      }
+    },
+    "diligence_questions": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["question_text", "reason", "evidence_refs"],
+        "properties": {
+          "question_text": {"$ref": "#/$defs/text"},
+          "reason": {"$ref": "#/$defs/text"},
+          "evidence_refs": {"$ref": "#/$defs/refs"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "refs": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^P[1-9][0-9]*$"}
+    },
+    "claim": {
+      "type": "object", "additionalProperties": false,
+      "required": ["claim_text", "claim_type", "evidence_refs", "reasoning"],
+      "properties": {
+        "claim_text": {"$ref": "#/$defs/text"},
+        "claim_type": {"enum": ["paper_fact", "cross_paper_inference", "insufficient_evidence"]},
+        "evidence_refs": {"$ref": "#/$defs/refs"},
+        "reasoning": {"$ref": "#/$defs/text"}
+      },
+      "allOf": [{
+        "if": {"properties": {"claim_type": {"enum": ["paper_fact", "cross_paper_inference"]}}},
+        "then": {"properties": {"evidence_refs": {"minItems": 1}}}
+      }]
+    },
+    "section": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "summary", "claims"],
+      "properties": {
+        "status": {"enum": ["supported", "insufficient_evidence"]},
+        "summary": {"$ref": "#/$defs/text"},
+        "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "supported"}}},
+        "then": {"properties": {"claims": {"minItems": 1}}}
+      }]
+    }
+  }
+}

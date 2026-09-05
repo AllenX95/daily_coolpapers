@@ -1,0 +1,34 @@
+<div class="paper-themes" aria-labelledby="paper-themes-heading" data-testid="paper-themes">
+  <div class="personal-decision-head">
+    <div><span class="eyebrow">Research folders / 研究归档</span><h3 id="paper-themes-heading">加入投资主题</h3></div>
+    <a href="{{ url_for('investment_themes', paper_id=paper.id) }}">创建／管理主题</a>
+  </div>
+  <p class="small muted">主题归档与收藏、跳过独立。保存只更新下方活跃主题；已归档关系需明确移除。</p>
+  {% for message in get_flashed_messages(category_filter=['themes']) %}<p class="decision-feedback" role="status">{{ message }}</p>{% endfor %}
+  {% if paper_themes.assigned %}
+    <ul class="assigned-themes" aria-label="已加入的投资主题">
+      {% for theme in paper_themes.assigned %}
+        <li><a class="theme-tag {{ theme.status }}" href="{{ url_for('investment_theme_papers', theme_id=theme.id) }}">{{ theme.name }}{% if theme.status == 'archived' %} · 已归档{% endif %}</a>
+          <form method="post" action="{{ url_for('remove_paper_investment_theme', paper_id=paper.id, theme_id=theme.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="secondary" aria-label="从论文移除主题：{{ theme.name }}">从论文移除</button>
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}<p class="small muted">尚未加入投资主题。</p>{% endif %}
+  {% if paper_themes.active %}
+    <form method="post" action="{{ url_for('save_paper_investment_themes', paper_id=paper.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <fieldset class="theme-picker"><legend>选择活跃主题（可多选）</legend>
+        {% for theme in paper_themes.active %}
+          <label class="theme-choice"><input type="checkbox" name="theme_ids" value="{{ theme.id }}" {% if theme.selected %}checked{% endif %}>
+            <span><strong>{{ theme.name }}</strong>{% if theme.description %}<small>{{ theme.description }}</small>{% endif %}</span>
+          </label>
+        {% endfor %}
+      </fieldset>
+      <p class="small muted">全部取消勾选并保存，将移除所有活跃主题关系，不影响上方已归档关系。</p>
+      <button type="submit">保存投资主题</button>
+    </form>
+  {% else %}<p class="empty">暂无可选的活跃主题。<a href="{{ url_for('investment_themes', paper_id=paper.id) }}">创建投资主题</a>，或恢复已有归档主题后再选择。</p>{% endif %}
+</div>

@@ -67,7 +67,8 @@ class RuntimeLifecycleTests(unittest.TestCase):
 
     def test_job_runner_start_and_stop_are_idempotent(self):
         runner = JobRunner()
-        with patch.object(runner, "_maybe_schedule_daily_work", return_value=None):
+        with (patch.object(runner, "_maybe_schedule_daily_work", return_value=None),
+              patch.object(runner, 'reconcile_orphaned_pending_jobs', return_value=0)):
             runner.start()
             runner.start()
             runner.stop()

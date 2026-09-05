@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from .config import MARKDOWN_CACHE_DIR, PDF_CACHE_DIR, ensure_directories
-from .db import get_bool_setting, get_int_setting, get_setting
+from .db import delete_expired_job_events, get_bool_setting, get_int_setting, get_setting
 from .network import httpx_proxy_kwargs
 
 logger = logging.getLogger(__name__)
@@ -231,6 +231,7 @@ def cleanup_caches(
         "pdf_tmp_deleted": cleanup_directory(PDF_CACHE_DIR, "*.tmp", 1),
         "markdown_deleted": cleanup_directory(MARKDOWN_CACHE_DIR, "*.md", md_days),
         "markdown_tmp_deleted": cleanup_directory(MARKDOWN_CACHE_DIR, "*.tmp", 1),
+        "job_events_deleted": delete_expired_job_events(),
     }
     logger.info("Cache cleanup finished: %s", result)
     return result

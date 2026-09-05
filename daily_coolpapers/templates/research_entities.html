@@ -1,0 +1,71 @@
+{% extends 'base.html' %}
+{% block title %}研究对象 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head">
+  <div><span class="eyebrow">People & institutions / 人工研究档案</span><h1>研究对象</h1>
+    <p class="muted">从论文积累作者与机构认知。这里记录人工确认的关系，不推断当前任职，不自动合并同名对象。</p>
+  </div>
+</section>
+<nav class="research-tabs" aria-label="研究对象视图">
+  {% for key, label in {'tracking': '跟踪论文', 'authors': '作者库', 'organizations': '机构/企业库'}.items() %}
+    <a href="{{ url_for('research_entities', view=key) }}" {% if view == key %}aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</nav>
+<section class="research-toolbar">
+  <form method="get" class="filters">
+    <input type="hidden" name="view" value="{{ view }}">
+    {% for kind, entity in scoped.items() %}<input type="hidden" name="{{ kind }}_id" value="{{ entity.id }}">{% endfor %}
+    <label>名称搜索<input name="q" aria-label="名称搜索" value="{{ query }}" placeholder="{{ '论文、作者或机构名称' if view == 'tracking' else '实体名称' }}"></label>
+    <label>作者分类<select name="author_category" aria-label="作者分类筛选"><option value="">全部分类</option>{% for key, label in author_categories.items() %}<option value="{{ key }}" {% if author_category == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label>机构类型<select name="organization_type" aria-label="机构类型筛选"><option value="">全部类型</option>{% for key, label in organization_types.items() %}<option value="{{ key }}" {% if organization_type == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label>状态<select name="status" aria-label="研究对象状态筛选">{% for key, label in status_options.items() %}<option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <button type="submit">应用筛选</button><a href="{{ url_for('research_entities', view=view) }}">重置</a>
+  </form>
+  <p class="small muted">{{ rows|length }} {{ '条关系' if view == 'tracking' else '个实体' }}{% if view != 'tracking' %} · 数量和关联对象包含跟踪中与已停止的历史关系，最近论文按发表日期排序，最多展示 3 篇。{% endif %}</p>
+  {% if scoped %}<p class="team-notes">限定对象：{% for kind, entity in scoped.items() %}{{ entity.name }}{% if not loop.last %} / {% endif %}{% endfor %} · <a href="{{ url_for('research_entities', view='tracking', status='all') }}">查看全部关系</a></p>{% endif %}
+</section>
+<section class="research-results" data-testid="research-results">
+  {% for row in rows %}
+    {% if view == 'tracking' %}
+      <article class="research-record" data-testid="tracking-record">
+        <header><a class="paper-title" href="{{ url_for('paper_detail', paper_id=row.paper_id, _anchor='fulltext-result') }}">{{ row.title }}</a><span class="decision-badge {{ 'favorite' if row.status == 'tracking' else 'skipped' }}">{{ '跟踪中' if row.status == 'tracking' else '已停止' }}</span></header>
+        <div class="research-relations">
+          <p>第一作者：<a href="{{ url_for('research_entities', view='authors', status='all', _anchor='author-' ~ row.lead_author_id) }}">{{ row.author_name }}</a> · {{ author_categories[row.author_category] }}{% if row.author_status == 'archived' %} · 作者已归档{% endif %}</p>
+          <p>主要机构：<a href="{{ url_for('research_entities', view='organizations', status='all', _anchor='organization-' ~ row.organization_id) }}">{{ row.organization_name }}</a> · {{ organization_types[row.organization_type] }}{% if row.organization_status == 'archived' %} · 机构已归档{% endif %}</p>
+        </div>
+        {% if row.notes %}<p class="team-notes">{{ row.notes }}</p>{% endif %}
+        <p class="small muted">开始跟踪：{{ row.created_at }} · 最近更新：{{ row.updated_at }} · <a href="{{ url_for('paper_detail', paper_id=row.paper_id, _anchor='fulltext-result') }}">在论文中编辑 / 停止跟踪 →</a></p>
+      </article>
+    {% else %}
+      {% set is_author = view == 'authors' %}
+      {% set kind = 'author' if is_author else 'organization' %}
+      {% set action_url = url_for('update_research_author', author_id=row.id) if is_author else url_for('update_research_organization', organization_id=row.id) %}
+      <article class="research-record {{ row.status }}" id="{{ kind }}-{{ row.id }}" data-testid="research-entity">
+        <header><div><span class="eyebrow">{{ 'AUTHOR' if is_author else 'ORGANIZATION' }} / #{{ row.id }}</span><h2>{{ row.name }}</h2></div><span class="decision-badge">{{ '活跃' if row.status == 'active' else '已归档' }}</span></header>
+        <p class="small muted">{{ author_categories[row.author_category] if is_author else organization_types[row.organization_type] }}{% if not is_author and row.region %} · {{ row.region }}{% endif %}</p>
+        <div class="research-counts">
+          <a href="{{ url_for('research_entities', view='tracking', status='all', author_id=row.id) if is_author else url_for('research_entities', view='tracking', status='all', organization_id=row.id) }}"><strong>{{ row.paper_count }}</strong> 篇关联论文</a>
+          <span><strong>{{ row.related_count }}</strong> {{ '家关联机构' if is_author else '位关联作者' }}</span><span><strong>{{ row.tracking_count }}</strong> 篇跟踪中</span>
+        </div>
+        {% if row.related_entities %}<p class="team-notes">{{ '关联机构' if is_author else '关联作者' }}：{% for other in row.related_entities %}<a href="{{ url_for('research_entities', view='tracking', status='all', author_id=row.id if is_author else other.id, organization_id=other.id if is_author else row.id) }}">{{ other.name }}</a>{% if other.status == 'archived' %}（已归档）{% endif %}{% if not loop.last %} / {% endif %}{% endfor %}{% if row.related_count > 3 %} 等 {{ row.related_count }} 个对象{% endif %}</p>{% endif %}
+        {% if row.notes %}<p class="team-notes">{{ row.notes }}</p>{% endif %}
+        {% if row.recent_papers %}<h3>最近论文</h3><ul class="recent-research-papers">{% for paper in row.recent_papers %}<li><a href="{{ url_for('paper_detail', paper_id=paper.id, _anchor='fulltext-result') }}">{{ paper.title }}</a><span class="small muted"> · {{ paper.published_at or '日期未知' }}{% if paper.status == 'archived' %} · 已停止跟踪{% endif %}</span></li>{% endfor %}</ul>{% endif %}
+        <div class="research-maintenance">
+          <details><summary>编辑{{ '作者' if is_author else '机构' }}</summary>
+            <form method="post" action="{{ action_url }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="update">
+              <label>名称<input name="name" aria-label="名称" value="{{ row.name }}" required></label>
+              {% if is_author %}<label>作者分类<select name="author_category" aria-label="作者分类">{% for key, label in author_categories.items() %}<option value="{{ key }}" {% if row.author_category == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+              {% else %}<label>机构类型<select name="organization_type" aria-label="机构类型" required>{% for key, label in organization_types.items() %}<option value="{{ key }}" {% if row.organization_type == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label><label>国家/地区（可选）<input name="region" aria-label="国家/地区（可选）" value="{{ row.region }}"></label>{% endif %}
+              <label>备注（可选）<textarea name="notes" aria-label="备注（可选）" rows="3">{{ row.notes }}</textarea></label>
+              <button type="submit">保存实体修改</button>
+            </form>
+          </details>
+          <form method="post" action="{{ action_url }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="{{ 'archive' if row.status == 'active' else 'restore' }}"><button type="submit" class="secondary">{{ '归档实体' if row.status == 'active' else '恢复实体' }}</button></form>
+        </div>
+        {% if row.status == 'archived' %}<p class="small muted">历史关系保留，停止跟踪需在论文内单独操作；恢复实体不会自动重新跟踪论文。</p>{% endif %}
+      </article>
+    {% endif %}
+  {% else %}<p class="empty">当前筛选下没有研究对象。可在成功全文评估的论文下方手工确认团队。<a href="{{ url_for('reviewed_papers') }}">前往全文库 →</a></p>{% endfor %}
+</section>
+{% endblock %}

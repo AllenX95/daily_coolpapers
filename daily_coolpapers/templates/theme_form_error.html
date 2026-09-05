@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}投资主题未保存 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section aria-labelledby="theme-error-heading">
+  <h1 id="theme-error-heading">投资主题未保存</h1>
+  <div role="alert">
+    {% if message %}<p>{{ message }}</p>{% endif %}
+    {% if errors %}<ul>{% for field, error in errors.items() %}<li>{{ {'name': '主题名称', 'description': '主题说明', 'theme_ids': '主题选择', 'action': '操作', 'paper_id': '返回论文'}.get(field, field) }}：{{ error }}</li>{% endfor %}</ul>{% endif %}
+  </div>
+  <p class="muted">本次操作未保存任何改动。请返回并刷新页面，修正后重新提交。</p>
+  <a class="button secondary" href="{{ return_url }}">{{ return_label }}</a>
+</section>
+{% endblock %}
