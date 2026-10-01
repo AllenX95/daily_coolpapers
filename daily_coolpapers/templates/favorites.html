@@ -3,22 +3,42 @@
 {% set is_theme = collection_kind|default('favorites') == 'theme' %}
 {% block title %}{{ theme.name if is_theme else ('全文库' if is_reviewed else '收藏') }} - Daily Cool Papers{% endblock %}
 {% block content %}
+{% macro collection_page_url(target_page) -%}
+  {%- if is_theme -%}
+    {{ url_for('investment_theme_papers', theme_id=theme.id, sort=sort, page=target_page, page_size=page_size) }}
+  {%- elif is_reviewed -%}
+    {{ url_for('reviewed_papers', sort=sort, decision=decision, page=target_page, page_size=page_size) }}
+  {%- else -%}
+    {{ url_for('favorites', sort=sort, page=target_page, page_size=page_size) }}
+  {%- endif -%}
+{%- endmacro %}
+{% macro collection_paper_url(paper_id) -%}
+  {%- if is_theme -%}
+    {{ url_for('paper_detail', paper_id=paper_id, collection='theme', theme_id=theme.id, sort=sort, page=page, page_size=page_size) }}
+  {%- elif is_reviewed -%}
+    {{ url_for('paper_detail', paper_id=paper_id, collection='reviewed', decision=decision, sort=sort, page=page, page_size=page_size) }}
+  {%- else -%}
+    {{ url_for('paper_detail', paper_id=paper_id, collection='favorites', sort=sort, page=page, page_size=page_size) }}
+  {%- endif -%}
+{%- endmacro %}
 <section class="favorites-head">
   <div>
     {% if is_theme %}
     <span class="eyebrow">Research folder / 投资主题</span>
     <h1>{{ theme.name }}</h1>
     <p class="theme-description">{{ theme.description }}</p>
-    <p class="muted">{{ papers|length }} 篇论文 · 包含收藏、跳过与未处理论文{% if theme.status == 'archived' %} · 此主题已归档，历史关系保留{% endif %}</p>
+    <p class="muted">{{ total }} 篇论文 · 包含收藏、跳过与未处理论文{% if theme.status == 'archived' %} · 此主题已归档，历史关系保留{% endif %}</p>
     <a href="{{ url_for('investment_themes', _anchor='theme-' ~ theme.id) }}">管理此主题 →</a>
     {% else %}
     <span class="eyebrow">{{ 'Reviewed / 已评估' if is_reviewed else 'Selected / 个人精选' }}</span>
     <h1>{{ '全文库' if is_reviewed else '收藏' }}</h1>
-    <p class="muted">{{ '这里保留所有曾成功完成全文评估的论文。完成评估不等于收藏，旧论文默认未处理。' if is_reviewed else '这里只保留你手动收藏的论文，跳过或取消收藏后不再显示。' }}</p>
+    <p class="muted">{{ '这里保留所有曾成功完成全文评估的论文。完成评估不等于收藏，旧论文默认未处理。' if is_reviewed else '这里只保留你手动收藏的论文，跳过或取消收藏后不再显示。' }} · 共 {{ total }} 篇</p>
     <a href="{{ url_for('favorites' if is_reviewed else 'reviewed_papers') }}">{{ '查看我的收藏 →' if is_reviewed else '到全文库整理已评估论文 →' }}</a>
     {% endif %}
   </div>
   <form method="get" class="filters">
+    <input type="hidden" name="page" value="1">
+    <input type="hidden" name="page_size" value="{{ page_size }}">
     {% if is_reviewed %}
       <label class="select-field">个人决策
         <select name="decision" aria-label="个人决策筛选">
@@ -37,12 +57,24 @@
   </form>
 </section>
 
+{% if pages > 0 %}
+<nav class="pagination" aria-label="论文列表分页">
+  <span>共 {{ total }} 条 · 第 {{ page }} / {{ pages }} 页</span>
+  {% if page > 1 %}<a href="{{ collection_page_url(page - 1) }}">上一页</a>{% endif %}
+  {% if page > pages %}<a href="{{ collection_page_url(pages) }}">返回末页</a>{% endif %}
+  {% if page < pages %}<a href="{{ collection_page_url(page + 1) }}">下一页</a>{% endif %}
+</nav>
+{% if page > pages %}<p class="empty">第 {{ page }} 页超出范围，请返回末页继续浏览。</p>{% endif %}
+{% elif total == 0 %}
+<p class="pagination muted">共 0 条</p>
+{% endif %}
+
 <section class="favorite-list" data-testid="{{ 'theme-papers' if is_theme else ('reviewed-papers' if is_reviewed else 'personal-favorites') }}">
   {% for paper in papers %}
     <article class="favorite-item">
       <header class="favorite-item-head">
         <div>
-          <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
+          <a class="paper-title" href="{{ collection_paper_url(paper.id) }}">{{ paper.title }}</a>
           <div class="favorite-meta">
             <span class="decision-badge {{ paper.decision|default('undecided') }}">{{ paper.decision_label|default('未处理') }}</span>
             <span class="mono">{{ paper.arxiv_id }}</span>
@@ -97,7 +129,7 @@
           {% endfor %}
         </div>
         <div class="favorite-actions">
-          <a class="button secondary" href="{{ url_for('paper_detail', paper_id=paper.id) }}#fulltext-result">全文结果</a>
+          <a class="button secondary" href="{{ collection_paper_url(paper.id) }}#fulltext-result">全文结果</a>
           <a class="button secondary" href="{{ url_for('open_pdf', paper_id=paper.id) }}" target="_blank">PDF</a>
           {% if markdown_cached(paper.arxiv_id) %}
             <a class="button secondary" href="{{ url_for('view_markdown', paper_id=paper.id) }}">Markdown</a>

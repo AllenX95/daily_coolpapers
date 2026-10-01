@@ -4,11 +4,12 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Callable
 
 from . import db
 from .cache_manager import cleanup_caches
+from . import schedule_db
 from .services import (SHANGHAI_TZ, build_daily_pipeline_plan, run_daily_pipeline,
                        crawl_all_categories, crawl_to_latest, evaluate_missing_abstracts, evaluate_paper,
                        safe_evaluation_error)
@@ -81,7 +82,12 @@ class JobProgressWriter:
 
 
 class JobRunner:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        scheduler_wait: Callable[[float], bool] | None = None,
+    ) -> None:
         self.queue: queue.Queue[int] = queue.Queue()
         self._started = False
         self._worker_thread: threading.Thread | None = None
@@ -92,12 +98,42 @@ class JobRunner:
         self._queued_job_ids: set[int] = set()
         self._running_job_id: int | None = None
         self._last_reconcile_at = 0.0
+        self._stopping = False
+        self._runtime_claimed = False
+        self._clock = clock or (lambda: datetime.now(SHANGHAI_TZ))
+        self._scheduler_wait = scheduler_wait
+
+    def claim_runtime(self) -> None:
+        with self._state_lock:
+            if self._runtime_claimed or self._started or any(
+                thread and thread.is_alive() for thread in (self._worker_thread, self._scheduler_thread)
+            ):
+                raise RuntimeError('此任务运行器已有运行时，不能重复使用')
+            if self._stopping:
+                # A replacement runtime recovers pending jobs from its database;
+                # never carry old in-memory IDs or schedule markers into it.
+                self.queue = queue.Queue()
+                self._queued_job_ids.clear()
+                self._running_job_id = None
+                self._daily_runs.clear()
+                self._last_reconcile_at = 0.0
+            self._runtime_claimed = True
+            self._stopping = False
+
+    def release_runtime(self) -> None:
+        with self._state_lock:
+            self._runtime_claimed = False
 
     def start(self) -> None:
         with self._state_lock:
             if self._started:
                 return
+            if self._stopping:
+                raise RuntimeError('运行器已停止，请通过新的运行时重新启动')
+            if any(t and t.is_alive() for t in (self._worker_thread, self._scheduler_thread)):
+                raise RuntimeError('后台任务仍在停止中，不能重新启动')
             self._stop_event.clear()
+            self._stopping = False
             self._started = True
             self._worker_thread = threading.Thread(target=self._worker_loop, name="job-worker", daemon=True)
             self._scheduler_thread = threading.Thread(target=self._scheduler_loop, name="job-scheduler", daemon=True)
@@ -105,23 +141,38 @@ class JobRunner:
             self._scheduler_thread.start()
         logger.info("Job runner started")
 
-    def stop(self, timeout_seconds: float = 5.0) -> None:
+    def stop(self, timeout_seconds: float = 5.0) -> bool:
         with self._state_lock:
-            if not self._started:
-                return
             self._started = False
+            self._stopping = True
             self._stop_event.set()
             threads = [self._worker_thread, self._scheduler_thread]
+        deadline = time.monotonic() + max(0, timeout_seconds)
         for thread in threads:
-            if thread and thread is not threading.current_thread():
-                thread.join(timeout_seconds)
+            if thread and thread.ident is not None and thread is not threading.current_thread():
+                thread.join(max(0, deadline - time.monotonic()))
         with self._state_lock:
+            if any(thread and thread.is_alive() for thread in threads):
+                return False
             self._worker_thread = None
             self._scheduler_thread = None
         logger.info("Job runner stopped")
+        return True
+
+    def wait_stopped(self) -> None:
+        with self._state_lock:
+            threads = [self._worker_thread, self._scheduler_thread]
+        for thread in threads:
+            if thread and thread.ident is not None:
+                thread.join()
+
+    def _require_accepting_locked(self) -> None:
+        if self._stopping:
+            raise RuntimeError('服务正在停止，不能提交新任务')
 
     def enqueue(self, job_type: str, payload: dict[str, Any] | None = None) -> int:
         with self._state_lock:
+            self._require_accepting_locked()
             job_id = db.create_job(job_type, payload or {})
             db.update_job_progress(job_id, 0, 1, "等待执行")
             self._queued_job_ids.add(job_id)
@@ -137,6 +188,7 @@ class JobRunner:
         from .services import build_direction_backfill_plan
         plan = build_direction_backfill_plan(direction_id,date_from,date_to)
         with self._state_lock:
+            self._require_accepting_locked()
             job_id = db.create_direction_backfill_job(plan)
             self._queued_job_ids.add(job_id)
             self.queue.put(job_id)
@@ -145,6 +197,7 @@ class JobRunner:
     def enqueue_memo(self,command):
         from .memos import create_memo_version
         with self._state_lock:
+            self._require_accepting_locked()
             created = create_memo_version(command)
             if created['created']:
                 self._queued_job_ids.add(created['job_id'])
@@ -160,6 +213,7 @@ class JobRunner:
         if retry_mode not in {'all', 'abstract_only'}:
             raise ValueError('未知重试模式')
         with self._state_lock:
+            self._require_accepting_locked()
             active = db.get_active_crawl_job()
             if active:
                 return int(active['id']), False
@@ -222,6 +276,8 @@ class JobRunner:
                 continue
             try:
                 with self._state_lock:
+                    if self._stop_event.is_set():
+                        continue
                     self._queued_job_ids.discard(job_id)
                     self._running_job_id = job_id
                 self._run_job(job_id)
@@ -238,24 +294,53 @@ class JobRunner:
                 self._maybe_schedule_daily_work()
             except Exception:
                 logger.exception("Scheduler loop failed")
-            self._stop_event.wait(30)
+            wait = self._scheduler_wait or self._stop_event.wait
+            wait(30)
+
+    def _queue_persisted_job(self, job_id: int | None) -> None:
+        with self._state_lock:
+            self._queue_persisted_job_locked(job_id)
+
+    def _queue_persisted_job_locked(self, job_id: int | None) -> None:
+        """Queue a committed Job while the caller already owns state_lock."""
+        if job_id is None:
+            return
+        self._require_accepting_locked()
+        if job_id in self._queued_job_ids or self._running_job_id == job_id:
+            return
+        self._queued_job_ids.add(int(job_id))
+        self.queue.put(int(job_id))
 
     def _maybe_schedule_daily_work(self) -> None:
-        if not db.get_bool_setting("scheduler.enabled", True):
-            return
-        now = datetime.now(SHANGHAI_TZ)
-        day_key = now.strftime("%Y-%m-%d")
-        cutoff = (now - timedelta(days=3)).strftime("%Y-%m-%d")
-        self._daily_runs = {key for key in self._daily_runs if key[:10] >= cutoff}
-        times = str(db.get_setting("scheduler.daily_times", "10:30,12:00"))
-        wanted = {item.strip() for item in times.split(",") if item.strip()}
-        current = now.strftime("%H:%M")
-        run_key = f"{day_key} {current}"
-        if current in wanted and run_key not in self._daily_runs:
-            self.enqueue_pipeline("scheduled", idempotency_key=f'scheduled:{run_key}')
-            self._daily_runs.add(run_key)
-            if db.get_bool_setting("cache.cleanup_daily", True):
-                self.enqueue("cleanup", {})
+        # Hold the runner admission lock over reconciliation and queue
+        # insertion.  Otherwise orphan recovery or shutdown can race between
+        # the committed pending Job and its in-memory queue entry.
+        with self._state_lock:
+            self._require_accepting_locked()
+            now = self._clock()
+            enabled = db.get_bool_setting("scheduler.enabled", True)
+            times = db.get_setting("scheduler.daily_times", "10:30,12:00")
+            if not enabled:
+                schedule_db.reconcile_daily_schedule(
+                    now,
+                    enabled=False,
+                    daily_times=times,
+                    cleanup_daily=False,
+                    plan_builder=build_daily_pipeline_plan,
+                )
+                return
+
+            result = schedule_db.reconcile_daily_schedule(
+                now,
+                enabled=True,
+                daily_times=times,
+                cleanup_daily=db.get_bool_setting("cache.cleanup_daily", True),
+                plan_builder=build_daily_pipeline_plan,
+            )
+            if result.queue_job:
+                self._queue_persisted_job_locked(result.job_id)
+            if result.queue_cleanup_job:
+                self._queue_persisted_job_locked(result.cleanup_job_id)
 
     def _run_job(self, job_id: int) -> None:
         job = db.get_job(job_id)

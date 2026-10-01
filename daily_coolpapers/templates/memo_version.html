@@ -5,12 +5,13 @@
 <p class="run-notice">{{ disclaimer }}</p>
 <div class="actions">{% if series.status=='active' %}<a class="button" href="{{ url_for('memo_new_version',series_id=series.id,version_id=version.id) }}">{{ '重新确认并创建新版本' if version.status in ['failed','interrupted'] else '基于此版本创建新版本' }}</a>{% endif %}{% if version.status=='success' %}<a class="button secondary" href="{{ url_for('memo_export',series_id=series.id,version_id=version.id) }}">导出 Markdown</a>{% endif %}</div>
 <section class="result-panel"><h2>本次生成配置</h2><p>来源 {{ version.source_mode_snapshot }} / {{ version.source_name_snapshot or '手工选择' }}<br>Prompt #{{ version.prompt_id or '原配置已删除' }} · Profile #{{ version.profile_id }} · {{ version.provider }} / {{ version.model }}</p><p class="theme-description">{{ version.source_scope_snapshot }}</p>
-  <p>预计输入 {{ version.estimated_input_tokens }} tokens · 实际输入 {{ version.input_tokens if version.input_tokens is not none else '未提供' }} / 输出 {{ version.output_tokens if version.output_tokens is not none else '未提供' }}</p>
+  <p>预计输入 {{ version.estimated_input_tokens }} tokens · 版本原有输入 / 输出 token 字段：{{ version.input_tokens if version.input_tokens is not none else '未提供' }} / {{ version.output_tokens if version.output_tokens is not none else '未提供' }}<span class="small muted">（统一账本详情见下方；历史调用未回填）</span></p>
   <p class="small">温度 {{ version.profile_snapshot.temperature }} · 输出预算 {{ version.profile_snapshot.max_output_tokens }} · 上下文 {{ version.profile_snapshot.context_window_tokens }}{% if version.input_snapshot.prompt_config %} · 原始 Prompt：{{ version.input_snapshot.prompt_config.name }} v{{ version.input_snapshot.prompt_config.version }}{% endif %}</p>
   <details><summary>查看冻结的生成指令与参数</summary><pre class="memo-json">{{ version.prompt_snapshot }}</pre><pre class="memo-json">{{ version.profile_snapshot|json_pretty }}</pre></details>
   {% if version.job_id %}<a href="{{ url_for('job_detail',job_id=version.job_id) }}">后台任务 #{{ version.job_id }}</a>{% endif %}
   {% if version.status in ['pending','running'] %}<p>后台生成中。此版本最多执行一次模型调用。<a href="{{ request.path }}">刷新查看结果</a></p>{% elif version.status in ['failed','interrupted'] %}<p class="danger">{{ version.error_code }}：{{ version.error_message or '生成未完成' }}。未保存部分 AI 草稿。</p>{% endif %}
 </section>
+{% include 'partials/llm_call_details.html' %}
 {% if version.status=='success' %}
 <section class="result-panel memo-draft" aria-labelledby="memo-draft-title"><span class="eyebrow">AI draft / 不可变研究底稿</span><h2 id="memo-draft-title">AI 草稿</h2><p class="muted">以下为论文引用，不代表引用与结论的语义支持已经核验。商业机会、产业链和中国市场判断均需另行尽调。</p>
   {% for key,title in sections.items() %}{% set section=version.result.sections[key] %}

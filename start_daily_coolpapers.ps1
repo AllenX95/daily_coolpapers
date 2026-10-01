@@ -6,18 +6,14 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 
 $Url = "http://127.0.0.1:8765/"
 $HealthUrl = "http://127.0.0.1:8765/api/health"
-$LogDir = Join-Path $Root "logs"
-$StartupLog = Join-Path $LogDir "startup.log"
-$StdoutLog = Join-Path $LogDir "server.stdout.log"
-$StderrLog = Join-Path $LogDir "server.stderr.log"
-
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-Set-Content -Encoding UTF8 -Path $StartupLog -Value ("{0} startup begin" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+$StartupLog = $null
 
 function Write-StartupLog {
     param([string]$Message)
     $Line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
-    Add-Content -Encoding UTF8 -Path $StartupLog -Value $Line
+    if ($StartupLog) {
+        Add-Content -Encoding UTF8 -LiteralPath $StartupLog -Value $Line
+    }
     Write-Host $Line
 }
 
@@ -62,44 +58,27 @@ function Open-DailyCoolPapers {
     }
 }
 
-function Stop-OldDailyCoolPapers {
-    if (-not (Test-DailyCoolPapersHome)) {
-        return $true
-    }
-
-    Write-StartupLog "old service detected without health endpoint; requesting shutdown"
-    try {
-        Invoke-WebRequest -UseBasicParsing -Method Post -Uri ($Url + "api/shutdown") -TimeoutSec 3 | Out-Null
-    }
-    catch {
-        Write-StartupLog ("shutdown request failed: {0}" -f $_.Exception.Message)
-    }
-
-    $Deadline = (Get-Date).AddSeconds(12)
-    while ((Get-Date) -lt $Deadline) {
-        Start-Sleep -Milliseconds 500
-        if (-not (Test-DailyCoolPapersHome)) {
-            Write-StartupLog "old service stopped"
-            return $true
-        }
-    }
-
-    Write-StartupLog "old service is still responding; leaving it untouched"
-    return $false
-}
-
 if (Test-DailyCoolPapersHealth) {
     Write-StartupLog "service already running"
     Open-DailyCoolPapers
     exit 0
 }
 
-if (-not (Stop-OldDailyCoolPapers)) {
+if (Test-DailyCoolPapersHome) {
     Write-Host "Daily Cool Papers is already running, but it did not pass the new health check."
-    Write-Host "Open logs\startup.log for details."
-    Read-Host "Press Enter to close"
+    Write-Host "The existing service was left untouched. Close it yourself before restarting."
     exit 1
 }
+
+# A launcher has not acquired the runtime lock. Keep its diagnostics per attempt
+# outside the workspace, so even simultaneous/failed launches cannot truncate logs.
+$LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("daily-coolpapers-startup-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $LogDir | Out-Null
+$StartupLog = Join-Path $LogDir "startup.log"
+$StdoutLog = Join-Path $LogDir "server.stdout.log"
+$StderrLog = Join-Path $LogDir "server.stderr.log"
+Write-StartupLog "startup begin"
+Write-StartupLog ("launcher diagnostics: {0}" -f $LogDir)
 
 function Get-PythonCandidates {
     $Candidates = New-Object System.Collections.Generic.List[string]
@@ -175,8 +154,6 @@ if (-not $Python) {
 }
 
 Write-StartupLog ("python: {0}" -f $Python)
-Set-Content -Encoding UTF8 -Path $StdoutLog -Value ""
-Set-Content -Encoding UTF8 -Path $StderrLog -Value ""
 
 $RunPy = Join-Path $Root "run.py"
 $CmdLine = '""{0}" -B "{1}" 1>>"{2}" 2>>"{3}""' -f $Python, $RunPy, $StdoutLog, $StderrLog

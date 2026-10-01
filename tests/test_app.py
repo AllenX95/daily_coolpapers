@@ -227,12 +227,23 @@ class AppSmokeTests(unittest.TestCase):
     def test_favorites_route_uses_page_model(self):
         client = self.app.test_client()
         page_model = {
+            "collection_kind": "favorites",
+            "decision": "favorite",
+            "decision_options": [
+                {"value": "favorite", "label": "已收藏", "selected": True},
+            ],
             "papers": [],
             "sort": "evaluated_desc",
             "sort_options": [
                 {"value": "evaluated_desc", "label": "评估时间", "selected": True},
                 {"value": "score_desc", "label": "全文评分", "selected": False},
             ],
+            "total": 0,
+            "page": 1,
+            "page_size": 30,
+            "pages": 0,
+            "has_previous": False,
+            "has_next": False,
         }
         with (
             patch("daily_coolpapers.app.favorite_papers_page_model", return_value=page_model) as model,
@@ -242,7 +253,7 @@ class AppSmokeTests(unittest.TestCase):
             response = client.get("/favorites?sort=bad")
 
         self.assertEqual(response.status_code, 200)
-        model.assert_called_once_with("bad")
+        model.assert_called_once_with("bad", page=1, page_size=30)
         list_reviewed.assert_not_called()
         self.assertEqual(render.call_args.args[0], "favorites.html")
         self.assertEqual(render.call_args.kwargs, page_model)
@@ -250,6 +261,11 @@ class AppSmokeTests(unittest.TestCase):
     def test_favorites_page_renders_card_model(self):
         client = self.app.test_client()
         page_model = {
+            "collection_kind": "favorites",
+            "decision": "favorite",
+            "decision_options": [
+                {"value": "favorite", "label": "已收藏", "selected": True},
+            ],
             "sort": "score_desc",
             "sort_options": [
                 {"value": "evaluated_desc", "label": "评估时间", "selected": False},
@@ -274,6 +290,12 @@ class AppSmokeTests(unittest.TestCase):
                     "tags": ["agent", "infra"],
                 }
             ],
+            "total": 1,
+            "page": 1,
+            "page_size": 30,
+            "pages": 1,
+            "has_previous": False,
+            "has_next": False,
         }
         with patch("daily_coolpapers.app.favorite_papers_page_model", return_value=page_model):
             response = client.get("/favorites?sort=score_desc")

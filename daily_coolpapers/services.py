@@ -18,7 +18,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
-from . import db
+from . import call_attempts, db
 from .crawler import (
     CategoryFetchResult,
     CrawlFetchError,
@@ -301,12 +301,33 @@ def build_paper_digest_csv(papers: list[dict[str, Any]]) -> str:
     return output.getvalue()
 
 
-def favorite_papers_page_model(sort: str | None = None) -> dict[str, Any]:
-    return _reviewed_collection_model(sort, decision='favorite', collection_kind='favorites')
+def favorite_papers_page_model(
+    sort: str | None = None,
+    page: int | None = None,
+    page_size: int = 30,
+) -> dict[str, Any]:
+    return _reviewed_collection_model(
+        sort,
+        decision='favorite',
+        collection_kind='favorites',
+        page=page,
+        page_size=page_size,
+    )
 
 
-def reviewed_papers_page_model(sort: str | None = None, decision: str = 'all') -> dict[str, Any]:
-    return _reviewed_collection_model(sort, decision=decision, collection_kind='reviewed')
+def reviewed_papers_page_model(
+    sort: str | None = None,
+    decision: str = 'all',
+    page: int | None = None,
+    page_size: int = 30,
+) -> dict[str, Any]:
+    return _reviewed_collection_model(
+        sort,
+        decision=decision,
+        collection_kind='reviewed',
+        page=page,
+        page_size=page_size,
+    )
 
 
 def paper_decision_model(paper_id: int) -> dict[str, Any]:
@@ -376,13 +397,38 @@ def team_form_model(paper: dict, submitted: Any = None, selections: Any = None) 
             'author_categories': AUTHOR_CATEGORIES, 'organization_types': ORGANIZATION_TYPES}
 
 
-def investment_theme_papers_model(theme_id: int, sort: str | None = None) -> dict[str, Any]:
+def investment_theme_papers_model(
+    theme_id: int,
+    sort: str | None = None,
+    page: int | None = None,
+    page_size: int = 30,
+) -> dict[str, Any]:
     theme = db.get_investment_theme(theme_id)
     options = [{'value': 'added_desc', 'label': '加入时间'}, {'value': 'score_desc', 'label': '全文评分'}, {'value': 'title', 'label': '论文标题'}]
     selected_sort = sort if sort in {option['value'] for option in options} else 'added_desc'
-    return {'collection_kind': 'theme', 'theme': theme, 'sort': selected_sort,
+    if page is None:
+        rows = db.list_fulltext_reviewed_papers(sort=selected_sort, theme_id=theme_id)
+        return {
+            'collection_kind': 'theme',
+            'theme': theme,
+            'sort': selected_sort,
             'sort_options': [{**option, 'selected': option['value'] == selected_sort} for option in options],
-            'papers': [_favorite_paper_card(row) for row in db.list_fulltext_reviewed_papers(sort=selected_sort, theme_id=theme_id)]}
+            'papers': [_favorite_paper_card(row) for row in rows],
+        }
+    page_result = db.list_fulltext_reviewed_papers_page(
+        sort=selected_sort,
+        theme_id=theme_id,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        'collection_kind': 'theme',
+        'theme': theme,
+        'sort': selected_sort,
+        'sort_options': [{**option, 'selected': option['value'] == selected_sort} for option in options],
+        'papers': [_favorite_paper_card(row) for row in page_result['items']],
+        **{key: page_result[key] for key in ('total', 'page', 'page_size', 'pages', 'has_previous', 'has_next')},
+    }
 
 
 def research_entities_model(args: Any) -> dict[str, Any]:
@@ -410,22 +456,47 @@ def research_entities_model(args: Any) -> dict[str, Any]:
             'scoped': scoped, 'rows': rows}
 
 
-def _reviewed_collection_model(sort: str | None, *, decision: str, collection_kind: str) -> dict[str, Any]:
+def _reviewed_collection_model(
+    sort: str | None,
+    *,
+    decision: str,
+    collection_kind: str,
+    page: int | None = None,
+    page_size: int = 30,
+) -> dict[str, Any]:
     selected_sort = _normalize_favorite_sort(sort)
+    if page is None:
+        rows = db.list_fulltext_reviewed_papers(sort=selected_sort, decision=decision)
+        return {
+            'collection_kind': collection_kind,
+            'decision': decision,
+            'decision_options': [{'value': key, 'label': label, 'selected': key == decision}
+                                 for key, label in {'all': '全部状态', **PAPER_DECISION_LABELS}.items()],
+            "papers": [_favorite_paper_card(row) for row in rows],
+            "sort": selected_sort,
+            "sort_options": [
+                {**option, "selected": option["value"] == selected_sort}
+                for option in FAVORITE_SORT_OPTIONS
+            ],
+        }
+    page_result = db.list_fulltext_reviewed_papers_page(
+        sort=selected_sort,
+        decision=decision,
+        page=page,
+        page_size=page_size,
+    )
     return {
         'collection_kind': collection_kind,
         'decision': decision,
         'decision_options': [{'value': key, 'label': label, 'selected': key == decision}
                              for key, label in {'all': '全部状态', **PAPER_DECISION_LABELS}.items()],
-        "papers": [
-            _favorite_paper_card(row)
-            for row in db.list_fulltext_reviewed_papers(sort=selected_sort, decision=decision)
-        ],
+        "papers": [_favorite_paper_card(row) for row in page_result['items']],
         "sort": selected_sort,
         "sort_options": [
             {**option, "selected": option["value"] == selected_sort}
             for option in FAVORITE_SORT_OPTIONS
         ],
+        **{key: page_result[key] for key in ('total', 'page', 'page_size', 'pages', 'has_previous', 'has_next')},
     }
 
 
@@ -1451,45 +1522,59 @@ def classify_candidate(paper_id, metadata, plan, job_id, *, config=None, client=
     started = perf_counter()
     outcome = {'calls':0,'call_success':0,'call_failed':0,'retry_count':0,'input_tokens':0,'output_tokens':0}
     try:
-        for attempt in range(1,4):
-            evaluation_id = db.start_classification_attempt(paper_id,job_id,source,directions,metadata,plan.get('classification_config'),attempt)
-            event('paper_started', {'evaluation_id':evaluation_id, 'direction_count':len(directions)},attempt=attempt)
-            response, result, code, retryable = None, None, None, False
-            if not config:
-                code = 'evaluation_config_missing'
-            else:
-                try:
-                    prompt = render_prompt(config.prompt['template'], {**metadata,
-                        'directions_json':json.dumps(directions,ensure_ascii=False),
-                        'metadata_json':json.dumps(metadata,ensure_ascii=False)})
-                    EvaluationRunner()._ensure_context_window(prompt, config.profile)
-                    outcome['calls'] += 1
-                    response = call_llm(config.profile,prompt,client=client)
-                    result = validate_classification_result(response.result_json, missing)
-                except sqlite3.DatabaseError:
-                    raise
-                except Exception as exc:
-                    retryable = bool(getattr(exc,'retryable',False))
-                    code = 'invalid_classification_result' if getattr(exc,'code',None) == 'invalid_classification_result' else ('provider_retryable_error' if retryable else 'provider_terminal_error')
-            usage = getattr(response,'usage',None) or {}
-            usage = usage if isinstance(usage,dict) else {}
-            for key in ('input_tokens','output_tokens'):
-                value = usage.get(key,usage.get('prompt_tokens' if key=='input_tokens' else 'completion_tokens',0))
-                if isinstance(value,(int,float)) and not isinstance(value,bool):
-                    outcome[key] += max(0,int(value))
-            will_retry = bool(code and retryable and attempt < 3)
-            db.finish_classification_attempt(evaluation_id, result=result, raw_output=response.raw_text if response else None,
-                error_code=code,retryable=retryable,terminal=not will_retry,usage=usage)
-            outcome['call_success' if result else 'call_failed'] += int(response is not None or outcome['calls'] > attempt-1)
-            if will_retry:
-                outcome['retry_count'] += 1
-                event('paper_retrying', {'evaluation_id':evaluation_id},attempt=attempt,code=code)
-                _abstract_retry_wait(attempt)
-                continue
-            outcome.update({'success' if result else 'failed':1, 'evaluation_id':evaluation_id,
-                            'duration_ms':round((perf_counter()-started)*1000)})
-            event('paper_succeeded' if result else 'paper_failed',outcome,attempt=attempt,terminal=True,code=code)
-            return outcome
+        operation = call_attempts.operation_context(
+            'direction_classification', job_id=job_id, paper_id=paper_id,
+            evaluation_type='direction_classification',
+            prompt_id=(config.prompt_id if config else None),
+            prompt_version=(config.prompt_version if config else None),
+            profile_id=(config.profile_id if config else None), model=(config.model if config else None),
+            input_schema_version='direction_classification.input.v1',
+            output_schema_version='direction_classification.output.v1',
+        )
+        with operation:
+            for attempt in range(1,4):
+                with call_attempts.business_attempt(retry_reason='provider_retry' if attempt > 1 else None):
+                    evaluation_id = db.start_classification_attempt(
+                        paper_id,job_id,source,directions,metadata,plan.get('classification_config'),attempt,
+                        operation_id=call_attempts.current_operation_id(),
+                    )
+                    event('paper_started', {'evaluation_id':evaluation_id, 'direction_count':len(directions)},attempt=attempt)
+                    response, result, code, retryable = None, None, None, False
+                    if not config:
+                        code = 'evaluation_config_missing'
+                    else:
+                        try:
+                            prompt = render_prompt(config.prompt['template'], {**metadata,
+                                'directions_json':json.dumps(directions,ensure_ascii=False),
+                                'metadata_json':json.dumps(metadata,ensure_ascii=False)})
+                            EvaluationRunner()._ensure_context_window(prompt, config.profile)
+                            outcome['calls'] += 1
+                            response = call_llm(config.profile,prompt,client=client)
+                            result = validate_classification_result(response.result_json, missing)
+                        except sqlite3.DatabaseError:
+                            raise
+                        except Exception as exc:
+                            retryable = bool(getattr(exc,'retryable',False))
+                            code = 'invalid_classification_result' if getattr(exc,'code',None) == 'invalid_classification_result' else ('provider_retryable_error' if retryable else 'provider_terminal_error')
+                    usage = getattr(response,'usage',None) or {}
+                    usage = usage if isinstance(usage,dict) else {}
+                    for key in ('input_tokens','output_tokens'):
+                        value = usage.get(key,usage.get('prompt_tokens' if key=='input_tokens' else 'completion_tokens',0))
+                        if isinstance(value,(int,float)) and not isinstance(value,bool):
+                            outcome[key] += max(0,int(value))
+                    will_retry = bool(code and retryable and attempt < 3)
+                    db.finish_classification_attempt(evaluation_id, result=result, raw_output=response.raw_text if response else None,
+                        error_code=code,retryable=retryable,terminal=not will_retry,usage=usage)
+                outcome['call_success' if result else 'call_failed'] += int(response is not None or outcome['calls'] > attempt-1)
+                if will_retry:
+                    outcome['retry_count'] += 1
+                    event('paper_retrying', {'evaluation_id':evaluation_id},attempt=attempt,code=code)
+                    _abstract_retry_wait(attempt)
+                    continue
+                outcome.update({'success' if result else 'failed':1, 'evaluation_id':evaluation_id,
+                                'duration_ms':round((perf_counter()-started)*1000)})
+                event('paper_succeeded' if result else 'paper_failed',outcome,attempt=attempt,terminal=True,code=code)
+                return outcome
     finally:
         db.release_classification_claim(token)
 
@@ -1760,29 +1845,40 @@ def evaluate_abstract_candidate(
             return outcome
         config = config or resolve_evaluation_config('abstract_review')
         runner = EvaluationRunner(config=config, llm_client=llm_client)
-        for attempt in range(1, max_retries + 2):
-            event('started', attempt=attempt, metrics={'prompt_id': config.prompt_id, 'profile_id': config.profile_id, 'model': config.model})
-            try:
-                evaluated = runner.evaluate(EvaluationRequest(paper_id, 'abstract_review', pipeline_job_id=pipeline_job_id, claim_token=token))
-            except sqlite3.DatabaseError:
-                raise
-            except Exception as exc:
-                retryable = bool(getattr(exc, 'retryable', False))
-                code = 'invalid_llm_result' if isinstance(exc, LLMResultError) else ('provider_retryable_error' if retryable else 'provider_terminal_error')
-                if retryable and attempt <= max_retries:
-                    event('retrying', attempt=attempt, code=code)
-                    (retry_wait or _abstract_retry_wait)(attempt)
-                    continue
-                if raise_errors:
+        with call_attempts.operation_context(
+            'abstract_review', job_id=job_id or pipeline_job_id, paper_id=paper_id,
+            evaluation_type='abstract_review', prompt_id=config.prompt_id,
+            prompt_version=config.prompt_version, profile_id=config.profile_id, model=config.model,
+            input_schema_version='paper_evaluation.input.v1',
+            output_schema_version='paper_evaluation.output.v1',
+        ) as operation_id:
+            for attempt in range(1, max_retries + 2):
+                event('started', attempt=attempt, metrics={'prompt_id': config.prompt_id, 'profile_id': config.profile_id, 'model': config.model})
+                try:
+                    with call_attempts.business_attempt(retry_reason='provider_retry' if attempt > 1 else None):
+                        evaluated = runner.evaluate(EvaluationRequest(
+                            paper_id, 'abstract_review', pipeline_job_id=pipeline_job_id,
+                            claim_token=token,
+                        ))
+                except sqlite3.DatabaseError:
                     raise
-                outcome = {'status': 'failed', 'retry_count': attempt - 1, 'terminal_failure': not retryable,
-                           'duration_ms': round((perf_counter()-started)*1000)}
-                event('failed', terminal=True, attempt=attempt, metrics=outcome, code=code)
+                except Exception as exc:
+                    retryable = bool(getattr(exc, 'retryable', False))
+                    code = 'invalid_llm_result' if isinstance(exc, LLMResultError) else ('provider_retryable_error' if retryable else 'provider_terminal_error')
+                    if retryable and attempt <= max_retries:
+                        event('retrying', attempt=attempt, code=code)
+                        (retry_wait or _abstract_retry_wait)(attempt)
+                        continue
+                    if raise_errors:
+                        raise
+                    outcome = {'status': 'failed', 'retry_count': attempt - 1, 'terminal_failure': not retryable,
+                               'duration_ms': round((perf_counter()-started)*1000)}
+                    event('failed', terminal=True, attempt=attempt, metrics=outcome, code=code)
+                    return outcome
+                outcome = {'status': 'success', 'retry_count': attempt - 1, 'duration_ms': round((perf_counter()-started)*1000), **evaluated}
+                event('succeeded', terminal=True, attempt=attempt,
+                      metrics={key: value for key, value in outcome.items() if key != 'result'})
                 return outcome
-            outcome = {'status': 'success', 'retry_count': attempt - 1, 'duration_ms': round((perf_counter()-started)*1000), **evaluated}
-            event('succeeded', terminal=True, attempt=attempt,
-                  metrics={key: value for key, value in outcome.items() if key != 'result'})
-            return outcome
     finally:
         db.release_evaluation_claim(token)
 
@@ -1853,13 +1949,31 @@ class EvaluationRunner:
     def evaluate(self, request: EvaluationRequest) -> dict[str, Any]:
         paper = self._load_paper(request.paper_id)
         config = self._resolve_config(request)
+        if call_attempts.current_operation_id() is None:
+            with call_attempts.operation_context(
+                request.evaluation_type,
+                job_id=request.pipeline_job_id,
+                paper_id=request.paper_id,
+                evaluation_type=request.evaluation_type,
+                prompt_id=config.prompt_id,
+                prompt_version=config.prompt_version,
+                profile_id=config.profile_id,
+                model=config.model,
+                input_schema_version='paper_evaluation.input.v1',
+                output_schema_version='paper_evaluation.output.v1',
+            ):
+                with call_attempts.business_attempt():
+                    return self._evaluate_in_context(request, paper, config)
+        return self._evaluate_in_context(request, paper, config)
+
+    def _evaluate_in_context(self, request, paper, config) -> dict[str, Any]:
         response = None
         phase = "preparation"
         try:
             prompt_text = self._build_prompt_text(request, paper, config)
             phase = "provider"
             if request.claim_token:
-                db.mark_evaluation_provider_started(request.claim_token)
+                db.mark_evaluation_provider_started(request.claim_token, call_attempts.current_operation_id())
             response = call_llm(config.profile, prompt_text, client=self._llm_client)
             phase = "validation"
             if response.result_json is None:
@@ -1980,6 +2094,7 @@ def evaluate_paper(
         evaluation_type=evaluation_type,
         prompt_id=prompt_id,
         force_markdown=force_markdown,
+        pipeline_job_id=job_id,
     )
     return EvaluationRunner().evaluate(request)
 
