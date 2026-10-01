@@ -6,14 +6,17 @@ import secrets
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from itsdangerous import BadSignature, URLSafeSerializer
 
 from flask import (
     Flask,
     Response,
     abort,
+    current_app,
     flash,
     redirect,
     render_template,
@@ -23,9 +26,10 @@ from flask import (
     url_for,
 )
 
-from . import db
+from . import call_attempts, db
 from . import job_views
-from . import memos, memo_db
+from . import memo_candidates, memo_db, memo_drafts, memos
+from . import schedule_db
 from .cache_manager import cleanup_caches, has_markdown, has_pdf, markdown_path, pdf_path
 from .config import CURRENT_LOG, INSTANCE_DIR, ensure_directories
 from .form_commands import (
@@ -40,11 +44,13 @@ from .form_commands import (
     parse_optional_int,
     parse_required_text,
     parse_theme_ids,
+    research_text,
 )
 from .jobs import JobRunner, job_runner
 from .llm import test_profile
 from .logging_setup import setup_logging
 from .security import SecretStore, secret_store
+from .runtime_lock import WorkspaceLock
 from .services import (
     build_paper_digest_csv,
     build_paper_evaluation_export,
@@ -70,11 +76,29 @@ logger = logging.getLogger(__name__)
 class RuntimeHandle:
     runner: JobRunner
     worker_started: bool
+    workspace_lock: WorkspaceLock
+    _stop_lock: Any = field(default_factory=threading.Lock, repr=False)
+    _stopping: bool = False
 
-    def stop(self) -> None:
-        if self.worker_started:
-            self.runner.stop()
-            self.worker_started = False
+    def stop(self, timeout_seconds: float = 5.0) -> None:
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+            if self.runner.stop(timeout_seconds=timeout_seconds) is False:
+                # Retain this handle (and descriptor) while an in-flight call finishes.
+                threading.Thread(target=self._release_after_workers, name='runtime-lock-release', daemon=True).start()
+            else:
+                self._release_lock()
+
+    def _release_lock(self):
+        self.runner.release_runtime()
+        self.workspace_lock.release()
+        self.worker_started = False
+
+    def _release_after_workers(self):
+        self.runner.wait_stopped()
+        self._release_lock()
 
 
 def start_runtime(
@@ -82,19 +106,34 @@ def start_runtime(
     start_worker: bool | None = None,
 ) -> RuntimeHandle:
     runtime_runner = runner or job_runner
-    ensure_directories()
-    db.init_db()
-    db.init_llm_profiles_db()
-    db.migrate_llm_profiles_from_main_db()
-    db.mark_unfinished_jobs_interrupted()
-    setup_logging(clear_on_start=db.get_bool_setting("logs.clear_on_start", True))
-    if db.get_bool_setting("cache.cleanup_on_start", True):
-        cleanup_caches()
-    if start_worker is None:
-        start_worker = os.environ.get("DAILY_COOLPAPERS_DISABLE_WORKER") != "1"
-    if start_worker:
-        runtime_runner.start()
-    return RuntimeHandle(runtime_runner, bool(start_worker))
+    workspace_lock = WorkspaceLock(db.DB_PATH).acquire()
+    try:
+        runtime_runner.claim_runtime()
+    except BaseException:
+        workspace_lock.release()
+        raise
+    handle = RuntimeHandle(runtime_runner, False, workspace_lock)
+    try:
+        ensure_directories()
+        db.init_db()
+        db.init_llm_profiles_db()
+        db.migrate_llm_profiles_from_main_db()
+        # Link recognizable pre-S2 scheduled jobs before recovery or the
+        # scheduler can observe an old idempotency key as a new slot.
+        schedule_db.migrate_legacy_scheduled_jobs()
+        db.mark_unfinished_jobs_interrupted()
+        setup_logging(clear_on_start=db.get_bool_setting("logs.clear_on_start", True))
+        if db.get_bool_setting("cache.cleanup_on_start", True):
+            cleanup_caches()
+        if start_worker is None:
+            start_worker = os.environ.get("DAILY_COOLPAPERS_DISABLE_WORKER") != "1"
+        if start_worker:
+            handle.worker_started = True  # start() may fail after starting one thread.
+            runtime_runner.start()
+        return handle
+    except BaseException:
+        handle.stop()
+        raise
 
 
 def create_app(
@@ -175,7 +214,464 @@ def _memo_error_response(payload,status):
     if request.accept_mimetypes.best_match(['application/json','text/html']) != 'text/html':
         return payload,status
     return render_template('theme_form_error.html',errors=payload.get('errors',{}),message=payload.get('error'),
-                           return_url=url_for('memo_new'),return_label='返回研究备忘录，重新确认论文与配置'),status
+                           return_url=_memo_error_return_url(),return_label='返回研究备忘录，重新确认论文与配置'),status
+
+
+MEMO_DRAFT_OWNER_SESSION = '_memo_draft_owner'
+MEMO_DRAFT_SIGNING_SALT = 'daily-coolpapers-memo-draft-page-v1'
+MEMO_DRAFT_CONTEXT_KEYS = (
+    'title', 'source_mode', 'source_id', 'series_id', 'previous_version_id',
+    'prompt_id', 'profile_id', 'copy_judgment', 'filters', 'page', 'page_size',
+)
+
+
+def _memo_error_return_url() -> str:
+    """Build a safe editor recovery URL from the submitted memo context."""
+    values = request.form if request.method == 'POST' else request.args
+    try:
+        series_id = parse_optional_int(values.get('series_id'), 'series_id')
+        previous_id = parse_optional_int(values.get('previous_version_id'), 'previous_version_id')
+    except FormValidationError:
+        return url_for('memo_new')
+    token = values.get('draft_token')
+    draft_loaded = False
+    if token and not (series_id and previous_id):
+        # Confirmation intentionally submits only token/version/key.  Recover
+        # the editor target from the server-side context without trusting a
+        # client supplied redirect URL.
+        try:
+            with db.connect() as conn:
+                draft = memo_drafts.read(
+                    conn, token, _memo_owner_token(),
+                    version=_query_int(values.get('draft_version'), 1, 1)
+                    if values.get('draft_version') not in (None, '') else None,
+                    include_ids=False,
+                )
+            draft_loaded = True
+            context = draft.get('context') or {}
+            series_id = parse_optional_int(context.get('series_id'), 'series_id')
+            previous_id = parse_optional_int(context.get('previous_version_id'), 'previous_version_id')
+        except (memo_db.MemoConflictError, FormValidationError):
+            pass
+    if token and series_id and previous_id:
+        return url_for('memo_new_version', series_id=series_id, version_id=previous_id,
+                       draft_token=token)
+    # A token which has not been persisted yet (for example a malformed first
+    # filter POST) cannot be reopened by GET.  Start a clean editor rather
+    # than linking to an unusable draft URL.
+    return url_for('memo_new', draft_token=token) if token and draft_loaded else url_for('memo_new')
+
+
+def _memo_owner_token() -> str:
+    owner = session.get(MEMO_DRAFT_OWNER_SESSION)
+    if not isinstance(owner, str) or not owner or len(owner) > 512:
+        owner = secrets.token_urlsafe(32)
+        session[MEMO_DRAFT_OWNER_SESSION] = owner
+    return owner
+
+
+def _memo_serializer() -> URLSafeSerializer:
+    return URLSafeSerializer(current_app.secret_key, salt=MEMO_DRAFT_SIGNING_SALT)
+
+
+def _memo_sign_page_context(owner: str, token: str, version: int, context: dict[str, Any], page_ids: list[int]) -> str:
+    return _memo_serializer().dumps({
+        'owner': owner,
+        'token': token,
+        'version': int(version),
+        'context': {key: context.get(key) for key in MEMO_DRAFT_CONTEXT_KEYS},
+        'page_ids': [int(value) for value in page_ids],
+    })
+
+
+def _memo_load_page_context(raw: str | None, owner: str, token: str, expected_version: int) -> dict[str, Any]:
+    if not raw:
+        raise memo_db.MemoConflictError('页面上下文缺失，请重新打开选择页面')
+    try:
+        payload = _memo_serializer().loads(raw)
+    except BadSignature as exc:
+        raise memo_db.MemoConflictError('页面上下文已失效，请重新打开选择页面') from exc
+    if not isinstance(payload, dict) or payload.get('owner') != owner or payload.get('token') != token:
+        raise memo_db.MemoConflictError('页面上下文与当前浏览器会话不匹配，请刷新后重试')
+    try:
+        version = int(payload.get('version'))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise memo_db.MemoConflictError('页面上下文版本无效，请重新打开选择页面') from exc
+    if version != int(expected_version):
+        raise memo_db.MemoConflictError('页面上下文版本已变化，请刷新后重试')
+    page_ids = payload.get('page_ids')
+    if not isinstance(page_ids, list) or len(page_ids) != len(set(page_ids)):
+        raise memo_db.MemoConflictError('页面上下文论文列表无效，请重新打开选择页面')
+    try:
+        normalized_page_ids = [parse_int(value, 'page_ids', minimum=1, maximum=2**63 - 1) for value in page_ids]
+    except FormValidationError as exc:
+        raise memo_db.MemoConflictError('页面上下文论文列表无效，请重新打开选择页面') from exc
+    context = payload.get('context')
+    if not isinstance(context, dict):
+        raise memo_db.MemoConflictError('页面上下文无效，请重新打开选择页面')
+    return {'context': context, 'page_ids': normalized_page_ids, 'version': version}
+
+
+def _memo_command_from_context(context: dict[str, Any], paper_ids: list[int] | None = None) -> memos.MemoRequest:
+    return memos.MemoRequest(
+        str(context.get('title') or ''),
+        str(context['source_mode']) if context.get('source_mode') is not None else 'manual',
+        context.get('source_id'),
+        list(paper_ids or []),
+        context.get('prompt_id'),
+        context.get('profile_id'),
+        context.get('series_id'),
+        context.get('previous_version_id'),
+        bool(context.get('copy_judgment')),
+    )
+
+
+def _memo_editor_url(context: dict[str, Any], token: str | None = None) -> str:
+    values = {'draft_token': token} if token else {}
+    if context.get('series_id') and context.get('previous_version_id'):
+        return url_for('memo_new_version', series_id=context['series_id'],
+                       version_id=context['previous_version_id'], **values)
+    return url_for('memo_new', **values)
+
+
+def _memo_context_from_values(values: Any, *, series_id: int | None = None, previous_version_id: int | None = None,
+                              base: dict[str, Any] | None = None, apply_source: bool = False) -> dict[str, Any]:
+    current = dict(base or {})
+    current['series_id'] = series_id if series_id is not None else current.get('series_id')
+    current['previous_version_id'] = previous_version_id if previous_version_id is not None else current.get('previous_version_id')
+    if current.get('series_id'):
+        current['title'] = ''
+        current['source_mode'] = ''
+        current['source_id'] = None
+    elif apply_source or not base:
+        mode = parse_choice(values.get('source_mode', current.get('source_mode', 'manual')), 'source_mode',
+                            {'manual', 'attention_direction', 'investment_theme'})
+        if mode == 'attention_direction':
+            if 'source_direction_id' in values:
+                source_value = values.get('source_direction_id')
+                explicit_id = values.get('source_id')
+                if explicit_id not in (None, '') and source_value not in (None, ''):
+                    if memos.optional_id(explicit_id, 'source_id') != memos.optional_id(source_value, 'source_direction_id'):
+                        raise FormValidationError({'source_id': '来源实体与关注方向选择不一致'})
+                elif explicit_id not in (None, '') and source_value in (None, ''):
+                    raise FormValidationError({'source_id': '来源实体与关注方向选择不一致'})
+            else:
+                source_value = values.get('source_id')
+        elif mode == 'investment_theme':
+            if 'source_theme_id' in values:
+                source_value = values.get('source_theme_id')
+                explicit_id = values.get('source_id')
+                if explicit_id not in (None, '') and source_value not in (None, ''):
+                    if memos.optional_id(explicit_id, 'source_id') != memos.optional_id(source_value, 'source_theme_id'):
+                        raise FormValidationError({'source_id': '来源实体与投资主题选择不一致'})
+                elif explicit_id not in (None, '') and source_value in (None, ''):
+                    raise FormValidationError({'source_id': '来源实体与投资主题选择不一致'})
+            else:
+                source_value = values.get('source_id')
+        else:
+            source_value = None
+        current['source_mode'] = mode
+        current['source_id'] = memos.optional_id(source_value, 'source_id') if mode != 'manual' else None
+        if mode == 'manual' and values.get('source_id') not in (None, ''):
+            raise FormValidationError({'source_id': '手工选择模式不接受来源实体'})
+    if not current.get('series_id'):
+        current['title'] = research_text(values.get('title', current.get('title', '')), 'title')
+        if len(current['title']) > 120:
+            raise FormValidationError({'title': '系列标题最多 120 字'})
+    current['prompt_id'] = memos.optional_id(values.get('prompt_id'), 'prompt_id') if 'prompt_id' in values else current.get('prompt_id')
+    current['profile_id'] = memos.optional_id(values.get('profile_id'), 'profile_id') if 'profile_id' in values else current.get('profile_id')
+    current['copy_judgment'] = (
+        '1' in values.getlist('copy_judgment')
+        if hasattr(values, 'getlist') and 'copy_judgment' in values
+        else str(values.get('copy_judgment', '')).lower() in {'1', 'true', 'on', 'yes'}
+    )
+    current['filters'] = memos.parse_candidate_filters(values) if base is None or any(
+        key in values for key in ('query', 'author', 'organization', 'filter_direction_id', 'filter_theme_id',
+                                  'favorite_from', 'favorite_to', 'min_score', 'sort')
+    ) else dict(current.get('filters') or {})
+    current['page'] = _query_int(values.get('target_page', values.get('page')), 1, 1)
+    current['page_size'] = _query_int(values.get('page_size'), 30, 1, 100)
+    current['filters']['page'] = current['page']
+    current['filters']['page_size'] = current['page_size']
+    return current
+
+
+def _memo_previous_ids(series_id: int, version_id: int) -> list[int]:
+    with db.connect() as conn:
+        row = conn.execute(
+            'SELECT id FROM investment_memo_versions WHERE id=? AND series_id=?',
+            (version_id, series_id),
+        ).fetchone()
+        if not row:
+            raise memo_db.MemoNotFoundError('此系列中不存在该备忘录版本')
+        return [
+            int(item['paper_id'])
+            for item in conn.execute(
+                'SELECT paper_id FROM investment_memo_version_papers WHERE memo_version_id=? ORDER BY display_order',
+                (version_id,),
+            )
+            if item['paper_id'] is not None
+        ]
+
+
+def _memo_initial_ids(context: dict[str, Any], source: dict[str, Any], *, old_ids: list[int] | None = None) -> list[int]:
+    if old_ids is not None:
+        # A new-version draft starts with the previous version's global order,
+        # retaining only papers that are still eligible.  Papers which lost
+        # eligibility stay visible in ``omitted_papers`` but must not enter
+        # the new draft selection.
+        with db.connect() as conn:
+            eligible = memo_candidates.eligible_ids(conn, old_ids)
+        return [int(paper_id) for paper_id in old_ids if int(paper_id) in eligible]
+    if source.get('mode') == 'manual':
+        return []
+    with db.connect() as conn:
+        conn.execute('BEGIN')
+        return memo_candidates.selection_ids(
+            conn, source, {'sort': (context.get('filters') or {}).get('sort', 'favorite_desc')}, source_only=True,
+        )
+
+
+def _memo_editor_model(context: dict[str, Any], owner: str, token: str, version: int,
+                       *, initial: bool = False, old_ids: list[int] | None = None) -> dict[str, Any]:
+    command = _memo_command_from_context(context)
+    filters = dict(context.get('filters') or {})
+    page = _query_int(context.get('page'), 1, 1)
+    page_size = _query_int(context.get('page_size'), 30, 1, 100)
+    filters['page'] = page
+    filters['page_size'] = page_size
+    with db.connect() as conn:
+        conn.execute('BEGIN')
+        series, source = memos.source_for_request(conn, command)
+        page_result = memo_candidates.page_data(conn, source, filters, page=page, page_size=page_size)
+        selected_orders: dict[int, int] = {}
+        selected_count = 0
+        if not initial:
+            draft = memo_drafts.read(conn, token, owner, version=version,
+                                     page_ids=[item['id'] for item in page_result['candidates']], include_ids=False)
+            selected_orders = {int(key): int(value) for key, value in (draft.get('selected_orders') or {}).items()}
+            selected_count = int(draft.get('selected_count') or 0)
+        else:
+            page_ids = {int(row['id']) for row in page_result['candidates']}
+            if old_ids is not None:
+                # Previous-version selection is the one initial case where a
+                # global ID list is intentional.  Keep its stored order, but
+                # drop papers which no longer satisfy current eligibility.
+                initial_ids = _memo_initial_ids(context, source, old_ids=old_ids)
+                selected_orders = {
+                    int(paper_id): index + 1
+                    for index, paper_id in enumerate(initial_ids)
+                    if int(paper_id) in page_ids
+                }
+                selected_count = len(initial_ids)
+            else:
+                # A first GET must remain read-only and bounded.  The query
+                # worker supplies global order for only the visible IDs;
+                # do not load all source selections until the first POST.
+                selected_orders = memo_candidates.preselected_orders(
+                    conn, source, filters, page_ids,
+                )
+                selected_count = (
+                    int(page_result.get('counts', {}).get('preselected') or 0)
+                    if source.get('mode') != 'manual' else 0
+                )
+    candidates = []
+    for item in page_result['candidates']:
+        row = dict(item)
+        row['selected'] = int(row['id']) in selected_orders
+        row['selected_order'] = selected_orders.get(int(row['id']))
+        candidates.append(row)
+    omitted_papers: list[str] = []
+    if old_ids or context.get('previous_version_id'):
+        with db.connect() as conn:
+            eligible = memo_candidates.eligible_ids(conn, old_ids or [])
+            rows = conn.execute(
+                'SELECT id,title FROM papers WHERE id IN (%s)' % ','.join('?' for _ in old_ids), old_ids,
+            ).fetchall() if old_ids else []
+            deleted_rows = []
+            if context.get('previous_version_id'):
+                deleted_rows = conn.execute(
+                    "SELECT json_extract(paper_snapshot_json,'$.paper.title') AS title "
+                    'FROM investment_memo_version_papers WHERE memo_version_id=? AND paper_id IS NULL '
+                    'ORDER BY display_order',
+                    (int(context['previous_version_id']),),
+                ).fetchall()
+        titles = {int(row['id']): row['title'] for row in rows}
+        omitted_papers = [titles.get(item, f'论文 #{item}') for item in old_ids if item not in eligible]
+        omitted_papers.extend(row['title'] or '已删除的旧版论文' for row in deleted_rows)
+    return {
+        'series': series,
+        'source': source,
+        'candidates': candidates,
+        'counts': page_result.get('counts', {}),
+        'total': int(page_result.get('total') or 0),
+        'page': int(page_result.get('page') or page),
+        'page_size': int(page_result.get('page_size') or page_size),
+        'pages': int(page_result.get('pages') or 0),
+        'has_previous': bool(page_result.get('has_previous')),
+        'has_next': bool(page_result.get('has_next')),
+        'selected_count': selected_count,
+        'selected_orders': selected_orders,
+        'omitted_papers': omitted_papers,
+        'draft_token': token,
+        'draft_version': int(version),
+        'editor_context': context,
+        'page_context': _memo_sign_page_context(owner, token, version, context,
+                                                 [int(item['id']) for item in candidates]),
+    }
+
+
+def _memo_draft_source(context: dict[str, Any]) -> dict[str, Any]:
+    command = _memo_command_from_context(context)
+    with db.connect() as conn:
+        conn.execute('BEGIN')
+        _series, source = memos.source_for_request(conn, command)
+        return source
+
+
+def _memo_form_selection(form: Any, page_ids: list[int]) -> tuple[list[int], dict[int, int]]:
+    raw_ids = form.getlist('paper_ids') if hasattr(form, 'getlist') else form.get('paper_ids', [])
+    selected = [parse_int(value, 'paper_ids', minimum=1, maximum=2**63 - 1) for value in raw_ids]
+    if len(selected) != len(set(selected)) or any(value not in page_ids for value in selected):
+        raise memo_db.MemoConflictError('当前页之外的论文不能由当前页表单修改')
+    orders = {}
+    for paper_id in selected:
+        raw_order = form.get(f'order_{paper_id}')
+        if raw_order not in (None, ''):
+            orders[paper_id] = parse_int(raw_order, 'order', minimum=1, maximum=2**63 - 1)
+    return selected, orders
+
+
+def _memo_save_draft_from_form(form: Any, *, series_id: int | None = None, previous_version_id: int | None = None,
+                               action: str = 'save') -> tuple[dict[str, Any], dict[str, Any], int, str, list[int]]:
+    owner = _memo_owner_token()
+    token = form.get('draft_token') or secrets.token_urlsafe(24)
+    has_draft_token = bool(form.get('draft_token'))
+    expected_version = 0
+    base_context = None
+    page_context = None
+    if form.get('page_context'):
+        page_context = _memo_load_page_context(form.get('page_context'), owner, token,
+                                               _query_int(form.get('draft_version'), 0, 0))
+        expected_version = int(page_context['version'])
+        base_context = dict(page_context['context'])
+    elif form.get('draft_version') not in (None, ''):
+        # Draft actions must carry the signed page and its displayed IDs.
+        # The only POST without that contract is the legacy no-draft form,
+        # which is handled by the route before reaching this helper.
+        raise memo_db.MemoConflictError('页面上下文缺失，请重新打开选择页面')
+    elif has_draft_token:
+        raise memo_db.MemoConflictError('页面上下文缺失，请重新打开选择页面')
+    context = _memo_context_from_values(
+        form,
+        series_id=series_id,
+        previous_version_id=previous_version_id,
+        base=base_context,
+        apply_source=action == 'apply_source',
+    )
+    if page_context is None:
+        raise memo_db.MemoConflictError('页面上下文缺失，请重新打开选择页面')
+    page_ids = list(page_context['page_ids'])
+    if action == 'filter':
+        context['page'] = 1
+        context['filters']['page'] = 1
+    if action in {'clear', 'apply_source'}:
+        # These actions intentionally replace or clear the global set.  They
+        # must not be affected by stale checkbox/order fields from the page.
+        selected_ids, orders = [], {}
+    else:
+        selected_ids, orders = _memo_form_selection(form, page_ids)
+    source = _memo_draft_source(context)
+    signed_series_id = context.get('series_id')
+    signed_previous_version_id = context.get('previous_version_id')
+    old_ids = (
+        _memo_previous_ids(int(signed_series_id), int(signed_previous_version_id))
+        if signed_series_id and signed_previous_version_id and expected_version == 0
+        else None
+    )
+    initial_ids = None
+    if action == 'apply_source':
+        initial_ids = _memo_initial_ids(context, source)
+    elif expected_version == 0:
+        initial_ids = _memo_initial_ids(context, source, old_ids=old_ids)
+    saved = memo_drafts.save(
+        owner, token, expected_version, context, page_ids, selected_ids, orders,
+        initial_ids=initial_ids, action='clear' if action == 'clear' else ('apply_source' if action == 'apply_source' else 'save'),
+    )
+    return saved, context, int(saved['version']), owner, page_ids
+
+
+def _memo_read_draft(token: str) -> tuple[dict[str, Any], str]:
+    """Read a draft using the browser-bound owner, without changing it."""
+    owner = _memo_owner_token()
+    with db.connect() as conn:
+        conn.execute('BEGIN')
+        draft = memo_drafts.read(conn, token, owner, include_ids=False)
+    return draft, owner
+
+
+def _memo_assert_editor_context(context: dict[str, Any], *, series_id: int | None = None,
+                                previous_version_id: int | None = None) -> None:
+    actual_series = context.get('series_id')
+    actual_previous = context.get('previous_version_id')
+    if series_id is None:
+        if actual_series is not None or actual_previous is not None:
+            raise memo_db.MemoConflictError('草稿与当前备忘录入口不匹配，请重新打开选择页面')
+        return
+    try:
+        actual_series = int(actual_series)
+        actual_previous = int(actual_previous)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise memo_db.MemoConflictError('草稿上下文缺少旧版本信息，请重新打开选择页面') from exc
+    if actual_series != int(series_id) or actual_previous != int(previous_version_id):
+        raise memo_db.MemoConflictError('草稿与当前备忘录版本不匹配，请重新打开选择页面')
+
+
+def _memo_editor_options(context: dict[str, Any]) -> dict[str, Any]:
+    prompts = db.list_prompts('investment_memo', enabled_only=True)
+    profiles = db.list_llm_profiles(enabled_only=True)
+    prompt_id = context.get('prompt_id')
+    profile_id = context.get('profile_id')
+    if prompt_id and not any(int(item['id']) == int(prompt_id) for item in prompts):
+        prompts.append({'id': int(prompt_id), 'name': '原配置已不可用，请重新选择', 'version': '不可用'})
+    if profile_id and not any(int(item['id']) == int(profile_id) for item in profiles):
+        profiles.append({'id': int(profile_id), 'name': '原配置已不可用，请重新选择', 'model': '不可用'})
+    return {
+        'directions': db.list_attention_directions(active_only=True),
+        'themes': [item for item in db.list_investment_themes() if item['status'] == 'active'],
+        'prompts': prompts,
+        'profiles': profiles,
+    }
+
+
+def _memo_render_editor(context: dict[str, Any], owner: str, token: str, version: int,
+                        *, initial: bool = False, old_ids: list[int] | None = None):
+    model = _memo_editor_model(context, owner, token, version, initial=initial, old_ids=old_ids)
+    command = _memo_command_from_context(context)
+    model.update(_memo_editor_options(context))
+    model.update({
+        'command': command,
+        'filters': dict(context.get('filters') or {}),
+        'selected_ids': list(model.get('selected_orders') or {}),
+        'editor_url': _memo_editor_url(context, token=token),
+        'is_draft': True,
+    })
+    return render_template('memo_new.html', **model)
+
+
+def _memo_resolve_draft_preview(saved: dict[str, Any], context: dict[str, Any], owner: str,
+                                token: str, version: int) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Freeze default Prompt/Profile IDs into the draft before preview."""
+    config = memos.resolve_memo_config(context.get('prompt_id'), context.get('profile_id'))
+    resolved_context = dict(context)
+    resolved_context['prompt_id'] = int(config['prompt']['id'])
+    resolved_context['profile_id'] = int(config['profile']['id'])
+    if resolved_context == context:
+        return saved, context, version
+    updated = memo_drafts.save(
+        owner, token, version, resolved_context, [], [], {}, action='save',
+    )
+    return updated, resolved_context, int(updated['version'])
 
 
 def _team_error_response(payload: dict, status: int):
@@ -320,7 +816,13 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/favorites")
     def favorites():
-        page_model = favorite_papers_page_model(request.args.get("sort"))
+        page = _query_int(request.args.get("page"), 1, 1)
+        page_size = _query_int(request.args.get("page_size"), 30, 1, 100)
+        page_model = favorite_papers_page_model(
+            request.args.get("sort"),
+            page=page,
+            page_size=page_size,
+        )
         return render_template(
             "favorites.html",
             **page_model,
@@ -329,7 +831,17 @@ def register_routes(app: Flask) -> None:
     @app.get('/reviewed-papers')
     def reviewed_papers():
         decision = parse_choice(request.args.get('decision', 'all'), 'decision', db.PAPER_DECISION_FILTERS)
-        return render_template('favorites.html', **reviewed_papers_page_model(request.args.get('sort'), decision))
+        page = _query_int(request.args.get("page"), 1, 1)
+        page_size = _query_int(request.args.get("page_size"), 30, 1, 100)
+        return render_template(
+            'favorites.html',
+            **reviewed_papers_page_model(
+                request.args.get('sort'),
+                decision,
+                page=page,
+                page_size=page_size,
+            ),
+        )
 
     def theme_return_paper(value):
         if not value:
@@ -362,20 +874,36 @@ def register_routes(app: Flask) -> None:
 
     @app.get('/investment-themes/<int:theme_id>/papers')
     def investment_theme_papers(theme_id: int):
-        return render_template('favorites.html', **investment_theme_papers_model(theme_id, request.args.get('sort')))
+        page = _query_int(request.args.get("page"), 1, 1)
+        page_size = _query_int(request.args.get("page_size"), 30, 1, 100)
+        return render_template(
+            'favorites.html',
+            **investment_theme_papers_model(
+                theme_id,
+                request.args.get('sort'),
+                page=page,
+                page_size=page_size,
+            ),
+        )
 
     @app.post('/api/papers/<int:paper_id>/investment-themes')
     def save_paper_investment_themes(paper_id: int):
         ids = parse_theme_ids(request.form.getlist('theme_ids'))
         db.set_paper_investment_themes(paper_id, ids)
         flash('投资主题已保存；已有归档主题关系保持不变', 'themes')
-        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+        collection = _collection_context(request.form, from_form=True)
+        if collection:
+            return redirect(_collection_redirect_url(collection, clamp_page=True))
+        return redirect(_paper_detail_redirect_url(paper_id, request.form, anchor='fulltext-result'))
 
     @app.post('/api/papers/<int:paper_id>/investment-themes/<int:theme_id>/remove')
     def remove_paper_investment_theme(paper_id: int, theme_id: int):
         db.remove_paper_investment_theme(paper_id, theme_id)
         flash('已从论文移除该主题，其他关系和个人决策不变', 'themes')
-        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+        collection = _collection_context(request.form, from_form=True)
+        if collection:
+            return redirect(_collection_redirect_url(collection, clamp_page=True))
+        return redirect(_paper_detail_redirect_url(paper_id, request.form, anchor='fulltext-result'))
 
     @app.post('/api/papers/<int:paper_id>/decision')
     def save_paper_decision(paper_id: int):
@@ -388,7 +916,10 @@ def register_routes(app: Flask) -> None:
             abort(409, description=str(exc))
         flash({'favorite': '已收藏此论文', 'skipped': '已跳过此论文；论文和评估记录均保留',
                'clear': '已恢复未处理'}[decision], 'decision')
-        return redirect(url_for('paper_detail', paper_id=paper_id, _anchor='fulltext-result'))
+        collection = _collection_context(request.form, from_form=True)
+        if collection:
+            return redirect(_collection_redirect_url(collection, clamp_page=True))
+        return redirect(_paper_detail_redirect_url(paper_id, request.form, anchor='fulltext-result'))
 
     @app.post('/api/papers/<int:paper_id>/team-tracking')
     def save_team_tracking(paper_id: int):
@@ -515,10 +1046,14 @@ def register_routes(app: Flask) -> None:
         if not paper:
             flash("论文不存在")
             return redirect(url_for("index"))
+        collection = _collection_context(request.args, from_form=False)
         personal_decision = paper_decision_model(paper_id)
+        with db.connect() as conn:
+            call_details = call_attempts.details_for_paper(conn, paper_id)
         return render_template(
             "paper_detail.html",
             paper=paper,
+            call_details=call_details,
             direction_results=db.paper_direction_results([paper_id]).get(paper_id,[]),
             attention_directions=db.list_attention_directions(active_only=True),
             categories=db.get_paper_categories(paper_id),
@@ -531,6 +1066,8 @@ def register_routes(app: Flask) -> None:
             has_markdown=has_markdown(paper["arxiv_id"]),
             pdf_path=pdf_path(paper["arxiv_id"]),
             markdown_path=markdown_path(paper["arxiv_id"]),
+            collection_context=collection,
+            collection_return_url=_collection_redirect_url(collection) if collection else None,
         )
 
     @app.get("/papers/<int:paper_id>/markdown")
@@ -606,25 +1143,76 @@ def register_routes(app: Flask) -> None:
 
     @app.get('/investment-memos/new')
     def memo_new():
-        mode = parse_choice(request.args.get('source_mode','manual'),'source_mode',{'manual','attention_direction','investment_theme'})
-        source_id = request.args.get('source_id') or request.args.get('source_direction_id' if mode=='attention_direction' else 'source_theme_id')
-        entity_id = memos.optional_id(source_id,'source_id') if mode!='manual' else None
-        command = memos.MemoRequest('',mode,entity_id,[],None,None)
-        filters = memos.parse_candidate_filters(request.args)
-        model = memos.candidate_page(command,filters)
-        return render_template('memo_new.html',**model,command=command,filters=filters,
-            selected_ids=[p['id'] for p in model['candidates'] if p['preselected']],
-            directions=db.list_attention_directions(active_only=True),themes=[t for t in db.list_investment_themes() if t['status']=='active'],
-            prompts=db.list_prompts('investment_memo',enabled_only=True),profiles=db.list_llm_profiles(enabled_only=True))
+        token = request.args.get('draft_token')
+        if token:
+            draft, owner = _memo_read_draft(token)
+            context = dict(draft['context'])
+            _memo_assert_editor_context(context)
+            return _memo_render_editor(context, owner, token, int(draft['version']))
+        owner = _memo_owner_token()
+        token = secrets.token_urlsafe(24)
+        context = _memo_context_from_values(request.args)
+        return _memo_render_editor(context, owner, token, 0, initial=True)
+
+    def handle_memo_selection_post():
+        requested_action = request.form.get('action')
+        if not requested_action:
+            requested_action = 'page' if request.form.get('target_page') not in (None, '') else 'save'
+        action = parse_choice(
+            requested_action, 'action',
+            {'save', 'page', 'filter', 'clear', 'apply_source', 'preview'},
+        )
+        saved, context, version, owner, _page_ids = _memo_save_draft_from_form(
+            request.form, action=action,
+        )
+        if action != 'preview':
+            return redirect(_memo_editor_url(context, token=saved['token']))
+        saved, context, version = _memo_resolve_draft_preview(
+            saved, context, owner, saved['token'], version,
+        )
+        command = memos.command(
+            owner, saved['token'], version,
+            idempotency_key='', check_version=True,
+        )
+        preview = memos.preview_memo(command)
+        return render_template(
+            'memo_preview.html', preview=preview, command=command,
+            disclaimer=memos.DISCLAIMER, is_draft=True,
+            draft_token=saved['token'], draft_version=version,
+            editor_url=_memo_editor_url(context, token=saved['token']),
+        )
+
+    @app.post('/investment-memos/select')
+    def memo_select():
+        return handle_memo_selection_post()
 
     @app.post('/investment-memos/preview')
     def memo_preview():
+        # Keep the pre-S3b endpoint contract for callers which submit the
+        # complete paper list directly.  Draft forms use the explicit
+        # selection endpoint; accepting a draft here remains a compatibility
+        # bridge for already-rendered pages.
+        if request.form.get('draft_token'):
+            return handle_memo_selection_post()
         command = memos.MemoRequest.from_form(request.form)
-        return render_template('memo_preview.html',preview=memos.preview_memo(command),command=command,disclaimer=memos.DISCLAIMER)
+        return render_template(
+            'memo_preview.html', preview=memos.preview_memo(command), command=command,
+            disclaimer=memos.DISCLAIMER, is_draft=False, editor_url=_memo_editor_url({}),
+        )
 
     @app.post('/investment-memos')
     def memo_create():
-        command = memos.MemoRequest.from_form(request.form,creating=True)
+        if request.form.get('draft_token'):
+            owner = _memo_owner_token()
+            token = request.form.get('draft_token')
+            expected_version = _query_int(request.form.get('draft_version'), 1, 1)
+            command = memos.command(
+                owner, token, expected_version,
+                idempotency_key=request.form.get('idempotency_key', ''),
+                check_version=False,
+            )
+        else:
+            command = memos.MemoRequest.from_form(request.form,creating=True)
         created = runtime_runner.enqueue_memo(command)
         flash('已创建备忘录版本，后台将仅调用一次模型。' if created['created'] else '此提交已处理，返回原版本，未重复调用。')
         return redirect(url_for('memo_version',series_id=created['series_id'],version_id=created['id']))
@@ -637,8 +1225,11 @@ def register_routes(app: Flask) -> None:
     @app.get('/investment-memos/<int:series_id>/versions/<int:version_id>')
     def memo_version(series_id,version_id):
         series,version,papers = memo_db.get_version(series_id,version_id)
+        with db.connect() as conn:
+            call_details = call_attempts.details_for_memo(conn, version_id)
         return render_template('memo_version.html',series=series,version=version,papers=papers,
-                               disclaimer=memos.DISCLAIMER,sections=memos.SECTIONS,claim_labels=memos.CLAIM_LABELS)
+                               disclaimer=memos.DISCLAIMER,sections=memos.SECTIONS,claim_labels=memos.CLAIM_LABELS,
+                               call_details=call_details)
 
     @app.post('/investment-memos/<int:series_id>/versions/<int:version_id>/personal-judgment')
     def memo_personal_judgment(series_id,version_id):
@@ -651,16 +1242,32 @@ def register_routes(app: Flask) -> None:
 
     @app.get('/investment-memos/<int:series_id>/versions/<int:version_id>/new-version')
     def memo_new_version(series_id,version_id):
-        filters = memos.parse_candidate_filters(request.args)
-        model = memos.new_version_editor(series_id,version_id,filters)
-        prompts = db.list_prompts('investment_memo',enabled_only=True)
-        profiles = db.list_llm_profiles(enabled_only=True)
-        command = model['command']
-        for entries,key in ((prompts,command.prompt_id),(profiles,command.profile_id)):
-            if key and not any(item['id']==key for item in entries):
-                entries.append({'id':key,'name':'原配置已不可用，请重新选择','model':'不可用','version':'不可用'})
-        return render_template('memo_new.html',**model,filters=filters,prompts=prompts,profiles=profiles,
-            directions=db.list_attention_directions(active_only=True),themes=[t for t in db.list_investment_themes() if t['status']=='active'])
+        token = request.args.get('draft_token')
+        if token:
+            draft, owner = _memo_read_draft(token)
+            context = dict(draft['context'])
+            _memo_assert_editor_context(
+                context, series_id=series_id, previous_version_id=version_id,
+            )
+            return _memo_render_editor(context, owner, token, int(draft['version']))
+        old_ids = _memo_previous_ids(series_id, version_id)
+        with db.connect() as conn:
+            conn.execute('BEGIN')
+            previous = conn.execute(
+                'SELECT prompt_id,profile_id FROM investment_memo_versions WHERE id=? AND series_id=?',
+                (version_id, series_id),
+            ).fetchone()
+        if not previous:
+            raise memo_db.MemoNotFoundError('此系列中不存在该备忘录版本')
+        owner = _memo_owner_token()
+        token = secrets.token_urlsafe(24)
+        context = _memo_context_from_values(
+            request.args, series_id=series_id, previous_version_id=version_id,
+            base={'prompt_id': previous['prompt_id'], 'profile_id': previous['profile_id']},
+        )
+        return _memo_render_editor(
+            context, owner, token, 0, initial=True, old_ids=old_ids,
+        )
 
     @app.post('/investment-memos/<int:series_id>/archive')
     def memo_archive(series_id):
@@ -879,8 +1486,11 @@ def register_routes(app: Flask) -> None:
     @app.get('/jobs/<int:job_id>')
     def job_detail(job_id: int):
         job, card, filters, event_page = job_detail_data(job_id)
+        with db.connect() as conn:
+            call_details = call_attempts.details_for_job(conn, job_id)
         return render_template('job_detail.html', job=job, pipeline=card, filters=filters,
-                               event_page=event_page, stages=job_views.STAGES)
+                               event_page=event_page, stages=job_views.STAGES,
+                               call_details=call_details)
 
     def job_detail_data(job_id: int):
         raw = db.get_job(job_id)
@@ -1059,9 +1669,113 @@ def _delayed_shutdown(shutdown_func: Any) -> None:
         os._exit(0)
 
 
+_COLLECTION_NAMES = frozenset({'favorites', 'reviewed', 'theme'})
+_COLLECTION_SORTS = {
+    'favorites': frozenset({'evaluated_desc', 'score_desc', 'rank', 'title'}),
+    'reviewed': frozenset({'evaluated_desc', 'score_desc', 'rank', 'title'}),
+    'theme': frozenset({'added_desc', 'score_desc', 'title'}),
+}
+
+
+def _collection_context(source: Any, *, from_form: bool = False) -> dict[str, Any] | None:
+    """Parse a local collection return context into a fixed route contract.
+
+    Collection links are rebuilt from this small allow-list.  In particular,
+    no caller supplied URL, path, or endpoint is ever used as a redirect
+    target, so a paper detail form cannot become an open redirect primitive.
+    """
+    if source is None:
+        return None
+    collection = source.get('collection') or source.get('return_collection')
+    if collection not in _COLLECTION_NAMES:
+        return None
+    sort = source.get('sort')
+    if sort not in _COLLECTION_SORTS[collection]:
+        sort = 'added_desc' if collection == 'theme' else 'evaluated_desc'
+    context: dict[str, Any] = {
+        'collection': collection,
+        'sort': sort,
+        'page': _query_int(source.get('page'), 1, 1),
+        'page_size': _query_int(source.get('page_size'), 30, 1, 100),
+    }
+    if collection == 'reviewed':
+        try:
+            # Detail forms also submit a button named ``decision``.  Keep the
+            # collection filter in a distinct field so the action value can
+            # never be mistaken for the return filter.
+            decision_value = source.get('return_decision')
+            if decision_value is None and not from_form:
+                decision_value = source.get('decision', 'all')
+            if decision_value is None:
+                decision_value = 'all'
+            context['decision'] = parse_choice(
+                decision_value, 'decision', db.PAPER_DECISION_FILTERS
+            )
+        except FormValidationError:
+            return None
+    elif collection == 'theme':
+        try:
+            context['theme_id'] = parse_int(
+                source.get('theme_id'), 'theme_id', minimum=1, maximum=2**63 - 1
+            )
+        except FormValidationError:
+            return None
+    return context
+
+
+def _collection_redirect_url(
+    context: dict[str, Any] | None,
+    *,
+    clamp_page: bool = False,
+) -> str:
+    """Build a collection URL from normalized context and optionally clamp page."""
+    if not context:
+        return url_for('index')
+    values = dict(context)
+    if clamp_page:
+        decision = 'favorite' if values['collection'] == 'favorites' else values.get('decision', 'all')
+        theme_id = values.get('theme_id') if values['collection'] == 'theme' else None
+        page_result = db.list_fulltext_reviewed_papers_page(
+            sort=values['sort'],
+            decision=decision,
+            theme_id=theme_id,
+            page=values['page'],
+            page_size=values['page_size'],
+        )
+        pages = int(page_result.get('pages') or 0)
+        values['page'] = min(values['page'], pages) if pages else 1
+    if values['collection'] == 'favorites':
+        return url_for(
+            'favorites', sort=values['sort'], page=values['page'], page_size=values['page_size']
+        )
+    if values['collection'] == 'reviewed':
+        return url_for(
+            'reviewed_papers', sort=values['sort'], decision=values['decision'],
+            page=values['page'], page_size=values['page_size'],
+        )
+    return url_for(
+        'investment_theme_papers', theme_id=values['theme_id'], sort=values['sort'],
+        page=values['page'], page_size=values['page_size'],
+    )
+
+
+def _paper_detail_redirect_url(
+    paper_id: int,
+    source: Any = None,
+    *,
+    anchor: str | None = None,
+) -> str:
+    """Return to a detail page while retaining an allow-listed collection context."""
+    collection = _collection_context(source, from_form=source is request.form)
+    return url_for(
+        'paper_detail', paper_id=paper_id, **(collection or {}),
+        **({'_anchor': anchor} if anchor else {}),
+    )
+
+
 def _back_to_detail_or_index(paper_id: int) -> str:
-    if request.form.get("from_detail"):
-        return url_for("paper_detail", paper_id=paper_id)
+    if request.form.get("from_detail") or _collection_context(request.form, from_form=True):
+        return _paper_detail_redirect_url(paper_id, request.form)
     return _safe_local_redirect(request.referrer) or url_for("index")
 
 

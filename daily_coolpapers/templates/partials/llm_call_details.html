@@ -1,0 +1,38 @@
+{% if call_details is defined and call_details %}
+  {% set call_summary = call_details.get('summary', {}) or {} %}
+  {% set call_items = call_details.get('items', []) or [] %}
+  <details class="result-panel llm-call-details" data-testid="llm-call-details">
+    <summary>模型调用记录 · {{ call_summary.get('calls', 0) }} 次</summary>
+    <p class="small muted">仅统计研究任务中的模型请求；模型连接测试和历史调用未纳入。未知用量保留为未知，不展示费用金额。</p>
+    {% if call_summary.get('calls', 0) %}
+      <p class="small">
+        模型：{{ (call_summary.get('models') or [])|join('、') or '未记录' }} ·
+        累计耗时：{{ call_summary.get('duration_ms', 0) }} ms ·
+        已知输入 / 输出 token：{{ call_summary.get('known_input_tokens', 0) }} / {{ call_summary.get('known_output_tokens', 0) }} ·
+        用量缺失：{{ call_summary.get('usage_missing_calls', 0) }} 次
+        {% if call_summary.get('usage_partial_calls', 0) %}· 部分用量：{{ call_summary.get('usage_partial_calls') }} 次{% endif %}
+        · 外部结果未知：{{ call_summary.get('external_outcome_unknown_calls', 0) }} 次
+        · 请求失败：{{ call_summary.get('failed_calls', 0) }} 次
+      </p>
+      {% if call_items %}
+        <ol class="call-attempt-list">
+          {% for item in call_items %}
+            {% set status_labels = {'provider_started': '请求已开始，尚未记录响应', 'succeeded': '请求成功', 'failed': '失败', 'external_outcome_unknown': '外部结果未知'} %}
+            <li>
+              <strong>{{ item.call_type }} · 第 {{ item.attempt_no }} 个物理请求</strong>
+              <span class="badge {{ item.status }}">{{ status_labels.get(item.status, item.status) }}</span>
+              <div class="small muted">{{ item.provider }} / {{ item.model or '模型未记录' }} · {{ item.started_at or '开始时间未记录' }}{% if item.finished_at %} → {{ item.finished_at }}{% endif %}{% if item.duration_ms is not none %} · {{ item.duration_ms }} ms{% endif %}</div>
+              <div class="small">输入 / 输出 / 总 token：{{ item.input_tokens if item.input_tokens is not none else '未知' }} / {{ item.output_tokens if item.output_tokens is not none else '未知' }} / {{ item.total_tokens if item.total_tokens is not none else '未知' }}</div>
+              {% if item.http_status or item.error_code or item.usage_missing_reason %}
+                <div class="small muted">{% if item.http_status %}HTTP {{ item.http_status }}{% endif %}{% if item.error_code %} · 错误码 {{ item.error_code }}{% endif %}{% if item.usage_missing_reason %} · 用量说明 {{ item.usage_missing_reason }}{% endif %}</div>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+      {% if call_summary.get('items_truncated') %}<p class="small muted">明细仅显示最近 100 次请求；上方汇总统计全部已记录请求。</p>{% endif %}
+    {% else %}
+      <p class="empty">此对象尚无已记录的研究任务模型请求。模型连接测试和历史调用未纳入此处。</p>
+    {% endif %}
+  </details>
+{% endif %}

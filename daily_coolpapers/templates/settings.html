@@ -20,6 +20,7 @@
     <label class="check"><input type="checkbox" name="crawler_trust_env_proxy" value="1" {% if settings.crawler_trust_env_proxy %}checked{% endif %}> 抓取和 PDF 下载使用系统代理</label>
     <label class="check"><input type="checkbox" name="llm_trust_env_proxy" value="1" {% if settings.llm_trust_env_proxy %}checked{% endif %}> LLM API 使用系统代理</label>
     <label class="check"><input type="checkbox" name="scheduler_enabled" value="1" {% if settings.scheduler_enabled %}checked{% endif %}> 启用每日抓取并摘要评估（北京时间）</label>
+    <p class="small muted">关闭期间不创建补跑；重新启用后按当前日配置处理尚未派发的到期时段，停机期间的历史日期不会重放。</p>
     <button type="submit">保存设置</button>
   </form>
   <form method="post" action="{{ url_for('run_cleanup') }}" class="inline-actions">

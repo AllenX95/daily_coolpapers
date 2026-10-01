@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from . import call_attempts
 from .db import get_bool_setting, loads_json
 from .network import httpx_proxy_kwargs
 from .security import secret_store
@@ -54,13 +55,7 @@ class LLMResponse:
 class _ProviderText(str):
     def __new__(cls, value: str, usage: Any = None):
         instance = super().__new__(cls, value)
-        def counts_only(item):
-            if not isinstance(item, dict):
-                return None
-            return {key: counts_only(value) if isinstance(value, dict) else value
-                    for key, value in item.items()
-                    if isinstance(value, (dict, int, float)) and not isinstance(value, bool)}
-        instance.usage = counts_only(usage)
+        instance.usage = call_attempts.normalize_usage(usage)
         return instance
 
 
@@ -216,11 +211,14 @@ def _call_openai_compatible(
     if client is None:
         client = make_llm_client(profile)
     try:
-        response = client.post(url, headers=headers, json=payload)
+        response = _tracked_post("openai_compatible", client, url, headers, payload)
         if profile.get('allow_response_format_fallback', True) and _response_format_unsupported(response) and "response_format" in payload:
             fallback_payload = dict(payload)
             fallback_payload.pop("response_format", None)
-            response = client.post(url, headers=headers, json=fallback_payload)
+            response = _tracked_post(
+                "openai_compatible", client, url, headers, fallback_payload,
+                fallback_reason="response_format_unsupported",
+            )
         _raise_for_http_status("openai_compatible", response)
         data = _response_json("openai_compatible", response)
     except LLMError:
@@ -269,7 +267,7 @@ def _call_anthropic(
     if client is None:
         client = make_llm_client(profile)
     try:
-        response = client.post(url, headers=headers, json=payload)
+        response = _tracked_post("anthropic", client, url, headers, payload)
         _raise_for_http_status("anthropic", response)
         data = _response_json("anthropic", response)
     except LLMError:
@@ -293,6 +291,28 @@ def _call_anthropic(
         ), data.get('usage'))
     except (KeyError, TypeError) as exc:
         raise LLMError(f"无法解析 Anthropic 响应: {data}", code="provider_response") from exc
+
+
+def _tracked_post(
+    provider: str,
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    fallback_reason: str | None = None,
+) -> Any:
+    """Persist one request at the HTTP boundary while preserving client injection."""
+    attempt_id, started = call_attempts.begin_provider_request(
+        provider, payload, fallback_reason=fallback_reason,
+    )
+    try:
+        response = client.post(url, headers=headers, json=payload)
+    except Exception as exc:
+        call_attempts.finish_provider_transport_error(attempt_id, started, exc)
+        raise
+    call_attempts.finish_provider_response(attempt_id, started, provider, response)
+    return response
 
 
 def _response_format_unsupported(response: Any) -> bool:

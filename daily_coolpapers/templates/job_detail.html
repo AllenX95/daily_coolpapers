@@ -7,13 +7,14 @@
     <div class="inline-actions"><a class="button secondary" href="{{ url_for('index') }}">返回论文</a><a class="button secondary" href="{{ request.full_path }}">刷新记录</a></div>
   </section>
   {% include 'partials/job_card.html' %}
+  {% include 'partials/llm_call_details.html' %}
   {% if pipeline %}
     {% if pipeline.classification.available %}
     <section class="run-notice" aria-label="分类阶段汇总">
       <h2>关注方向分类</h2>
       {% if pipeline.classification.no_directions %}<p>当前未启用关注方向，将对全部新论文执行摘要评估。</p>
       {% else %}<p>方向 {{ pipeline.classification.direction_count }} · 候选 {{ pipeline.classification.candidate_count }} · matched {{ pipeline.classification.matched }} · possible {{ pipeline.classification.possible }} · unmatched {{ pipeline.classification.unmatched }} · 失败论文 {{ pipeline.classification.failed_papers }}（本次失败 {{ pipeline.classification.failed }}）</p>
-      <p class="small">调用 {{ pipeline.classification.calls }} · 重试 {{ pipeline.classification.retry_count }} · 跳过已有／历史 {{ pipeline.classification.already_classified }} · 输入不完整 {{ pipeline.classification.input_incomplete }} · 输入 / 输出 token {{ pipeline.classification.input_tokens }} / {{ pipeline.classification.output_tokens }}</p>
+      <p class="small">旧分类业务统计（不计入下方统一调用账本）：调用 {{ pipeline.classification.calls }} · 重试 {{ pipeline.classification.retry_count }} · 跳过已有／历史 {{ pipeline.classification.already_classified }} · 输入不完整 {{ pipeline.classification.input_incomplete }} · 历史字段中的输入 / 输出 token {{ pipeline.classification.input_tokens }} / {{ pipeline.classification.output_tokens }}</p>
       {% if pipeline.classification.has_partial_failure %}<p>至少一个方向分类失败，不被其他方向的匹配结果掩盖。请查看失败记录，配置完成后明确重试。</p>{% endif %}
       {% endif %}
     </section>

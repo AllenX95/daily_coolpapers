@@ -12,6 +12,14 @@ from .default_prompts import DEFAULT_ABSTRACT_PROMPT, DEFAULT_FULLTEXT_PROMPT, D
 from .form_commands import (InvestmentThemeCommand, FormValidationError, parse_theme_ids, parse_choice,
                             ResearchEntityCommand, TeamTrackingCommand, normalized_research_name,
                             AUTHOR_CATEGORIES, ORGANIZATION_TYPES, parse_int, research_text)
+from . import investment_themes_db, research_entities_db
+from .domain_errors import (
+    ArchivedThemeError,
+    InvestmentThemeNotFoundError,
+    ResearchEntityConflictError,
+    ResearchEntityNotFoundError,
+)
+from .domain_utils import chunks
 
 
 DAILY_PIPELINE_JOB_TYPE = "daily_pipeline"
@@ -67,14 +75,6 @@ class FulltextRequiredError(ValueError):
     pass
 
 
-class InvestmentThemeNotFoundError(LookupError):
-    pass
-
-
-class ArchivedThemeError(ValueError):
-    pass
-
-
 class DirectionNotFoundError(LookupError):
     pass
 
@@ -83,17 +83,7 @@ class DirectionConflictError(ValueError):
     pass
 
 
-class ResearchEntityNotFoundError(LookupError):
-    pass
-
-
-class ResearchEntityConflictError(ValueError):
-    def __init__(self, conflicts: list[dict[str, Any]]):
-        self.conflicts = conflicts
-        super().__init__('作者或机构已存在或已归档，请核对后明确复用或先恢复；本次未保存任何改动')
-
-
-RESEARCH_ENTITY_TABLES = {'author': 'research_authors', 'organization': 'research_organizations'}
+RESEARCH_ENTITY_TABLES = research_entities_db.RESEARCH_ENTITY_TABLES
 
 
 def now_iso() -> str:
@@ -457,6 +447,7 @@ def _init_db_once() -> None:
                 job_id INTEGER REFERENCES jobs(id),
                 pipeline_job_id INTEGER REFERENCES jobs(id),
                 provider_started INTEGER NOT NULL DEFAULT 0,
+                operation_id TEXT,
                 last_evaluation_id INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(paper_id, evaluation_type)
@@ -476,6 +467,31 @@ def _init_db_once() -> None:
 
 def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     conn.executescript('''
+        CREATE TABLE IF NOT EXISTS schedule_occurrences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_kind TEXT NOT NULL,
+            local_date TEXT NOT NULL,
+            scheduled_time TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            config_snapshot TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL CHECK(state IN ('due','dispatched','coalesced','expired','cancelled')),
+            job_id INTEGER REFERENCES jobs(id),
+            coalesced_into_id INTEGER REFERENCES schedule_occurrences(id),
+            created_at TEXT NOT NULL,
+            dispatched_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(schedule_kind, local_date, scheduled_time)
+        );
+        CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_due
+            ON schedule_occurrences(schedule_kind, local_date, state, scheduled_time);
+        CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_job
+            ON schedule_occurrences(job_id);
+        CREATE TABLE IF NOT EXISTS schedule_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS attention_directions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL, normalized_name TEXT NOT NULL, scope_text TEXT NOT NULL,
@@ -533,12 +549,151 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         "error_retryable": (
             "ALTER TABLE evaluations ADD COLUMN error_retryable INTEGER NOT NULL DEFAULT 0"
         ),
+            "call_operation_id": "ALTER TABLE evaluations ADD COLUMN call_operation_id TEXT",
     }
     for column, sql in evaluation_migrations.items():
         if column not in evaluation_columns:
             conn.execute(sql)
+    claim_columns = {row["name"] for row in conn.execute("PRAGMA table_info(evaluation_claims)").fetchall()}
+    if "operation_id" not in claim_columns:
+        conn.execute("ALTER TABLE evaluation_claims ADD COLUMN operation_id TEXT")
+    _ensure_fulltext_evaluation_projection(conn)
     from .memo_db import init_schema as init_memo_schema
     init_memo_schema(conn)
+    from .call_attempts import init_schema as init_call_attempt_schema
+    init_call_attempt_schema(conn)
+
+
+FULLTEXT_EVALUATION_PROJECTION_MIGRATION = "fulltext_evaluation_projection_v1"
+
+
+def _ensure_fulltext_evaluation_projection(conn: sqlite3.Connection) -> None:
+    """Create the JSON-free v1 projection used by collection pages.
+
+    This database shape is new in S3a, so it deliberately has no compatibility
+    rebuild path.  ``score_scalar`` has no declared type affinity: SQLite then
+    keeps integer, real, text, boolean and NULL values in their native storage
+    classes.  The JSON document is read only for the page rows themselves.
+    """
+    savepoint = "fulltext_projection_v1"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        ddl_statements = (
+            """
+            CREATE TABLE IF NOT EXISTS fulltext_evaluation_projection (
+                evaluation_id INTEGER PRIMARY KEY REFERENCES evaluations(id) ON DELETE CASCADE,
+                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                score_type TEXT NOT NULL,
+                score_scalar
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_fulltext_projection_latest
+                ON fulltext_evaluation_projection(paper_id, created_at DESC, evaluation_id DESC)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+            """,
+            "DROP TRIGGER IF EXISTS trg_fulltext_projection_insert",
+            "DROP TRIGGER IF EXISTS trg_fulltext_projection_update",
+            "DROP TRIGGER IF EXISTS trg_fulltext_projection_delete",
+            """
+            CREATE TRIGGER trg_fulltext_projection_insert
+            AFTER INSERT ON evaluations
+            WHEN NEW.evaluation_type = 'fulltext_review' AND NEW.status = 'success'
+            BEGIN
+                INSERT OR REPLACE INTO fulltext_evaluation_projection(
+                    evaluation_id, paper_id, created_at, score_type, score_scalar
+                ) VALUES (
+                    NEW.id, NEW.paper_id, NEW.created_at,
+                    CASE
+                        WHEN json_valid(NEW.result_json)
+                            THEN COALESCE(json_type(NEW.result_json, '$.score'), 'missing')
+                        ELSE 'invalid'
+                    END,
+                    CASE
+                        WHEN json_valid(NEW.result_json)
+                            THEN json_extract(NEW.result_json, '$.score')
+                        ELSE NULL
+                    END
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER trg_fulltext_projection_update
+            AFTER UPDATE OF id, paper_id, evaluation_type, status, result_json, created_at ON evaluations
+            BEGIN
+                DELETE FROM fulltext_evaluation_projection WHERE evaluation_id = OLD.id;
+                INSERT OR REPLACE INTO fulltext_evaluation_projection(
+                    evaluation_id, paper_id, created_at, score_type, score_scalar
+                )
+                SELECT
+                    NEW.id, NEW.paper_id, NEW.created_at,
+                    CASE
+                        WHEN json_valid(NEW.result_json)
+                            THEN COALESCE(json_type(NEW.result_json, '$.score'), 'missing')
+                        ELSE 'invalid'
+                    END,
+                    CASE
+                        WHEN json_valid(NEW.result_json)
+                            THEN json_extract(NEW.result_json, '$.score')
+                        ELSE NULL
+                    END
+                WHERE NEW.evaluation_type = 'fulltext_review' AND NEW.status = 'success';
+            END
+            """,
+            """
+            CREATE TRIGGER trg_fulltext_projection_delete
+            AFTER DELETE ON evaluations
+            BEGIN
+                DELETE FROM fulltext_evaluation_projection WHERE evaluation_id = OLD.id;
+            END
+            """,
+        )
+        for statement in ddl_statements:
+            conn.execute(statement)
+
+        marker = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (FULLTEXT_EVALUATION_PROJECTION_MIGRATION,),
+        ).fetchone()
+        if marker is None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO fulltext_evaluation_projection(
+                    evaluation_id, paper_id, created_at, score_type, score_scalar
+                )
+                SELECT
+                    e.id, e.paper_id, e.created_at,
+                    CASE
+                        WHEN json_valid(e.result_json)
+                            THEN COALESCE(json_type(e.result_json, '$.score'), 'missing')
+                        ELSE 'invalid'
+                    END,
+                    CASE
+                        WHEN json_valid(e.result_json)
+                            THEN json_extract(e.result_json, '$.score')
+                        ELSE NULL
+                    END
+                FROM evaluations e
+                WHERE e.evaluation_type = 'fulltext_review' AND e.status = 'success'
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                (FULLTEXT_EVALUATION_PROJECTION_MIGRATION, now_iso()),
+            )
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        finally:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
 
 
 def ensure_indexes(conn: sqlite3.Connection) -> None:
@@ -580,6 +735,9 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_jobs_retry_of
         ON jobs(retry_of_job_id, created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_date_state
+        ON schedule_occurrences(local_date, state, scheduled_time);
 
         CREATE INDEX IF NOT EXISTS idx_job_events_job_timeline
         ON job_events(job_id, id);
@@ -1551,8 +1709,7 @@ def _unique_ints(values: Iterable[Any]) -> list[int]:
 
 
 def _chunks(items: list[int], size: int = 500) -> Iterable[list[int]]:
-    for index in range(0, len(items), size):
-        yield items[index : index + size]
+    yield from chunks(items, size)
 
 
 def has_successful_fulltext(paper_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
@@ -1598,39 +1755,28 @@ def _require_paper_fulltext(conn: sqlite3.Connection, paper_id: int) -> None:
 
 
 def _require_theme(conn: sqlite3.Connection, theme_id: int) -> dict[str, Any]:
-    row = conn.execute('SELECT * FROM investment_themes WHERE id=?', (theme_id,)).fetchone() if 0 < theme_id <= 2**63-1 else None
-    if row is None:
-        raise InvestmentThemeNotFoundError('投资主题不存在')
-    return dict(row)
+    return investment_themes_db.require_theme(conn, theme_id)
 
 
 def get_investment_theme(theme_id: int) -> dict[str, Any]:
     with connect() as conn:
-        return _require_theme(conn, theme_id)
+        return investment_themes_db.require_theme(conn, theme_id)
 
 
 def list_investment_themes() -> list[dict[str, Any]]:
     with connect() as conn:
-        return [dict(row) for row in conn.execute("""SELECT t.*, COALESCE(m.paper_count,0) AS paper_count
-            FROM investment_themes t LEFT JOIN
-                (SELECT theme_id, COUNT(*) AS paper_count FROM paper_investment_themes GROUP BY theme_id) m
-                ON m.theme_id=t.id ORDER BY t.status, t.updated_at DESC, t.id DESC""")]
+        return investment_themes_db.list_investment_themes(conn)
 
 
 def _check_theme_name(conn: sqlite3.Connection, normalized_name: str, theme_id: int | None = None) -> None:
-    row = conn.execute('SELECT id FROM investment_themes WHERE normalized_name=?', (normalized_name,)).fetchone()
-    if row and row['id'] != theme_id:
-        raise FormValidationError({'name': '同名投资主题已存在（包含已归档主题），请复用或恢复原主题'})
+    investment_themes_db.check_theme_name(conn, normalized_name, theme_id)
 
 
 def create_investment_theme(name: str, description: str = '') -> int:
     command = InvestmentThemeCommand.from_values(name, description)
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        _check_theme_name(conn, command.normalized_name)
-        now = now_iso()
-        return int(conn.execute("""INSERT INTO investment_themes(name,normalized_name,description,created_at,updated_at)
-            VALUES (?,?,?,?,?)""", (command.name, command.normalized_name, command.description, now, now)).lastrowid)
+        return investment_themes_db.create_investment_theme(conn, command, now_iso)
 
 
 def update_investment_theme(theme_id: int, action: str, name: str | None = None, description: str = '') -> None:
@@ -1638,16 +1784,7 @@ def update_investment_theme(theme_id: int, action: str, name: str | None = None,
     command = InvestmentThemeCommand.from_values(name, description) if action == 'update' else None
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        old = _require_theme(conn, theme_id)
-        if command:
-            _check_theme_name(conn, command.normalized_name, theme_id)
-            if (old['name'], old['description']) != (command.name, command.description):
-                conn.execute('UPDATE investment_themes SET name=?,normalized_name=?,description=?,updated_at=? WHERE id=?',
-                             (command.name, command.normalized_name, command.description, now_iso(), theme_id))
-        else:
-            status = 'archived' if action == 'archive' else 'active'
-            if old['status'] != status:
-                conn.execute('UPDATE investment_themes SET status=?,updated_at=? WHERE id=?', (status, now_iso(), theme_id))
+        investment_themes_db.update_investment_theme(conn, theme_id, action, command, now_iso)
 
 
 def list_paper_investment_themes(paper_ids: Iterable[int]) -> dict[int, list[dict[str, Any]]]:
@@ -1656,14 +1793,7 @@ def list_paper_investment_themes(paper_ids: Iterable[int]) -> dict[int, list[dic
     if not ids:
         return result
     with connect() as conn:
-        for chunk in _chunks(ids):
-            placeholders = ','.join('?' for _ in chunk)
-            rows = conn.execute(f"""SELECT t.id,t.name,t.status,m.paper_id,m.created_at AS added_at
-                FROM paper_investment_themes m JOIN investment_themes t ON t.id=m.theme_id
-                WHERE m.paper_id IN ({placeholders}) ORDER BY t.status,m.created_at DESC,t.id""", chunk)
-            for row in rows:
-                result[row['paper_id']].append(dict(row))
-    return result
+        return investment_themes_db.list_paper_investment_themes(conn, ids)
 
 
 def set_paper_investment_themes(paper_id: int, theme_ids: Iterable[int]) -> None:
@@ -1671,67 +1801,40 @@ def set_paper_investment_themes(paper_id: int, theme_ids: Iterable[int]) -> None
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        requested = {}
-        for chunk in _chunks(ids):
-            placeholders = ','.join('?' for _ in chunk)
-            requested.update({row['id']: row['status'] for row in conn.execute(
-                f'SELECT id,status FROM investment_themes WHERE id IN ({placeholders})', chunk)})
-        if len(requested) != len(ids):
-            raise InvestmentThemeNotFoundError('所选投资主题不存在，请刷新后重试')
-        if any(status != 'active' for status in requested.values()):
-            raise ArchivedThemeError('所选主题已归档，请刷新后重试；已有归档关系不会被普通保存删除')
-        current = {row['theme_id'] for row in conn.execute("""SELECT m.theme_id FROM paper_investment_themes m
-            JOIN investment_themes t ON t.id=m.theme_id WHERE m.paper_id=? AND t.status='active'""", (paper_id,))}
-        desired = set(ids)
-        conn.executemany('DELETE FROM paper_investment_themes WHERE paper_id=? AND theme_id=?',
-                         [(paper_id, theme_id) for theme_id in current-desired])
-        now = now_iso()
-        conn.executemany('INSERT INTO paper_investment_themes(paper_id,theme_id,created_at) VALUES (?,?,?)',
-                         [(paper_id, theme_id, now) for theme_id in desired-current])
+        investment_themes_db.set_paper_investment_themes(conn, paper_id, ids, now_iso)
 
 
 def paper_investment_theme_options(paper_id: int) -> list[dict[str, Any]]:
     with connect() as conn:
-        return [dict(row) for row in conn.execute("""SELECT t.id,t.name,t.description,t.status,m.created_at AS added_at
-            FROM investment_themes t LEFT JOIN paper_investment_themes m ON m.theme_id=t.id AND m.paper_id=?
-            WHERE t.status='active' OR m.paper_id IS NOT NULL ORDER BY t.status,t.normalized_name,t.id""", (paper_id,))]
+        return investment_themes_db.paper_investment_theme_options(conn, paper_id)
 
 
 def remove_paper_investment_theme(paper_id: int, theme_id: int) -> None:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        _require_theme(conn, theme_id)
-        conn.execute('DELETE FROM paper_investment_themes WHERE paper_id=? AND theme_id=?', (paper_id, theme_id))
+        investment_themes_db.remove_paper_investment_theme(conn, paper_id, theme_id)
 
 
 def _research_table(kind: str) -> str:
-    return RESEARCH_ENTITY_TABLES[parse_choice(kind, 'kind', set(RESEARCH_ENTITY_TABLES))]
+    return research_entities_db.research_table(kind)
 
 
 def _require_research_entity(conn: sqlite3.Connection, kind: str, entity_id: int) -> dict[str, Any]:
-    table = _research_table(kind)
-    row = conn.execute(f'SELECT * FROM {table} WHERE id=?', (entity_id,)).fetchone() if 0 < entity_id <= 2**63-1 else None
-    if row is None:
-        raise ResearchEntityNotFoundError('作者或机构不存在，请刷新后重新选择')
-    return dict(row)
+    return research_entities_db.require_research_entity(conn, kind, entity_id)
 
 
 def get_research_entity(kind: str, entity_id: int) -> dict[str, Any]:
     with connect() as conn:
-        return _require_research_entity(conn, kind, entity_id)
+        return research_entities_db.require_research_entity(conn, kind, entity_id)
 
 
 def _research_conflict(kind: str, row: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    return {'kind': kind, 'id': row['id'], 'name': row['name'], 'status': row['status'], 'reason': reason}
+    return research_entities_db.research_conflict(kind, row, reason)
 
 
 def _insert_research_entity(conn: sqlite3.Connection, command: ResearchEntityCommand) -> int:
-    values = {**command.values, 'created_at': now_iso(), 'updated_at': now_iso()}
-    columns = ','.join(values)
-    placeholders = ','.join('?' for _ in values)
-    return int(conn.execute(f'INSERT INTO {_research_table(command.kind)}({columns}) VALUES ({placeholders})',
-                            list(values.values())).lastrowid)
+    return research_entities_db.insert_research_entity(conn, command, now_iso)
 
 
 def save_paper_team_tracking(paper_id: int, form: Mapping[str, Any]) -> int:
@@ -1739,43 +1842,14 @@ def save_paper_team_tracking(paper_id: int, form: Mapping[str, Any]) -> int:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        ids, conflicts = {}, []
-        # Resolve both entities before the first DML, including exact duplicates.
-        for kind in ('author', 'organization'):
-            value = getattr(command, kind)
-            if isinstance(value, int):
-                row = _require_research_entity(conn, kind, value)
-                if row['status'] != 'active':
-                    conflicts.append(_research_conflict(kind, row, 'archived'))
-                ids[kind] = value
-            else:
-                row = conn.execute(f'SELECT * FROM {_research_table(kind)} WHERE normalized_name=?',
-                                   (value.values['normalized_name'],)).fetchone()
-                if row:
-                    conflicts.append(_research_conflict(kind, row, 'duplicate'))
-        if conflicts:
-            raise ResearchEntityConflictError(conflicts)
-        for kind in ('author', 'organization'):
-            if kind not in ids:
-                ids[kind] = _insert_research_entity(conn, getattr(command, kind))
-        now = now_iso()
-        conn.execute("""INSERT INTO paper_team_tracking(paper_id,lead_author_id,organization_id,notes,created_at,updated_at)
-            VALUES (?,?,?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET
-                lead_author_id=excluded.lead_author_id,organization_id=excluded.organization_id,
-                notes=excluded.notes,status='tracking',updated_at=excluded.updated_at
-            WHERE paper_team_tracking.lead_author_id != excluded.lead_author_id
-                OR paper_team_tracking.organization_id != excluded.organization_id
-                OR paper_team_tracking.notes != excluded.notes OR paper_team_tracking.status != 'tracking'""",
-            (paper_id, ids['author'], ids['organization'], command.notes, now, now))
-        return int(conn.execute('SELECT id FROM paper_team_tracking WHERE paper_id=?', (paper_id,)).fetchone()[0])
+        return research_entities_db.save_paper_team_tracking(conn, paper_id, command, now_iso)
 
 
 def archive_paper_team_tracking(paper_id: int) -> None:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        conn.execute("UPDATE paper_team_tracking SET status='archived',updated_at=? WHERE paper_id=? AND status='tracking'",
-                     (now_iso(), paper_id))
+        research_entities_db.archive_paper_team_tracking(conn, paper_id, now_iso)
 
 
 def update_research_entity(kind: str, entity_id: int, action: str, form: Mapping[str, Any] | None = None) -> None:
@@ -1784,124 +1858,332 @@ def update_research_entity(kind: str, entity_id: int, action: str, form: Mapping
     command = ResearchEntityCommand.from_form(kind, form or {}) if action == 'update' else None
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        old = _require_research_entity(conn, kind, entity_id)
-        if command:
-            row = conn.execute(f'SELECT * FROM {table} WHERE normalized_name=? AND id!=?',
-                               (command.values['normalized_name'], entity_id)).fetchone()
-            if row:
-                raise ResearchEntityConflictError([_research_conflict(kind, row, 'duplicate')])
-            values = command.values
-        else:
-            values = {'status': 'archived' if action == 'archive' else 'active'}
-        if any(old[key] != value for key, value in values.items()):
-            updates = {**values, 'updated_at': now_iso()}
-            conn.execute(f"UPDATE {table} SET {','.join(key+'=?' for key in updates)} WHERE id=?",
-                         [*updates.values(), entity_id])
+        research_entities_db.update_research_entity(conn, kind, entity_id, action, command, now_iso)
 
 
 def get_paper_team_tracking(paper_id: int) -> dict[str, Any] | None:
     with connect() as conn:
-        return row_to_dict(conn.execute("""SELECT t.*,a.name AS author_name,a.status AS author_status,
-            a.author_category,o.name AS organization_name,o.status AS organization_status,o.organization_type
-            FROM paper_team_tracking t JOIN research_authors a ON a.id=t.lead_author_id
-            JOIN research_organizations o ON o.id=t.organization_id WHERE t.paper_id=?""", (paper_id,)).fetchone())
+        return research_entities_db.get_paper_team_tracking(conn, paper_id)
 
 
 def research_entity_options(kind: str) -> list[dict[str, Any]]:
     with connect() as conn:
-        return [dict(row) for row in conn.execute(f"SELECT id,name FROM {_research_table(kind)} WHERE status='active' ORDER BY normalized_name,id")]
+        return research_entities_db.research_entity_options(conn, kind)
 
 
 def _research_filters(author_category: str, organization_type: str) -> tuple[str, str]:
-    if author_category:
-        author_category = parse_choice(author_category, 'author_category', set(AUTHOR_CATEGORIES))
-    if organization_type:
-        organization_type = parse_choice(organization_type, 'organization_type', set(ORGANIZATION_TYPES))
-    return author_category, organization_type
+    return research_entities_db.research_filters(author_category, organization_type)
 
 
 def list_team_tracking(*, query: str = '', status: str = 'tracking', author_category: str = '',
                        organization_type: str = '', author_id: int | None = None,
                        organization_id: int | None = None) -> list[dict[str, Any]]:
-    status = parse_choice(status, 'status', {'all', 'tracking', 'archived'})
-    author_category, organization_type = _research_filters(author_category, organization_type)
-    clauses, params = [], []
-    if status != 'all':
-        clauses.append('t.status=?')
-        params.append(status)
-    if query.strip():
-        clauses.append('(instr(a.normalized_name,?)>0 OR instr(o.normalized_name,?)>0 OR instr(lower(p.title),?)>0)')
-        normalized = normalized_research_name(query)
-        params.extend([normalized, normalized, query.strip().lower()])
-    for column, value in [('a.author_category', author_category), ('o.organization_type', organization_type)]:
-        if value:
-            clauses.append(column+'=?')
-            params.append(value)
-    for column, value in [('t.lead_author_id', author_id), ('t.organization_id', organization_id)]:
-        if value is not None:
-            clauses.append(column+'=?')
-            params.append(parse_int(value, column, minimum=1, maximum=2**63-1))
-    where = ' AND '.join(clauses) or '1=1'
+    query_spec = research_entities_db.prepare_team_tracking_list_query(
+        query=query, status=status, author_category=author_category, organization_type=organization_type,
+        author_id=author_id, organization_id=organization_id)
     with connect() as conn:
-        return [dict(row) for row in conn.execute(f"""SELECT t.*,p.title,p.arxiv_id,p.published_at,
-            a.name AS author_name,a.author_category,a.status AS author_status,
-            o.name AS organization_name,o.organization_type,o.region,o.status AS organization_status
-            FROM paper_team_tracking t JOIN papers p ON p.id=t.paper_id
-            JOIN research_authors a ON a.id=t.lead_author_id
-            JOIN research_organizations o ON o.id=t.organization_id
-            WHERE {where} ORDER BY t.updated_at DESC,t.id DESC""", params)]
+        return research_entities_db.list_team_tracking(conn, query_spec)
 
 
 def list_research_entities(kind: str, *, query: str = '', status: str = 'active',
                            author_category: str = '', organization_type: str = '') -> list[dict[str, Any]]:
-    table = _research_table(kind)
-    status = parse_choice(status, 'status', {'all', 'active', 'archived'})
-    author_category, organization_type = _research_filters(author_category, organization_type)
-    foreign_key, other_key, other_table = (('lead_author_id', 'organization_id', 'research_organizations')
-        if kind == 'author' else ('organization_id', 'lead_author_id', 'research_authors'))
-    clauses, params = [], []
-    if status != 'all':
-        clauses.append('e.status=?')
-        params.append(status)
-    if query.strip():
-        clauses.append('instr(e.normalized_name,?)>0')
-        params.append(normalized_research_name(query))
-    for column, value, own in [('author_category', author_category, kind == 'author'),
-                                ('organization_type', organization_type, kind == 'organization')]:
-        if value:
-            clauses.append(f'e.{column}=?' if own else f'EXISTS(SELECT 1 FROM paper_team_tracking tf JOIN {other_table} ot ON ot.id=tf.{other_key} WHERE tf.{foreign_key}=e.id AND ot.{column}=?)')
-            params.append(value)
-    where = ' AND '.join(clauses) or '1=1'
+    query_spec = research_entities_db.prepare_research_entity_list_query(
+        kind, query=query, status=status, author_category=author_category, organization_type=organization_type)
     with connect() as conn:
         conn.execute('BEGIN')
-        rows = [dict(row) for row in conn.execute(f"""WITH counts AS (
-            SELECT {foreign_key} AS entity_id,COUNT(*) AS paper_count,COUNT(DISTINCT {other_key}) AS related_count,
-                SUM(status='tracking') AS tracking_count FROM paper_team_tracking GROUP BY {foreign_key})
-            SELECT e.*,COALESCE(c.paper_count,0) AS paper_count,COALESCE(c.related_count,0) AS related_count,
-                COALESCE(c.tracking_count,0) AS tracking_count
-            FROM {table} e LEFT JOIN counts c ON c.entity_id=e.id WHERE {where}
-            ORDER BY e.updated_at DESC,e.id DESC""", params)]
-        by_id = {row['id']: row for row in rows}
+        return research_entities_db.list_research_entities(conn, query_spec)
+
+
+def _collection_page_score(score_type: Any, score_scalar: Any) -> int:
+    """Reproduce the legacy ``int(score)`` ordering without JSON parsing."""
+    try:
+        if score_type == "true":
+            return 1
+        if score_type == "false":
+            return 0
+        if score_type in {"integer", "real", "text"}:
+            value = str(score_scalar).strip()
+            if score_type == "real":
+                numeric = float(value)
+                if numeric in {float("inf"), float("-inf")} or numeric != numeric:
+                    return -1
+                return int(numeric)
+            return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return -1
+
+
+def _collection_page_rank(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 999999
+
+
+def _collection_page_lower(value: Any) -> str:
+    return str(value or "").lower()
+
+
+_COLLECTION_PAGE_RESULT_FIELDS = (
+    "score",
+    "attention",
+    "one_sentence_summary",
+    "detailed_summary_zh",
+    "problem",
+    "novelty_assessment",
+    "recommended_action",
+    "vc_perspective",
+    "tags",
+)
+
+
+def _collection_page_result_select(alias: str) -> str:
+    """Select only the JSON paths needed to render a collection card."""
+    expressions: list[str] = []
+    for field in _COLLECTION_PAGE_RESULT_FIELDS:
+        path = f"$.{field}"
+        expressions.extend(
+            [
+                f"CASE WHEN json_valid({alias}.result_json) "
+                f"THEN json_type({alias}.result_json, '{path}') END "
+                f"AS fulltext_result_{field}_type",
+                f"CASE WHEN json_valid({alias}.result_json) "
+                f"THEN json_extract({alias}.result_json, '{path}') END "
+                f"AS fulltext_result_{field}_value",
+            ]
+        )
+    return ", ".join(expressions)
+
+
+def _collection_page_result(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode the selected JSON paths while retaining JSON scalar types."""
+    result: dict[str, Any] = {}
+    for field in _COLLECTION_PAGE_RESULT_FIELDS:
+        value_type = row.pop(f"fulltext_result_{field}_type", None)
+        value = row.pop(f"fulltext_result_{field}_value", None)
+        if value_type is None:
+            continue
+        if value_type == "true":
+            value = True
+        elif value_type == "false":
+            value = False
+        elif value_type in {"object", "array"} and isinstance(value, (str, bytes, bytearray)):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                # A valid JSON document should always make this branch
+                # decodable; keep the value available if SQLite returns an
+                # unusual adapter type instead of silently dropping it.
+                pass
+        result[field] = value
+    return result
+
+
+def _collection_page_categories_with_conn(
+    conn: sqlite3.Connection,
+    paper_ids: list[int],
+) -> dict[int, list[dict[str, Any]]]:
+    result = {paper_id: [] for paper_id in paper_ids}
+    if not paper_ids:
+        return result
+    placeholders = ",".join("?" for _ in paper_ids)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM paper_categories
+        WHERE paper_id IN ({placeholders})
+        ORDER BY paper_id, crawl_date DESC, category
+        """,
+        paper_ids,
+    ).fetchall()
+    for row in rows:
+        result.setdefault(int(row["paper_id"]), []).append(dict(row))
+    return result
+
+
+def _collection_page_themes_with_conn(
+    conn: sqlite3.Connection,
+    paper_ids: list[int],
+) -> dict[int, list[dict[str, Any]]]:
+    result = {paper_id: [] for paper_id in paper_ids}
+    if not paper_ids:
+        return result
+    placeholders = ",".join("?" for _ in paper_ids)
+    rows = conn.execute(
+        f"""
+        SELECT t.id, t.name, t.status, m.paper_id, m.created_at AS added_at
+        FROM paper_investment_themes m
+        JOIN investment_themes t ON t.id = m.theme_id
+        WHERE m.paper_id IN ({placeholders})
+        ORDER BY t.status, m.created_at DESC, t.id
+        """,
+        paper_ids,
+    ).fetchall()
+    for row in rows:
+        result.setdefault(int(row["paper_id"]), []).append(dict(row))
+    return result
+
+
+def list_fulltext_reviewed_papers_page(
+    sort: str = "evaluated_desc",
+    *,
+    decision: str = "all",
+    theme_id: int | None = None,
+    page: int = 1,
+    page_size: int = 30,
+) -> dict[str, Any]:
+    """Read one collection page while preserving the old full-list semantics.
+
+    Eligibility, de-duplication, ordering, count and LIMIT/OFFSET run against
+    the same short read transaction.  Only the selected page carries the
+    evaluation JSON used to render cards; the projection table supplies the
+    global latest-evaluation and score ordering facts.
+    """
+    if decision not in PAPER_DECISION_FILTERS:
+        raise ValueError("无效的个人决策筛选")
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    selected_sort = sort if sort in {"evaluated_desc", "score_desc", "rank", "title", "added_desc"} else "evaluated_desc"
+
+    conn = connect()
+    conn.create_function("collection_score_int", 2, _collection_page_score)
+    conn.create_function("collection_rank_int", 1, _collection_page_rank)
+    conn.create_function("collection_lower", 1, _collection_page_lower)
+    try:
+        conn.execute("BEGIN")
+        theme_join = (
+            "JOIN paper_investment_themes tm ON tm.paper_id = p.id AND tm.theme_id = ?"
+            if theme_id is not None
+            else ""
+        )
+        theme_column = "tm.created_at" if theme_id is not None else "NULL"
+        evaluation_join = "LEFT JOIN" if theme_id is not None else "JOIN"
+        decision_where = (
+            "(? = 'all' OR (? = 'undecided' AND d.paper_id IS NULL) OR d.decision = ?)"
+        )
+        candidate_ctes = f"""
+            WITH candidates AS (
+                SELECT
+                    p.id, p.title,
+                    e.evaluation_id AS fulltext_evaluation_id,
+                    e.created_at AS fulltext_evaluated_at,
+                    e.score_type AS fulltext_score_type,
+                    e.score_scalar AS fulltext_score_scalar,
+                    COALESCE(d.decision, 'undecided') AS decision,
+                    d.updated_at AS decision_updated_at,
+                    {theme_column} AS theme_added_at,
+                    lc.category AS latest_category_name,
+                    lc.rank AS latest_category_rank,
+                    lc.reading_stars AS latest_category_stars
+                FROM papers p
+                {evaluation_join} fulltext_evaluation_projection e
+                    ON e.evaluation_id = (
+                        SELECT ep.evaluation_id
+                        FROM fulltext_evaluation_projection ep
+                        WHERE ep.paper_id = p.id
+                        ORDER BY ep.created_at DESC, ep.evaluation_id DESC
+                        LIMIT 1
+                    )
+                {theme_join}
+                LEFT JOIN paper_dispositions d ON d.paper_id = p.id
+                LEFT JOIN paper_categories lc
+                    ON lc.id = (
+                        SELECT pc.id
+                        FROM paper_categories pc
+                        WHERE pc.paper_id = p.id
+                        ORDER BY pc.crawl_date DESC, pc.category ASC
+                        LIMIT 1
+                    )
+                WHERE {decision_where}
+            )
+        """
+        if selected_sort == "added_desc":
+            order_by = (
+                "theme_added_at DESC, id DESC, fulltext_evaluated_at DESC, "
+                "fulltext_evaluation_id DESC"
+            )
+        elif selected_sort == "score_desc":
+            order_by = (
+                "collection_score_int(fulltext_score_type, fulltext_score_scalar) DESC, "
+                "fulltext_evaluated_at DESC, fulltext_evaluation_id DESC, id DESC"
+            )
+        elif selected_sort == "title":
+            order_by = (
+                "collection_lower(title) ASC, fulltext_evaluated_at DESC, "
+                "fulltext_evaluation_id DESC, id DESC"
+            )
+        elif selected_sort == "rank":
+            order_by = (
+                "COALESCE(latest_category_name, '') ASC, "
+                "collection_rank_int(latest_category_rank) ASC, "
+                "fulltext_evaluated_at DESC, fulltext_evaluation_id DESC, id DESC"
+            )
+        else:
+            order_by = "fulltext_evaluated_at DESC, fulltext_evaluation_id DESC, id DESC"
+
+        params: list[Any] = []
+        if theme_id is not None:
+            params.append(theme_id)
+        params.extend([decision, decision, decision])
+        offset = (page - 1) * page_size
+        total = int(
+            conn.execute(
+                candidate_ctes + " SELECT COUNT(*) AS total FROM candidates",
+                params,
+            ).fetchone()["total"]
+        )
+        raw_rows = conn.execute(
+            candidate_ctes
+            + f", page_ids AS MATERIALIZED ("
+            + f" SELECT candidates.*, ROW_NUMBER() OVER (ORDER BY {order_by}) AS _collection_order"
+            + f" FROM candidates ORDER BY {order_by} LIMIT ? OFFSET ?"
+            + f") SELECT page_ids.*, p.arxiv_id, p.abstract, p.abs_url, "
+            + f" ev.model AS fulltext_model, {_collection_page_result_select('ev')}"
+            + f" FROM page_ids JOIN papers p ON p.id = page_ids.id "
+            + f" LEFT JOIN evaluations ev "
+            + f" ON ev.id = page_ids.fulltext_evaluation_id"
+            + f" ORDER BY page_ids._collection_order",
+            [*params, page_size, offset],
+        ).fetchall()
+        rows = []
+        for raw_row in raw_rows:
+            row = dict(raw_row)
+            row.pop("_collection_order", None)
+            rows.append(row)
+        paper_ids = [int(row["id"]) for row in rows]
+        categories_by_paper = _collection_page_categories_with_conn(conn, paper_ids)
+        themes_by_paper = _collection_page_themes_with_conn(conn, paper_ids)
         for row in rows:
-            row.update(recent_papers=[], related_entities=[])
-        for chunk in _chunks(list(by_id)):
-            placeholders = ','.join('?' for _ in chunk)
-            recent = conn.execute(f"""WITH ranked AS (
-                SELECT t.{foreign_key} AS entity_id,p.id,p.title,p.published_at,t.status,
-                    ROW_NUMBER() OVER(PARTITION BY t.{foreign_key} ORDER BY COALESCE(p.published_at,'') DESC,t.created_at DESC,t.id DESC) AS rn
-                FROM paper_team_tracking t JOIN papers p ON p.id=t.paper_id WHERE t.{foreign_key} IN ({placeholders}))
-                SELECT * FROM ranked WHERE rn<=3 ORDER BY entity_id,rn""", chunk)
-            for row in recent:
-                by_id[row['entity_id']]['recent_papers'].append(dict(row))
-            partners = conn.execute(f"""WITH links AS (
-                SELECT DISTINCT t.{foreign_key} AS entity_id,o.id,o.name,o.normalized_name,o.status
-                FROM paper_team_tracking t JOIN {other_table} o ON o.id=t.{other_key}
-                WHERE t.{foreign_key} IN ({placeholders})),ranked AS (
-                SELECT *,ROW_NUMBER() OVER(PARTITION BY entity_id ORDER BY normalized_name,id) AS rn FROM links)
-                SELECT * FROM ranked WHERE rn<=3 ORDER BY entity_id,rn""", chunk)
-            for row in partners:
-                by_id[row['entity_id']]['related_entities'].append(dict(row))
-        return rows
+            row["fulltext_result"] = _collection_page_result(row)
+            row.pop("fulltext_score_type", None)
+            row.pop("fulltext_score_scalar", None)
+            categories = categories_by_paper.get(int(row["id"]), [])
+            row["categories"] = categories
+            latest_category_name = row.pop("latest_category_name", None)
+            latest_category_rank = row.pop("latest_category_rank", None)
+            latest_category_stars = row.pop("latest_category_stars", None)
+            row["latest_category"] = (
+                {
+                    "category": latest_category_name,
+                    "rank": latest_category_rank,
+                    "reading_stars": latest_category_stars,
+                }
+                if latest_category_name is not None
+                else {}
+            )
+            row["investment_themes"] = themes_by_paper.get(int(row["id"]), [])
+        return {
+            "items": rows,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size if total else 0,
+            "has_previous": page > 1,
+            "has_next": page * page_size < total,
+        }
+    finally:
+        conn.close()
 
 
 def list_fulltext_reviewed_papers(sort: str = "evaluated_desc", *, decision: str = 'all', theme_id: int | None = None) -> list[dict[str, Any]]:
@@ -2510,18 +2792,19 @@ def claim_classification(paper_id: int, direction_ids: list[int], job_id: int, *
         return token, missing, None
 
 
-def start_classification_attempt(paper_id, job_id, source, directions, metadata, config, attempt):
+def start_classification_attempt(paper_id, job_id, source, directions, metadata, config, attempt,
+                                operation_id=None):
     encoded_input = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
     # Configuration contains only the frozen public fields and a transport binding hash.
     prompt, profile = (config or {}).get('prompt', {}), (config or {}).get('profile', {})
     with connect() as conn:
         return int(conn.execute('''INSERT INTO evaluations(paper_id,pipeline_job_id,evaluation_type,
             prompt_id,prompt_version,llm_profile_id,model,status,classification_source,
-            direction_snapshot_json,input_snapshot_json,input_fingerprint,config_snapshot_json,attempt,created_at)
-            VALUES (?,?,'direction_classification',?,?,?,?,'running',?,?,?,?,?,?,?)''',
+            direction_snapshot_json,input_snapshot_json,input_fingerprint,config_snapshot_json,attempt,call_operation_id,created_at)
+            VALUES (?,?,'direction_classification',?,?,?,?,'running',?,?,?,?,?,?,?,?)''',
             (paper_id,job_id,prompt.get('id'),prompt.get('version'),profile.get('id'),profile.get('model'),source,
              json.dumps(directions,ensure_ascii=False),encoded_input,hashlib.sha256(encoded_input.encode()).hexdigest(),
-             json.dumps(config or {},ensure_ascii=False),attempt,now_iso())).lastrowid)
+             json.dumps(config or {},ensure_ascii=False),attempt,operation_id,now_iso())).lastrowid)
 
 
 def _write_direction_models(conn, evaluation, results):
@@ -2553,6 +2836,8 @@ def finish_classification_attempt(evaluation_id, *, result=None, raw_output=None
         elif terminal:
             _write_direction_models(conn,evaluation,[{'direction_id':d['id'],'decision':'failed','reason':error_code or 'classification_failed'}
                                                     for d in loads_json(evaluation['direction_snapshot_json'],[])])
+        from .call_attempts import associate_current_attempts
+        associate_current_attempts(conn, evaluation_id=evaluation_id)
 
 
 def release_classification_claim(token):
@@ -2604,12 +2889,12 @@ def claim_abstract_evaluation(
         return token, None
 
 
-def mark_evaluation_provider_started(token: str) -> None:
+def mark_evaluation_provider_started(token: str, operation_id: str | None = None) -> None:
     with connect() as conn:
-        conn.execute("""UPDATE evaluation_claims SET provider_started=1,
+        conn.execute("""UPDATE evaluation_claims SET provider_started=1,operation_id=COALESCE(?,operation_id),
             last_evaluation_id=(SELECT COALESCE(MAX(id),0) FROM evaluations e
                 WHERE e.paper_id=evaluation_claims.paper_id AND e.evaluation_type=evaluation_claims.evaluation_type)
-            WHERE token=?""", (token,))
+            WHERE token=?""", (operation_id,token))
 
 
 def release_evaluation_claim(token: str) -> None:
@@ -2651,15 +2936,16 @@ def create_evaluation(
     pipeline_job_id: int | None = None,
 ) -> int:
     with connect() as conn:
+        from . import call_attempts
         cur = conn.execute(
             """
             INSERT INTO evaluations(
                 paper_id, pipeline_job_id, evaluation_type,
                 prompt_id, prompt_version, llm_profile_id,
                 model, status, result_json, raw_output, error_message,
-                error_code, error_retryable, created_at
+                error_code, error_retryable, call_operation_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 paper_id,
@@ -2675,10 +2961,13 @@ def create_evaluation(
                 error_message,
                 error_code,
                 1 if error_retryable else 0,
+                call_attempts.current_operation_id(),
                 now_iso(),
             ),
         )
-        return int(cur.lastrowid)
+        evaluation_id = int(cur.lastrowid)
+        call_attempts.associate_current_attempts(conn, evaluation_id=evaluation_id)
+        return evaluation_id
 
 
 def _hydrate_evaluation_row(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any] | None:
@@ -2851,12 +3140,19 @@ def create_job(
         return int(cur.lastrowid)
 
 
-def create_daily_pipeline_job(
+def _create_daily_pipeline_job_in_connection(
+    conn: sqlite3.Connection,
     payload: dict[str, Any],
     *,
     idempotency_key: str | None = None,
     retry_of_job_id: int | None = None,
 ) -> tuple[int, bool]:
+    """Create a daily pipeline job without opening or committing a connection.
+
+    The scheduler uses this helper while it owns the same ``BEGIN IMMEDIATE``
+    transaction as the schedule occurrence transition.  The public wrapper
+    below retains the historical standalone API for manual callers.
+    """
     payload_data = dict(payload or {})
     trigger_source = str(payload_data.get("trigger_source") or "")
     if trigger_source not in PIPELINE_TRIGGER_SOURCES:
@@ -2868,82 +3164,96 @@ def create_daily_pipeline_job(
         sort_keys=True,
         separators=(",", ":"),
     )
+    if normalized_key:
+        existing = conn.execute(
+            "SELECT id, type, payload, retry_of_job_id FROM jobs WHERE idempotency_key = ?",
+            (normalized_key,),
+        ).fetchone()
+        if existing:
+            existing_payload = json.dumps(
+                loads_json(existing["payload"], {}),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if (
+                existing["type"] != DAILY_PIPELINE_JOB_TYPE
+                or existing_payload != encoded_payload
+                or existing["retry_of_job_id"] != retry_of_job_id
+            ):
+                raise ValueError("idempotency_key 已用于不同的流水线请求")
+            return int(existing["id"]), False
+
+    active = conn.execute(
+        f"""
+        SELECT id FROM jobs
+        WHERE type IN ({','.join('?' for _ in CRAWL_JOB_TYPES)})
+          AND status IN ('pending', 'running')
+        ORDER BY created_at, id
+        LIMIT 1
+        """,
+        CRAWL_JOB_TYPES,
+    ).fetchone()
+    if active:
+        return int(active["id"]), False
+
+    if retry_of_job_id is not None:
+        original = conn.execute(
+            "SELECT type, status FROM jobs WHERE id = ?",
+            (retry_of_job_id,),
+        ).fetchone()
+        if not original:
+            raise ValueError("retry_of_job_id 指向的任务不存在")
+        if original["status"] not in JOB_TERMINAL_STATUSES:
+            raise ValueError("只能重试已经结束的任务")
+        if original["type"] != DAILY_PIPELINE_JOB_TYPE:
+            raise ValueError("只能重试历史每日情报流水线任务")
+
+    cur = conn.execute(
+        """
+        INSERT INTO jobs(
+            type, status, idempotency_key, retry_of_job_id, payload, created_at
+        )
+        VALUES (?, 'pending', ?, ?, ?, ?)
+        """,
+        (
+            DAILY_PIPELINE_JOB_TYPE,
+            normalized_key,
+            retry_of_job_id,
+            encoded_payload,
+            now_iso(),
+        ),
+    )
+    job_id = int(cur.lastrowid)
+    plan_event = _normalize_job_event(
+        job_id,
+        f"pipeline:{job_id}:plan_created",
+        "plan",
+        "pipeline.plan_created",
+        metrics={
+            "trigger_source": trigger_source,
+            "category_count": len(payload_data.get("categories") or []),
+        },
+        message="每日情报流水线计划已创建",
+    )
+    _insert_job_event(conn, plan_event)
+    return job_id, True
+
+
+def create_daily_pipeline_job(
+    payload: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+    retry_of_job_id: int | None = None,
+) -> tuple[int, bool]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        if normalized_key:
-            existing = conn.execute(
-                "SELECT id, type, payload, retry_of_job_id FROM jobs WHERE idempotency_key = ?",
-                (normalized_key,),
-            ).fetchone()
-            if existing:
-                existing_payload = json.dumps(
-                    loads_json(existing["payload"], {}),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                if (
-                    existing["type"] != DAILY_PIPELINE_JOB_TYPE
-                    or existing_payload != encoded_payload
-                    or existing["retry_of_job_id"] != retry_of_job_id
-                ):
-                    raise ValueError("idempotency_key 已用于不同的流水线请求")
-                return int(existing["id"]), False
-
-        active = conn.execute(
-            f"""
-            SELECT id FROM jobs
-            WHERE type IN ({','.join('?' for _ in CRAWL_JOB_TYPES)})
-              AND status IN ('pending', 'running')
-            ORDER BY created_at, id
-            LIMIT 1
-            """,
-            CRAWL_JOB_TYPES,
-        ).fetchone()
-        if active:
-            return int(active["id"]), False
-
-        if retry_of_job_id is not None:
-            original = conn.execute(
-                "SELECT type, status FROM jobs WHERE id = ?",
-                (retry_of_job_id,),
-            ).fetchone()
-            if not original:
-                raise ValueError("retry_of_job_id 指向的任务不存在")
-            if original["status"] not in JOB_TERMINAL_STATUSES:
-                raise ValueError("只能重试已经结束的任务")
-            if original["type"] != DAILY_PIPELINE_JOB_TYPE:
-                raise ValueError("只能重试历史每日情报流水线任务")
-
-        cur = conn.execute(
-            """
-            INSERT INTO jobs(
-                type, status, idempotency_key, retry_of_job_id, payload, created_at
-            )
-            VALUES (?, 'pending', ?, ?, ?, ?)
-            """,
-            (
-                DAILY_PIPELINE_JOB_TYPE,
-                normalized_key,
-                retry_of_job_id,
-                encoded_payload,
-                now_iso(),
-            ),
+        return _create_daily_pipeline_job_in_connection(
+            conn,
+            payload,
+            idempotency_key=idempotency_key,
+            retry_of_job_id=retry_of_job_id,
         )
-        job_id = int(cur.lastrowid)
-        plan_event = _normalize_job_event(
-            job_id,
-            f"pipeline:{job_id}:plan_created",
-            "plan",
-            "pipeline.plan_created",
-            metrics={
-                "trigger_source": trigger_source,
-                "category_count": len(payload_data.get("categories") or []),
-            },
-            message="每日情报流水线计划已创建",
-        )
-        _insert_job_event(conn, plan_event)
-        return job_id, True
 
 
 def get_active_crawl_job() -> dict[str, Any] | None:
@@ -3444,18 +3754,38 @@ def mark_pending_jobs_interrupted_except(active_job_ids: set[int], message: str)
 def mark_unfinished_jobs_interrupted() -> int:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        from . import call_attempts
+        call_attempts.mark_incomplete_unknown(conn)
         from .memo_db import recover_versions
         memo_interrupted = recover_versions(conn)
         for evaluation in conn.execute("SELECT * FROM evaluations WHERE evaluation_type='direction_classification' AND status='running'").fetchall():
-            conn.execute("UPDATE evaluations SET status='failed',error_code='external_outcome_unknown',error_message='服务中断，重试可能产生额外费用',error_retryable=1 WHERE id=?", (evaluation['id'],))
-            _write_direction_models(conn,evaluation,[{'direction_id':d['id'],'decision':'failed','reason':'external_outcome_unknown'}
+            attempt_rows = []
+            if evaluation['call_operation_id']:
+                attempt_rows = conn.execute("""SELECT id,status FROM llm_call_attempts
+                    WHERE operation_id=? AND evaluation_id IS NULL ORDER BY business_attempt_no,attempt_no,id""",
+                    (evaluation['call_operation_id'],)).fetchall()
+            if attempt_rows and all(row['status'] in {'succeeded','failed'} for row in attempt_rows):
+                error_code = 'result_persistence_interrupted'
+                error_message = 'Provider 响应已记录，但分类结果未能保存；系统不会自动重调。'
+            elif evaluation['call_operation_id'] and not attempt_rows:
+                error_code = 'pipeline_interrupted'
+                error_message = '服务在 Provider 请求开始前中断；未发送新的模型请求。'
+            else:
+                error_code = 'external_outcome_unknown'
+                error_message = '服务中断，重试可能产生额外费用'
+            conn.execute("UPDATE evaluations SET status='failed',error_code=?,error_message=?,error_retryable=? WHERE id=?",
+                         (error_code,error_message,int(error_code == 'external_outcome_unknown'),evaluation['id']))
+            if evaluation['call_operation_id']:
+                conn.execute("UPDATE llm_call_attempts SET evaluation_id=? WHERE operation_id=? AND evaluation_id IS NULL",
+                             (evaluation['id'],evaluation['call_operation_id']))
+            _write_direction_models(conn,evaluation,[{'direction_id':d['id'],'decision':'failed','reason':error_code}
                                                     for d in loads_json(evaluation['direction_snapshot_json'],[])])
             if evaluation['pipeline_job_id']:
                 _insert_job_event(conn, _normalize_job_event(evaluation['pipeline_job_id'],
                     f"classification:{evaluation['pipeline_job_id']}:{evaluation['paper_id']}:terminal", 'classification',
                     'classification.paper_failed', level='warning', paper_id=evaluation['paper_id'],
-                    error_code='external_outcome_unknown', metrics={'failed':1,'evaluation_id':evaluation['id']},
-                    message='分类调用中断；显式重试可能产生额外费用'))
+                    error_code=error_code, metrics={'failed':1,'evaluation_id':evaluation['id']},
+                    message=error_message))
         # A retryable failed attempt may be sleeping between requests. The claim,
         # not only a running evaluation, defines an unfinished logical task.
         for claim in conn.execute('SELECT * FROM classification_claims').fetchall():
@@ -3484,36 +3814,88 @@ def mark_unfinished_jobs_interrupted() -> int:
         conn.execute('DELETE FROM classification_claims')
         claims = conn.execute("SELECT * FROM evaluation_claims").fetchall()
         for claim in claims:
-            known = conn.execute(
-                "SELECT id,status FROM evaluations WHERE paper_id=? AND evaluation_type=? AND id>? ORDER BY id DESC LIMIT 1",
-                (claim['paper_id'], claim['evaluation_type'], claim['last_evaluation_id']),
-            ).fetchone()
-            if claim['provider_started'] and not known:
-                conn.execute(
-                    """INSERT INTO evaluations(paper_id,evaluation_type,pipeline_job_id,status,error_code,error_retryable,error_message,created_at)
-                       VALUES (?, ?, ?, 'failed', 'external_outcome_unknown', 1, ?, ?)""",
-                    (claim['paper_id'], claim['evaluation_type'], claim['pipeline_job_id'],
-                     '服务中断，外部调用结果未知；重试可能产生额外费用', now_iso()),
+            operation_id = claim['operation_id']
+            if operation_id:
+                known = conn.execute(
+                    """SELECT id,status,error_code,error_message FROM evaluations
+                       WHERE paper_id=? AND evaluation_type=? AND call_operation_id=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (claim['paper_id'], claim['evaluation_type'], operation_id),
+                ).fetchone()
+                unresolved = conn.execute(
+                    """SELECT id,status FROM llm_call_attempts
+                       WHERE operation_id=? AND evaluation_id IS NULL
+                       ORDER BY business_attempt_no,attempt_no,id""",
+                    (operation_id,),
+                ).fetchall()
+            else:
+                # Claims written before operation IDs were introduced retain the
+                # old ID-watermark recovery path.
+                known = conn.execute(
+                    """SELECT id,status,error_code,error_message FROM evaluations
+                       WHERE paper_id=? AND evaluation_type=? AND id>?
+                       ORDER BY id DESC LIMIT 1""",
+                    (claim['paper_id'], claim['evaluation_type'], claim['last_evaluation_id']),
+                ).fetchone()
+                unresolved = []
+
+            recovery_code = None
+            if claim['provider_started'] and unresolved:
+                recovery_code = (
+                    'external_outcome_unknown'
+                    if any(row['status'] == 'external_outcome_unknown' for row in unresolved)
+                    else 'result_persistence_interrupted'
                 )
-                if claim['pipeline_job_id']:
-                    _insert_job_event(conn, _normalize_job_event(
-                        claim['pipeline_job_id'], f"abstract:{claim['pipeline_job_id']}:{claim['paper_id']}:terminal",
-                        'abstract_eval', 'abstract.paper_failed', level='warning', paper_id=claim['paper_id'],
-                        error_code='external_outcome_unknown', metrics={'status': 'failed'},
-                        message='外部调用结果未知，重试可能产生额外费用',
-                    ))
-            elif claim['pipeline_job_id']:
+            elif claim['provider_started'] and not known and not operation_id:
+                # Claims from before operation IDs existed cannot prove that the
+                # provider request row was committed before interruption.
+                recovery_code = 'external_outcome_unknown'
+
+            if recovery_code:
+                error_message = (
+                    '服务中断，外部调用结果未知；重试可能产生额外费用'
+                    if recovery_code == 'external_outcome_unknown'
+                    else 'Provider 响应已记录，但业务结果未能保存；系统不会自动重调。'
+                )
+                cur = conn.execute(
+                    """INSERT INTO evaluations(paper_id,evaluation_type,pipeline_job_id,status,error_code,
+                       error_retryable,error_message,call_operation_id,created_at)
+                       VALUES (?, ?, ?, 'failed', ?, ?, ?, ?, ?)""",
+                    (claim['paper_id'], claim['evaluation_type'], claim['pipeline_job_id'],
+                     recovery_code, int(recovery_code == 'external_outcome_unknown'), error_message, operation_id, now_iso()),
+                )
+                if operation_id:
+                    conn.execute(
+                        "UPDATE llm_call_attempts SET evaluation_id=? WHERE operation_id=? AND evaluation_id IS NULL",
+                        (cur.lastrowid, operation_id),
+                    )
+                known = conn.execute(
+                    "SELECT id,status,error_code,error_message FROM evaluations WHERE id=?",
+                    (cur.lastrowid,),
+                ).fetchone()
+
+            if claim['pipeline_job_id']:
                 event_key = f"abstract:{claim['pipeline_job_id']}:{claim['paper_id']}:terminal"
                 if not conn.execute('SELECT 1 FROM job_events WHERE event_key=?', (event_key,)).fetchone():
                     succeeded = known and known['status'] == 'success'
+                    event_code = (
+                        None if succeeded else
+                        recovery_code or (known['error_code'] if known and known['error_code'] else 'pipeline_interrupted')
+                    )
+                    event_message = (
+                        error_message if recovery_code else
+                        known['error_message'] if known and known['error_message'] else
+                        '服务重启，从已持久化记录恢复摘要终态' if known else
+                        '摘要评估阶段中断，尚未形成终态'
+                    )
                     _insert_job_event(conn, _normalize_job_event(
                         claim['pipeline_job_id'], event_key, 'abstract_eval',
                         'abstract.paper_succeeded' if succeeded else 'abstract.paper_failed',
                         paper_id=claim['paper_id'], level='info' if succeeded else 'warning',
                         metrics={'status': 'success' if succeeded else 'failed',
                                  'evaluation_id': known['id'] if known else None, 'recovered': True},
-                        error_code=None if succeeded else 'pipeline_interrupted',
-                        message='服务重启，从已持久化记录恢复摘要终态',
+                        error_code=event_code,
+                        message=event_message,
                     ))
         conn.execute("DELETE FROM evaluation_claims")
         rows = conn.execute(

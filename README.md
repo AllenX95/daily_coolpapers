@@ -77,6 +77,8 @@ start_daily_coolpapers.bat
 
 The script starts the local service and opens the browser. If the service is already running, it only opens the web page.
 
+The same data workspace can have only one runtime. Direct duplicate starts exit with a message; the launcher never shuts down an existing service. Launcher diagnostics are saved per attempt under the Windows temporary directory (`daily-coolpapers-startup-*`), and the script prints their exact location. Application logging remains in `logs/current.log`.
+
 ### Manual
 
 ```bash

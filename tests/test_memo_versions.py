@@ -58,7 +58,7 @@ class MemoVersionWorkflowTests(unittest.TestCase):
         self.assertEqual(len(db.list_jobs()),1)
         db.set_paper_decision(second,'clear')
         html=self.client.get(path).get_data(as_text=True)
-        self.assertIn('当前资格或筛选条件未被预选',html)
+        self.assertIn('当前已不满足收藏或成功全文资格',html)
         self.assertNotIn(f'value="{second}" checked',html)
 
     def test_copy_judgment_to_new_version_not_model_input_and_old_unchanged(self):

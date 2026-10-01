@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from unittest.mock import patch
 
-from daily_coolpapers import db, memo_db, memos, services
+from daily_coolpapers import call_attempts, db, memo_db, memos, services
 from daily_coolpapers import memo_contract as contract
 from daily_coolpapers.llm import LLMResponse, LLMError, LLMHTTPError
 from tests import test_memo_foundation as foundation
@@ -59,6 +59,16 @@ class MemoGenerationTests(unittest.TestCase):
         self.assertIn('JSON Schema',call.call_args.args[0]['system_prompt'])
         self.assertEqual(self.client.get(f"/investment-memos/{created['series_id']}/versions/{created['id']}").status_code,200)
         self.assertEqual(self.client.get(f"/jobs/{created['job_id']}").status_code,200)
+
+    def test_memo_usage_uses_shared_safe_normalization(self):
+        created = self.create()
+        self.assertIsNotNone(memo_db.start_generation(created['id'],created['job_id']))
+        memo_db.finish_generation(created['id'],result=valid_result(),markdown='test',
+            usage={'input_tokens':True,'prompt_tokens':17.9,'completion_tokens':float('inf'),
+                   'secret':'do-not-persist'})
+        version = self.get(created)
+        self.assertEqual(version['input_tokens'],17)
+        self.assertIsNone(version['output_tokens'])
 
     def test_duplicate_and_concurrent_dispatch_only_one_call(self):
         created = self.create()
@@ -145,18 +155,31 @@ class MemoGenerationTests(unittest.TestCase):
         self.assertIsNone(version['result_json'])
         self.assertEqual(db.get_job(created['job_id'])['status'],'failed')
 
-    def test_unwritable_terminal_then_recovery_unknown_outcome_no_recall(self):
+    def test_unwritable_terminal_then_recovery_known_response_no_recall(self):
         created = self.create()
+        response = LLMResponse('{}',valid_result(),{'prompt_tokens':123,'completion_tokens':45})
+        class HttpResponse:
+            status_code = 200
+            def json(self):
+                return {'usage':{'prompt_tokens':123,'completion_tokens':45}}
+        def recorded_call(profile,prompt,client=None):
+            attempt_id,started = call_attempts.begin_provider_request(profile['provider'],
+                {'model':profile['model'],'messages':[{'role':'user','content':prompt}]})
+            call_attempts.finish_provider_response(attempt_id,started,profile['provider'],HttpResponse())
+            return response
         with patch.object(memo_db,'finish_generation',side_effect=sqlite3.OperationalError('synthetic')):
             with self.assertRaises(sqlite3.OperationalError):
-                self.run_version(created)
+                with patch.object(services,'make_llm_client',return_value=nullcontext(None)), \
+                     patch.object(services,'call_llm',side_effect=recorded_call) as call:
+                    memos.generate_memo(created['job_id'],created['id'])
+        self.assertEqual(call.call_count,1)
         self.assertEqual(self.get(created)['status'],'running')
         self.assertEqual(db.mark_unfinished_jobs_interrupted(),1)
         version = self.get(created)
         self.assertEqual(version['status'],'interrupted')
-        self.assertEqual(version['error_code'],'external_outcome_unknown')
+        self.assertEqual(version['error_code'],'result_persistence_interrupted')
         self.assertEqual(db.get_job(created['job_id'])['status'],'interrupted')
-        self.assertIn('可能已产生一次费用',version['error_message'])
+        self.assertIn('响应已记录',version['error_message'])
         self.assertEqual(db.mark_unfinished_jobs_interrupted(),0)
         self.assertEqual(memos.generate_memo(created['job_id'],created['id'])['status'],'skipped')
 

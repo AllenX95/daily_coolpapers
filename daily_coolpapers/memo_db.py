@@ -45,6 +45,7 @@ def init_schema(conn):
             result_json TEXT, rendered_markdown TEXT, raw_output TEXT,
             personal_judgment_markdown TEXT NOT NULL DEFAULT '', personal_judgment_updated_at TEXT,
             error_code TEXT, error_message TEXT, provider_started INTEGER NOT NULL DEFAULT 0,
+            call_operation_id TEXT,
             created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
             UNIQUE(series_id,version_no),
             CHECK(status!='success' OR (result_json IS NOT NULL AND rendered_markdown IS NOT NULL))
@@ -104,6 +105,14 @@ def init_schema(conn):
           OR (OLD.status='success' AND OLD.provider_started IS NOT NEW.provider_started)
         BEGIN SELECT RAISE(ABORT,'memo_config_reference_immutable'); END;
     ''')
+    version_columns = {row['name'] for row in conn.execute('PRAGMA table_info(investment_memo_versions)')}
+    if 'call_operation_id' not in version_columns:
+        conn.execute('ALTER TABLE investment_memo_versions ADD COLUMN call_operation_id TEXT')
+    # Short-lived paginated selection drafts live in their own module/table;
+    # keep this hook here so the existing database initialization remains the
+    # single schema entry point without coupling memo_db to draft behavior.
+    from . import memo_drafts
+    memo_drafts.init_schema(conn)
 
 
 def series_row(conn,series_id,*,active=False):
@@ -321,9 +330,9 @@ def start_generation(version_id,job_id):
         return dict(row)
 
 
-def mark_provider_started(version_id):
+def mark_provider_started(version_id, operation_id=None):
     with db.connect() as conn:
-        changed = conn.execute("UPDATE investment_memo_versions SET provider_started=1 WHERE id=? AND status='running' AND provider_started=0",(version_id,)).rowcount
+        changed = conn.execute("UPDATE investment_memo_versions SET provider_started=1,call_operation_id=? WHERE id=? AND status='running' AND provider_started=0",(operation_id,version_id)).rowcount
         if changed!=1:
             raise MemoConflictError('版本不处于可调用状态；不会重复请求模型')
 
@@ -336,11 +345,12 @@ def finish_generation(version_id,*,result=None,markdown=None,raw_output=None,err
             raise MemoConflictError('版本已结束或不存在，不能覆盖 AI 结果')
         status = 'success' if result is not None else 'failed'
         now = db.now_iso()
-        usage = usage if isinstance(usage,dict) else {}
+        from .call_attempts import normalize_usage
+        usage = normalize_usage(usage) or {}
         tokens = {}
         for key,alias in [('input_tokens','prompt_tokens'),('output_tokens','completion_tokens')]:
             value = usage.get(key,usage.get(alias))
-            tokens[key] = max(0,int(value)) if isinstance(value,(int,float)) and not isinstance(value,bool) else None
+            tokens[key] = value if isinstance(value,int) and not isinstance(value,bool) else None
         conn.execute('''UPDATE investment_memo_versions SET status=?,result_json=?,rendered_markdown=?,raw_output=?,
             input_tokens=?,output_tokens=?,error_code=?,error_message=?,finished_at=? WHERE id=?''',
             (status,json.dumps(result,ensure_ascii=False) if result is not None else None,markdown if result is not None else None,
@@ -354,6 +364,8 @@ def finish_generation(version_id,*,result=None,markdown=None,raw_output=None,err
             (status,now,error_message,'备忘录已生成' if status=='success' else '备忘录生成失败，未自动重试',
              json.dumps({'phase':'investment_memo',**metrics},ensure_ascii=False),version['job_id']))
         conn.execute('UPDATE investment_memo_series SET updated_at=? WHERE id=?',(now,version['series_id']))
+        from .call_attempts import associate_current_attempts
+        associate_current_attempts(conn, memo_version_id=version_id)
         db._insert_job_event(conn,db._normalize_job_event(version['job_id'],f'memo:{version_id}:finished','investment_memo',
             'investment_memo.generation_succeeded' if status=='success' else 'investment_memo.generation_failed',
             level='info' if status=='success' else 'error',metrics=metrics,error_code=error_code,message=error_message or '备忘录生成完成'))
@@ -377,9 +389,25 @@ def recover_versions(conn,job_ids=None):
             conn.execute('UPDATE jobs SET status=?,finished_at=COALESCE(?,?),error_message=? WHERE id=?',
                          (version['status'],version['finished_at'],now,version['error_message'],version['job_id']))
             continue
-        code = 'external_outcome_unknown' if version['provider_started'] else 'memo_interrupted'
+        latest_attempt = None
+        if version['call_operation_id']:
+            latest_attempt = conn.execute('''SELECT id,status FROM llm_call_attempts
+                WHERE operation_id=? ORDER BY business_attempt_no DESC,attempt_no DESC LIMIT 1''',
+                (version['call_operation_id'],)).fetchone()
+        if latest_attempt and latest_attempt['status'] == 'external_outcome_unknown':
+            code = 'external_outcome_unknown'
+            message = '调用结果未知，可能已产生一次费用；请重新确认后创建新版本。'
+        elif latest_attempt and latest_attempt['status'] in {'succeeded','failed'}:
+            code = 'result_persistence_interrupted'
+            message = 'Provider 响应已记录，但业务结果未完成；请重新确认后创建新版本。'
+        elif version['provider_started'] and not version['call_operation_id']:
+            # Legacy versions only had a coarse provider_started marker.
+            code = 'external_outcome_unknown'
+            message = '调用结果未知，可能已产生一次费用；请重新确认后创建新版本。'
+        else:
+            code = 'memo_interrupted'
+            message = '服务中断，未自动续跑；请重新确认并创建新版本。'
         interrupted += int(version['job_status'] in {'pending','running'})
-        message = '调用结果未知，可能已产生一次费用；请重新确认后创建新版本。' if version['provider_started'] else '服务中断，未自动续跑；请重新确认并创建新版本。'
         conn.execute("UPDATE investment_memo_versions SET status='interrupted',error_code=?,error_message=?,finished_at=? WHERE id=?",(code,message,now,version['id']))
         conn.execute("UPDATE jobs SET status='interrupted',error_message=?,finished_at=? WHERE id=?",(message,now,version['job_id']))
         if version['job_id']:

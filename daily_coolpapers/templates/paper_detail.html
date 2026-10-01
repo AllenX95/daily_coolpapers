@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ paper.title }}{% endblock %}
 {% block content %}
+{% macro collection_context_fields() -%}
+  {% if collection_context %}
+    {% for key in ('collection', 'theme_id', 'decision', 'sort', 'page', 'page_size') %}
+      {% if collection_context.get(key) is not none %}<input type="hidden" name="{{ 'return_decision' if key == 'decision' else key }}" value="{{ collection_context.get(key) }}">{% endif %}
+    {% endfor %}
+  {% endif %}
+{%- endmacro %}
 <div class="paper-detail-page">
 <section class="detail-head">
   <div>
@@ -18,6 +25,7 @@
     {% set abs_url = paper.abs_url|safe_arxiv_url %}
     {% if abs_url %}<a class="button secondary" href="{{ abs_url }}" target="_blank" rel="noopener noreferrer">打开 arXiv</a>{% endif %}
     <a class="button secondary" href="{{ url_for('export_paper_markdown', paper_id=paper.id) }}">导出评估</a>
+    {% if collection_return_url %}<a class="button secondary" href="{{ collection_return_url }}">返回当前列表</a>{% endif %}
   </div>
 </section>
 
@@ -41,6 +49,7 @@
       <form method="post" action="{{ action.action_url }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="from_detail" value="1">
+        {{ collection_context_fields() }}
         <label>{{ action.title }}
           <select name="prompt_id">
             {% for option in action.prompt_options %}
@@ -129,6 +138,7 @@
       {% for message in get_flashed_messages(category_filter=['decision']) %}<p class="decision-feedback" role="status">{{ message }}</p>{% endfor %}
       <form method="post" action="{{ url_for('save_paper_decision', paper_id=paper.id) }}" class="decision-actions">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {{ collection_context_fields() }}
         <button type="submit" name="decision" value="favorite" aria-pressed="{{ 'true' if personal_decision.decision == 'favorite' else 'false' }}" class="{{ 'selected' if personal_decision.decision == 'favorite' else 'secondary' }}">{{ '已收藏' if personal_decision.decision == 'favorite' else '收藏' }}</button>
         <button type="submit" name="decision" value="skipped" aria-pressed="{{ 'true' if personal_decision.decision == 'skipped' else 'false' }}" class="secondary {{ 'selected' if personal_decision.decision == 'skipped' else '' }}">{{ '已跳过' if personal_decision.decision == 'skipped' else '跳过' }}</button>
         {% if personal_decision.decision != 'undecided' %}<button type="submit" name="decision" value="clear" class="secondary">{{ '取消收藏，恢复未处理' if personal_decision.decision == 'favorite' else '恢复未处理' }}</button>{% endif %}
@@ -142,6 +152,7 @@
 
 <section id="evaluations">
   <h2>评估历史</h2>
+  {% include 'partials/llm_call_details.html' %}
   {% for evaluation in evaluation_results.history %}
     <article class="eval-block">
       <header>

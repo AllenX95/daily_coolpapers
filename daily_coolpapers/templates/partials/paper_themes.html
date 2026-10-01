@@ -11,6 +11,7 @@
         <li><a class="theme-tag {{ theme.status }}" href="{{ url_for('investment_theme_papers', theme_id=theme.id) }}">{{ theme.name }}{% if theme.status == 'archived' %} · 已归档{% endif %}</a>
           <form method="post" action="{{ url_for('remove_paper_investment_theme', paper_id=paper.id, theme_id=theme.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            {% if collection_context %}{% for key in ('collection', 'theme_id', 'decision', 'sort', 'page', 'page_size') %}{% if collection_context.get(key) is not none %}<input type="hidden" name="{{ 'return_decision' if key == 'decision' else key }}" value="{{ collection_context.get(key) }}">{% endif %}{% endfor %}{% endif %}
             <button type="submit" class="secondary" aria-label="从论文移除主题：{{ theme.name }}">从论文移除</button>
           </form>
         </li>
@@ -20,6 +21,7 @@
   {% if paper_themes.active %}
     <form method="post" action="{{ url_for('save_paper_investment_themes', paper_id=paper.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if collection_context %}{% for key in ('collection', 'theme_id', 'decision', 'sort', 'page', 'page_size') %}{% if collection_context.get(key) is not none %}<input type="hidden" name="{{ 'return_decision' if key == 'decision' else key }}" value="{{ collection_context.get(key) }}">{% endif %}{% endfor %}{% endif %}
       <fieldset class="theme-picker"><legend>选择活跃主题（可多选）</legend>
         {% for theme in paper_themes.active %}
           <label class="theme-choice"><input type="checkbox" name="theme_ids" value="{{ theme.id }}" {% if theme.selected %}checked{% endif %}>

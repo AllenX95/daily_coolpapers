@@ -2,12 +2,13 @@
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from datetime import date
 from uuid import uuid4
 from time import perf_counter
 
-from . import db, memo_db
+from . import call_attempts, db, memo_db, memo_candidates, memo_drafts
 from . import services
 from .llm import LLMError
 from .form_commands import FormValidationError, parse_bool, parse_choice, parse_int, research_text
@@ -19,6 +20,13 @@ from .services import PROFILE_SNAPSHOT_FIELDS, _profile_binding
 
 def optional_id(value,field):
     return parse_int(value,field,minimum=1,maximum=2**63-1) if value not in (None,'') else None
+
+
+def _validate_idempotency_key(key):
+    """Validate only the repeat key before draft idempotency lookup."""
+
+    if not isinstance(key,str) or not key or not re.fullmatch(r'[A-Za-z0-9_-]{16,128}',key):
+        raise FormValidationError({'idempotency_key':'提交标识无效，请刷新确认页'})
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,9 @@ class MemoRequest:
     previous_version_id: int | None = None
     copy_judgment: bool = False
     idempotency_key: str = ''
+    # Only command() may attach this read-time snapshot.  It is intentionally
+    # absent from from_form so a browser cannot submit or forge a guard.
+    draft_guard: memo_drafts.DraftGuard | None = None
 
     @classmethod
     def from_form(cls,form,*,require_papers=True,creating=False):
@@ -87,7 +98,96 @@ def validate_command(command,*,creating=False):
         fields['series_id']=command.series_id
     else:
         fields.update(title=command.title,source_mode=command.source_mode,source_id=command.source_id)
-    return MemoRequest.from_form(fields,creating=creating)
+    validated = MemoRequest.from_form(fields,creating=creating)
+    validated = replace(validated,draft_guard=command.draft_guard)
+    _validate_guard_command_fields(validated)
+    return validated
+
+
+def _draft_command_context(context):
+    """Extract command fields from the compact context saved by the UI."""
+
+    if not isinstance(context,dict):
+        raise memo_db.MemoConflictError('草稿上下文无效，请重新打开选择页面')
+    fields = context.get('command',context)
+    if not isinstance(fields,dict):
+        raise memo_db.MemoConflictError('草稿命令字段无效，请重新打开选择页面')
+    series_id = fields.get('series_id',context.get('series_id'))
+    mode = fields.get('source_mode',context.get('source_mode'))
+    if mode is None:
+        mode = '' if series_id not in (None,'') else 'manual'
+    source_id = fields.get('source_id',context.get('source_id'))
+    if source_id in ('',None):
+        source_id = None
+    return {
+        'title': fields.get('title',context.get('title','')) or '',
+        'source_mode': mode,
+        'source_id': source_id,
+        'prompt_id': fields.get('prompt_id',context.get('prompt_id')),
+        'profile_id': fields.get('profile_id',context.get('profile_id')),
+        'series_id': series_id,
+        'previous_version_id': fields.get('previous_version_id',context.get('previous_version_id')),
+        'copy_judgment': fields.get('copy_judgment',context.get('copy_judgment',False)),
+    }
+
+
+def _validate_guard_command_fields(command):
+    """Ensure a browser command still describes the draft snapshot it guards."""
+
+    guard = command.draft_guard
+    if guard is None:
+        return
+    fields = _draft_command_context(guard.context)
+    expected = MemoRequest(
+        fields['title'],fields['source_mode'],optional_id(fields['source_id'],'source_id'),
+        list(guard.paper_ids),optional_id(fields['prompt_id'],'prompt_id'),
+        optional_id(fields['profile_id'],'profile_id'),optional_id(fields['series_id'],'series_id'),
+        optional_id(fields['previous_version_id'],'previous_version_id'),bool(fields['copy_judgment']),
+        command.idempotency_key,
+    )
+    actual = replace(command,draft_guard=None)
+    if actual != expected:
+        raise memo_db.MemoConflictError('确认命令与预览时的草稿上下文不一致，请刷新后重试')
+
+
+def command(owner,token,expected_version,*,idempotency_key='',check_version=True):
+    """Build a memo request from a draft and retain its optimistic guard.
+
+    ``check_version=False`` is used only by confirmation: it permits the
+    caller to inspect the current draft even when an idempotency key already
+    produced a version.  A new version still rechecks the requested version
+    and the complete selected set inside create_memo_version's write
+    transaction.
+    """
+
+    try:
+        requested_version = int(expected_version)
+    except (TypeError,ValueError,OverflowError) as exc:
+        raise memo_db.MemoConflictError('草稿版本无效，请刷新后重试') from exc
+    if requested_version < 1:
+        raise memo_db.MemoConflictError('草稿版本无效，请刷新后重试')
+    with db.connect() as conn:
+        conn.execute('BEGIN')
+        draft = memo_drafts.read(
+            conn,token,owner,
+            version=requested_version if check_version else None,
+            include_ids=True,
+        )
+    fields = _draft_command_context(draft['context'])
+    guard = memo_drafts.DraftGuard(
+        token=draft['token'],
+        owner=owner,
+        expected_version=requested_version,
+        context=draft['context'],
+        paper_ids=tuple(draft['paper_ids']),
+    )
+    return MemoRequest(
+        fields['title'],fields['source_mode'],optional_id(fields['source_id'],'source_id'),
+        list(draft['paper_ids']),optional_id(fields['prompt_id'],'prompt_id'),
+        optional_id(fields['profile_id'],'profile_id'),optional_id(fields['series_id'],'series_id'),
+        optional_id(fields['previous_version_id'],'previous_version_id'),
+        bool(fields['copy_judgment']),idempotency_key,guard,
+    )
 
 
 def resolve_memo_config(prompt_id=None,profile_id=None):
@@ -151,12 +251,26 @@ def parse_candidate_filters(values):
     return filters
 
 
-def candidate_page(command,filters):
+def candidate_page(command,filters,page=None):
     with db.connect() as conn:
         conn.execute('BEGIN')
         series,source = source_for_request(conn,command)
-        candidates,counts = memo_db.candidate_data(conn,source,filters)
-    return {'series':series,'source':source,'candidates':candidates,'counts':counts}
+        if page is None:
+            candidates,counts = memo_db.candidate_data(conn,source,filters)
+            return {'series':series,'source':source,'candidates':candidates,'counts':counts}
+        try:
+            page_number = int(page)
+        except (TypeError,ValueError,OverflowError) as exc:
+            raise FormValidationError({'page':'页码无效'}) from exc
+        try:
+            page_size = int(filters.get('page_size',30))
+        except (TypeError,ValueError,OverflowError) as exc:
+            raise FormValidationError({'page_size':'每页数量无效'}) from exc
+        page_filters = {key:value for key,value in filters.items() if key not in {'page','page_size'}}
+        page_data = memo_candidates.page_data(
+            conn,source,page_filters,page=page_number,page_size=page_size,
+        )
+        return {'series':series,'source':source,**page_data}
 
 
 def preview_memo(command):
@@ -164,11 +278,24 @@ def preview_memo(command):
     config = resolve_memo_config(command.prompt_id,command.profile_id)
     with db.connect() as conn:
         conn.execute('BEGIN')
+        _validate_guard_command_fields(command)
+        memo_drafts.verify_guard(conn,command.draft_guard,paper_ids=command.paper_ids)
         prepared = prepared_input(conn,command,config)
     return {**prepared,'config':config,'idempotency_key':command.idempotency_key or uuid4().hex}
 
 
 def create_memo_version(command):
+    # Confirmation may arrive after another tab cleared the draft.  Keep the
+    # idempotency fast path ahead of the non-empty-paper validation so a repeat
+    # of an already committed key still returns its original version.  The
+    # command() factory has already authenticated the draft owner/token.
+    if command.draft_guard is not None:
+        _validate_idempotency_key(command.idempotency_key)
+        with db.connect() as conn:
+            memo_drafts.verify_owner(conn,command.draft_guard)
+            existing = conn.execute('SELECT id,series_id,job_id FROM investment_memo_versions WHERE idempotency_key=?',(command.idempotency_key,)).fetchone()
+        if existing:
+            return {**dict(existing),'created':False}
     command = validate_command(command,creating=True)
     # Resolve cross-database configuration outside the main DB write lock.
     # A repeated key returns the original result even if current eligibility changed.
@@ -182,6 +309,8 @@ def create_memo_version(command):
         existing = conn.execute('SELECT id,series_id,job_id FROM investment_memo_versions WHERE idempotency_key=?',(command.idempotency_key,)).fetchone()
         if existing:
             return {**dict(existing),'created':False}
+        _validate_guard_command_fields(command)
+        memo_drafts.verify_guard(conn,command.draft_guard,paper_ids=command.paper_ids)
         prepared = prepared_input(conn,command,config)
         series = prepared['series']
         previous = None
@@ -226,6 +355,39 @@ def create_memo_version(command):
 
 
 def new_version_editor(series_id,version_id,filters):
+    if filters.get('page') is not None or filters.get('page_size') is not None:
+        with db.connect() as conn:
+            conn.execute('BEGIN')
+            series = memo_db.series_row(conn,series_id)
+            previous_row = conn.execute('''SELECT id,prompt_id,profile_id
+                FROM investment_memo_versions WHERE id=? AND series_id=?''',(version_id,series_id)).fetchone()
+            if not previous_row:
+                raise memo_db.MemoNotFoundError('此系列中不存在该备忘录版本')
+            old_rows = [dict(row) for row in conn.execute('''SELECT paper_id,
+                json_extract(paper_snapshot_json,'$.paper.title') AS snapshot_title,
+                display_order FROM investment_memo_version_papers
+                WHERE memo_version_id=? ORDER BY display_order''',(version_id,))]
+            old_ids = [int(row['paper_id']) for row in old_rows if row['paper_id'] is not None]
+            eligible_ids = memo_candidates.eligible_ids(conn,old_ids)
+        command = MemoRequest(
+            '','',None,[],previous_row['prompt_id'],previous_row['profile_id'],
+            series_id,version_id,
+        )
+        model = candidate_page(command,filters,page=filters.get('page',1))
+        selected_ids = [paper_id for paper_id in old_ids if paper_id in eligible_ids]
+        omitted = [
+            row['snapshot_title'] or f"论文 #{row['paper_id']}"
+            for row in old_rows
+            if row['paper_id'] is None or int(row['paper_id']) not in eligible_ids
+        ]
+        return {
+            **model,
+            'command':command,
+            'selected_ids':selected_ids,
+            'selected_orders':{paper_id:index+1 for index,paper_id in enumerate(selected_ids)},
+            'omitted_papers':omitted,
+            'previous_version':dict(previous_row),
+        }
     series,previous,papers = memo_db.get_version(series_id,version_id)
     command = MemoRequest('','',None,[],previous['prompt_id'],previous['profile_id'],series_id,version_id)
     model = candidate_page(command,filters)
@@ -277,31 +439,40 @@ def generate_memo(job_id,version_id):
     if version is None:
         return {'status':'skipped','version_id':version_id}
     started,response = perf_counter(),None
-    try:
-        profile = db.get_llm_profile(version['profile_id'])
-        snapshot = json.loads(version['input_snapshot_json'])
-        if not profile or not profile['enabled'] or _profile_binding(profile)!=snapshot['profile_binding']:
-            raise MemoOutputError('memo_config_invalid')
-        profile = {**profile,**json.loads(version['profile_snapshot_json'])}
-        estimated = estimate_tokens(profile['system_prompt']+'\n'+version['prompt_snapshot'])
-        if estimated+int(profile['max_output_tokens'])>int(profile['context_window_tokens']):
-            raise MemoOutputError('memo_context_exceeded')
-        with services.make_llm_client(profile) as client:
-            memo_db.mark_provider_started(version_id)
-            response = services.call_llm(profile,version['prompt_snapshot'],client=client)
-        result = validate_memo_result(response.result_json,snapshot['papers'])
-        markdown = render_memo_markdown(result)+'\n'+render_evidence_markdown(result['evidence_index'])
-        return memo_db.finish_generation(version_id,result=result,markdown=markdown,raw_output=response.raw_text,
-            usage=getattr(response,'usage',None),duration_ms=round((perf_counter()-started)*1000))
-    except Exception as exc:
-        if isinstance(exc,MemoOutputError):
-            code = exc.code
-        elif isinstance(exc,sqlite3.DatabaseError):
-            code = 'memo_database_error'
-        elif isinstance(exc,LLMError):
-            code = 'memo_auth_error' if getattr(exc,'status_code',None) in {401,403} else ('memo_transport_error' if exc.code=='transport_error' else 'memo_provider_error')
-        else:
-            code = 'memo_generation_error'
-        return memo_db.finish_generation(version_id,error_code=code,error_message=MEMO_ERRORS[code],
-            raw_output=response.raw_text if response else None,usage=getattr(response,'usage',None),
-            duration_ms=round((perf_counter()-started)*1000))
+    with ExitStack() as stack:
+        try:
+            profile = db.get_llm_profile(version['profile_id'])
+            snapshot = json.loads(version['input_snapshot_json'])
+            if not profile or not profile['enabled'] or _profile_binding(profile)!=snapshot['profile_binding']:
+                raise MemoOutputError('memo_config_invalid')
+            profile = {**profile,**json.loads(version['profile_snapshot_json'])}
+            estimated = estimate_tokens(profile['system_prompt']+'\n'+version['prompt_snapshot'])
+            if estimated+int(profile['max_output_tokens'])>int(profile['context_window_tokens']):
+                raise MemoOutputError('memo_context_exceeded')
+            stack.enter_context(call_attempts.operation_context(
+                'investment_memo', job_id=job_id, memo_version_id=version_id,
+                evaluation_type='investment_memo', prompt_id=version['prompt_id'],
+                prompt_version=snapshot.get('prompt_config',{}).get('version'),
+                profile_id=version['profile_id'], model=version['model'],
+                input_schema_version=SCHEMA_VERSION, output_schema_version=SCHEMA_VERSION,
+            ))
+            stack.enter_context(call_attempts.business_attempt())
+            with services.make_llm_client(profile) as client:
+                memo_db.mark_provider_started(version_id, call_attempts.current_operation_id())
+                response = services.call_llm(profile,version['prompt_snapshot'],client=client)
+            result = validate_memo_result(response.result_json,snapshot['papers'])
+            markdown = render_memo_markdown(result)+'\n'+render_evidence_markdown(result['evidence_index'])
+            return memo_db.finish_generation(version_id,result=result,markdown=markdown,raw_output=response.raw_text,
+                usage=getattr(response,'usage',None),duration_ms=round((perf_counter()-started)*1000))
+        except Exception as exc:
+            if isinstance(exc,MemoOutputError):
+                code = exc.code
+            elif isinstance(exc,sqlite3.DatabaseError):
+                code = 'memo_database_error'
+            elif isinstance(exc,LLMError):
+                code = 'memo_auth_error' if getattr(exc,'status_code',None) in {401,403} else ('memo_transport_error' if exc.code=='transport_error' else 'memo_provider_error')
+            else:
+                code = 'memo_generation_error'
+            return memo_db.finish_generation(version_id,error_code=code,error_message=MEMO_ERRORS[code],
+                raw_output=response.raw_text if response else None,usage=getattr(response,'usage',None),
+                duration_ms=round((perf_counter()-started)*1000))

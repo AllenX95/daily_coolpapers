@@ -77,6 +77,8 @@ start_daily_coolpapers.bat
 
 脚本会启动本地服务并自动打开浏览器。如果服务已在运行，则只打开网页。
 
+同一数据工作区只允许一个运行实例。直接重复启动会提示并退出；启动脚本不会自动关闭已有服务。启动诊断按每次尝试保存在 Windows 临时目录的 `daily-coolpapers-startup-*` 下，具体路径会打印在启动窗口中；应用日志仍保存在 `logs/current.log`。
+
 ### 手动启动
 
 ```bash
