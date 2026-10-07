@@ -1,0 +1,619 @@
+{
+  "measured_at": "2026-10-07T05:15:51.262550+00:00",
+  "python": "3.12.2",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "sqlite": "3.43.1",
+  "scope": "Real application pipeline + isolated SQLite + synthetic HTTP/LLM. No paid model calls.",
+  "limits": [
+    "Single run per case, not repeated statistical trials.",
+    "Synthetic matching/output/token counts; no model-quality or provider-quota measurement.",
+    "Mock delays are unscaled wall-clock sleeps, not real provider latency.",
+    "No historical database, active runtime, interactive job, or catch-up workload."
+  ],
+  "source_sha256": {
+    "tests\\benchmark_pipeline.py": "05f4bb67b49b0e86288d2127a4d013a590fbb2a9599681b186ee060d4c660025",
+    "daily_coolpapers\\services.py": "208370c72e1e850212e8917ac2c6dfcfdd1794e30731bf2e5cf0391218a5d086",
+    "daily_coolpapers\\crawler.py": "2335a669cca402e304dd9cb1b67dfcc7898076d4bf70710b22ec14d8ed800203",
+    "daily_coolpapers\\db.py": "a6450a772b8994988fbe738e4c06bf0c9415df5703f2cfe5a1e1df96d8bccabc",
+    "daily_coolpapers\\jobs.py": "540eaa840511f631ddc4b08c2c206b9065b26efff9d4cb4cc0013cf7deb845a3",
+    "daily_coolpapers\\llm.py": "e3e164b08eb19597b79100002535588e7e1914d50fc2cb022a49b952be9c963e",
+    "daily_coolpapers\\call_attempts.py": "d7c3fcc8accfc38fbb681eafbd46430a153a38d8e1b7ea10a118f8a41354fb0c"
+  },
+  "offline": [
+    {
+      "name": "local_overhead",
+      "concurrency": 4,
+      "unique_papers": 1500,
+      "category_appearances": 2119,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0,
+        "abstract": 0
+      },
+      "retry_every": 0,
+      "job_status": "success",
+      "wall_seconds": 62.56,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 1036.785,
+          "p50_ms": 6.043,
+          "p95_ms": 260.922,
+          "max_ms": 279.247
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 461.865,
+          "p50_ms": 9.701,
+          "p95_ms": 182.927,
+          "max_ms": 182.927
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 1765.179,
+          "p50_ms": 1765.179,
+          "p95_ms": 1765.179,
+          "max_ms": 1765.179
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 1500,
+          "sum_ms": 81.834,
+          "p50_ms": 0.045,
+          "p95_ms": 0.078,
+          "max_ms": 1.354
+        },
+        "abstract": {
+          "count": 300,
+          "sum_ms": 17.543,
+          "p50_ms": 0.049,
+          "p95_ms": 0.077,
+          "max_ms": 0.461
+        }
+      },
+      "max_simultaneous_mock_requests": 1,
+      "mock_429_count": 0,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 1500,
+        "paper_categories": 2119,
+        "evaluations": 1800,
+        "job_events": 3666,
+        "llm_call_attempts": 1800
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 0,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 300,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 0,
+        "call_success": 1500,
+        "calls": 1500,
+        "candidate_count": 1500,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 48113,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 750000,
+        "matched": 300,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 225000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "status": "success",
+        "success": 1500,
+        "unmatched": 1200
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 300,
+        "duration_ms": 12607,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "success": 300,
+        "terminal_failed": 0,
+        "unique_count": 300
+      },
+      "checks_passed": true,
+      "same_day_repeat": {
+        "wall_seconds": 11.037,
+        "new_llm_requests": 0,
+        "status": "success"
+      }
+    },
+    {
+      "name": "delayed_c4",
+      "concurrency": 4,
+      "unique_papers": 1500,
+      "category_appearances": 2119,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0.2,
+        "abstract": 1
+      },
+      "retry_every": 0,
+      "job_status": "success",
+      "wall_seconds": 207.432,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 1134.756,
+          "p50_ms": 1.493,
+          "p95_ms": 276.208,
+          "max_ms": 329.926
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 497.433,
+          "p50_ms": 20.626,
+          "p95_ms": 297.702,
+          "max_ms": 297.702
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 1802.8,
+          "p50_ms": 1802.8,
+          "p95_ms": 1802.8,
+          "max_ms": 1802.8
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 1500,
+          "sum_ms": 300654.093,
+          "p50_ms": 200.412,
+          "p95_ms": 200.659,
+          "max_ms": 240.523
+        },
+        "abstract": {
+          "count": 300,
+          "sum_ms": 300133.735,
+          "p50_ms": 1000.433,
+          "p95_ms": 1000.685,
+          "max_ms": 1001.37
+        }
+      },
+      "max_simultaneous_mock_requests": 4,
+      "mock_429_count": 0,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 1500,
+        "paper_categories": 2119,
+        "evaluations": 1800,
+        "job_events": 3666,
+        "llm_call_attempts": 1800
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 0,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 300,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 0,
+        "call_success": 1500,
+        "calls": 1500,
+        "candidate_count": 1500,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 122851,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 750000,
+        "matched": 300,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 225000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "status": "success",
+        "success": 1500,
+        "unmatched": 1200
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 300,
+        "duration_ms": 82590,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "success": 300,
+        "terminal_failed": 0,
+        "unique_count": 300
+      },
+      "checks_passed": true
+    },
+    {
+      "name": "delayed_c8",
+      "concurrency": 8,
+      "unique_papers": 1500,
+      "category_appearances": 2119,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0.2,
+        "abstract": 1
+      },
+      "retry_every": 0,
+      "job_status": "success",
+      "wall_seconds": 118.693,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 1470.139,
+          "p50_ms": 2.015,
+          "p95_ms": 333.053,
+          "max_ms": 372.623
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 206.923,
+          "p50_ms": 11.466,
+          "p95_ms": 59.396,
+          "max_ms": 59.396
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 2111.205,
+          "p50_ms": 2111.205,
+          "p95_ms": 2111.205,
+          "max_ms": 2111.205
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 1500,
+          "sum_ms": 300601.124,
+          "p50_ms": 200.389,
+          "p95_ms": 200.691,
+          "max_ms": 201.297
+        },
+        "abstract": {
+          "count": 300,
+          "sum_ms": 300129.309,
+          "p50_ms": 1000.424,
+          "p95_ms": 1000.714,
+          "max_ms": 1001.182
+        }
+      },
+      "max_simultaneous_mock_requests": 8,
+      "mock_429_count": 0,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 1500,
+        "paper_categories": 2119,
+        "evaluations": 1800,
+        "job_events": 3666,
+        "llm_call_attempts": 1800
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 0,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 300,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 0,
+        "call_success": 1500,
+        "calls": 1500,
+        "candidate_count": 1500,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 74318,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 750000,
+        "matched": 300,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 225000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "status": "success",
+        "success": 1500,
+        "unmatched": 1200
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 300,
+        "duration_ms": 42171,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "success": 300,
+        "terminal_failed": 0,
+        "unique_count": 300
+      },
+      "checks_passed": true
+    },
+    {
+      "name": "delayed_c12",
+      "concurrency": 12,
+      "unique_papers": 1500,
+      "category_appearances": 2119,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0.2,
+        "abstract": 1
+      },
+      "retry_every": 0,
+      "job_status": "success",
+      "wall_seconds": 83.511,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 1064.413,
+          "p50_ms": 1.699,
+          "p95_ms": 259.595,
+          "max_ms": 290.172
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 174.378,
+          "p50_ms": 9.758,
+          "p95_ms": 55.38,
+          "max_ms": 55.38
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 1560.109,
+          "p50_ms": 1560.109,
+          "p95_ms": 1560.109,
+          "max_ms": 1560.109
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 1500,
+          "sum_ms": 300595.599,
+          "p50_ms": 200.379,
+          "p95_ms": 200.675,
+          "max_ms": 207.116
+        },
+        "abstract": {
+          "count": 300,
+          "sum_ms": 300127.297,
+          "p50_ms": 1000.421,
+          "p95_ms": 1000.68,
+          "max_ms": 1001.222
+        }
+      },
+      "max_simultaneous_mock_requests": 12,
+      "mock_429_count": 0,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 1500,
+        "paper_categories": 2119,
+        "evaluations": 1800,
+        "job_events": 3666,
+        "llm_call_attempts": 1800
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 0,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 300,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 0,
+        "call_success": 1500,
+        "calls": 1500,
+        "candidate_count": 1500,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 53708,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 750000,
+        "matched": 300,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 225000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "status": "success",
+        "success": 1500,
+        "unmatched": 1200
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 300,
+        "duration_ms": 28169,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "success": 300,
+        "terminal_failed": 0,
+        "unique_count": 300
+      },
+      "checks_passed": true
+    },
+    {
+      "name": "retry_c4",
+      "concurrency": 4,
+      "unique_papers": 1500,
+      "category_appearances": 2119,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0.2,
+        "abstract": 1
+      },
+      "retry_every": 50,
+      "job_status": "success",
+      "wall_seconds": 224.37,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 1188.528,
+          "p50_ms": 1.407,
+          "p95_ms": 317.248,
+          "max_ms": 326.992
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 150.474,
+          "p50_ms": 13.29,
+          "p95_ms": 26.922,
+          "max_ms": 26.922
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 1675.358,
+          "p50_ms": 1675.358,
+          "p95_ms": 1675.358,
+          "max_ms": 1675.358
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 1530,
+          "sum_ms": 306644.247,
+          "p50_ms": 200.421,
+          "p95_ms": 200.687,
+          "max_ms": 201.37
+        },
+        "abstract": {
+          "count": 330,
+          "sum_ms": 330146.131,
+          "p50_ms": 1000.445,
+          "p95_ms": 1000.697,
+          "max_ms": 1001.037
+        }
+      },
+      "max_simultaneous_mock_requests": 4,
+      "mock_429_count": 60,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 1500,
+        "paper_categories": 2119,
+        "evaluations": 1860,
+        "job_events": 3786,
+        "llm_call_attempts": 1860
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 60,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 300,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 30,
+        "call_success": 1500,
+        "calls": 1530,
+        "candidate_count": 1500,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 120206,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 750000,
+        "matched": 300,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 225000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 30,
+        "status": "success",
+        "success": 1500,
+        "unmatched": 1200
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 300,
+        "duration_ms": 102419,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 30,
+        "success": 300,
+        "terminal_failed": 0,
+        "unique_count": 300
+      },
+      "checks_passed": true
+    }
+  ],
+  "post_run_validation": {
+    "passed": true,
+    "actual_delayed_concurrency": [
+      4,
+      8,
+      12
+    ],
+    "recovered_429_count": 60,
+    "classification_retry_count": 30,
+    "abstract_retry_count": 30,
+    "retry_physical_requests_and_ledger_rows": 1860,
+    "source_hashes_match": true,
+    "regression_tests": 61,
+    "regression_result": "OK"
+  }
+}

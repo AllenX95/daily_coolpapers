@@ -1,0 +1,145 @@
+{
+  "measured_at": "2026-10-07T06:17:24.944920+00:00",
+  "python": "3.12.2",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "sqlite": "3.43.1",
+  "scope": "Real application pipeline + isolated SQLite + synthetic HTTP/LLM. No paid model calls.",
+  "limits": [
+    "Single run per case, not repeated statistical trials.",
+    "Synthetic matching/output/token counts; no model-quality or provider-quota measurement.",
+    "Mock delays are unscaled wall-clock sleeps, not real provider latency.",
+    "No historical database, active runtime, interactive job, or catch-up workload."
+  ],
+  "source_sha256": {
+    "tests\\benchmark_pipeline.py": "2c7061d206a7ece6ccd3e1f11f1e2b36b9d91f06e41168d8d3edfa9f11d482e8",
+    "daily_coolpapers\\services.py": "3f300d0cd82f21347e694fd617402b0aa211dbd157277f93cb7a8d02cafcac70",
+    "daily_coolpapers\\crawler.py": "2335a669cca402e304dd9cb1b67dfcc7898076d4bf70710b22ec14d8ed800203",
+    "daily_coolpapers\\db.py": "a6450a772b8994988fbe738e4c06bf0c9415df5703f2cfe5a1e1df96d8bccabc",
+    "daily_coolpapers\\jobs.py": "6771f8009960c15313a57255e8c5e7ca30ab0e41e6fdf6572e0a9652793dd693",
+    "daily_coolpapers\\llm.py": "807def391b694d5cb950f8347f437aed34fd3bc20b1cdeb617e3f2bb62de4b8b",
+    "daily_coolpapers\\llm_concurrency.py": "36bf90828aac50dded00414e0a8a32c5ae0c141e58181044e786db23d936fbe0",
+    "daily_coolpapers\\call_attempts.py": "13e03d0573f28476e882e7f95afc904a91d0a0e18d172b87fd83f399c73c1f6c"
+  },
+  "offline": [
+    {
+      "name": "smoke",
+      "concurrency": 10,
+      "unique_papers": 100,
+      "category_appearances": 441,
+      "selection_rate": 0.2,
+      "mock_delay_seconds": {
+        "classification": 0,
+        "abstract": 0
+      },
+      "retry_every": 0,
+      "job_status": "success",
+      "wall_seconds": 4.325,
+      "timings": {
+        "response_parse": {
+          "count": 20,
+          "sum_ms": 193.052,
+          "p50_ms": 5.257,
+          "p95_ms": 20.773,
+          "max_ms": 23.157
+        },
+        "category_upsert": {
+          "count": 10,
+          "sum_ms": 63.42,
+          "p50_ms": 5.991,
+          "p95_ms": 9.934,
+          "max_ms": 9.934
+        },
+        "crawl_stage": {
+          "count": 1,
+          "sum_ms": 592.745,
+          "p50_ms": 592.745,
+          "p95_ms": 592.745,
+          "max_ms": 592.745
+        }
+      },
+      "mock_request_timings": {
+        "classification": {
+          "count": 100,
+          "sum_ms": 4.487,
+          "p50_ms": 0.041,
+          "p95_ms": 0.066,
+          "max_ms": 0.246
+        },
+        "abstract": {
+          "count": 20,
+          "sum_ms": 1.008,
+          "p50_ms": 0.045,
+          "p95_ms": 0.07,
+          "max_ms": 0.073
+        }
+      },
+      "max_simultaneous_mock_requests": 1,
+      "mock_429_count": 0,
+      "crawler_requests": 20,
+      "counts": {
+        "papers": 100,
+        "paper_categories": 441,
+        "evaluations": 120,
+        "job_events": 306,
+        "llm_call_attempts": 120
+      },
+      "failed_evaluation_rows_including_recovered_attempts": 0,
+      "pipeline_system_errors": 0,
+      "classification": {
+        "abstract_failed": 0,
+        "abstract_new": 20,
+        "abstract_reused": 0,
+        "already_classified": 0,
+        "call_failed": 0,
+        "call_success": 100,
+        "calls": 100,
+        "candidate_count": 100,
+        "classification_already_running": 0,
+        "direction_count": 1,
+        "direction_ids": [
+          1
+        ],
+        "duration_ms": 2868,
+        "failed": 0,
+        "failed_papers": 0,
+        "has_partial_failure": false,
+        "input_incomplete": 0,
+        "input_tokens": 50000,
+        "matched": 20,
+        "model": "synthetic-no-paid-model",
+        "output_tokens": 15000,
+        "possible": 0,
+        "profile_id": 1,
+        "prompt_id": 3,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "status": "success",
+        "success": 100,
+        "unmatched": 80
+      },
+      "abstract": {
+        "already_successful": 0,
+        "candidate_count": 20,
+        "duration_ms": 800,
+        "evaluation_already_running": 0,
+        "failed": 0,
+        "input_incomplete": 0,
+        "model": "synthetic-no-paid-model",
+        "previous_failure": 0,
+        "profile_id": 1,
+        "prompt_id": 1,
+        "prompt_version": 1,
+        "retry_count": 0,
+        "success": 20,
+        "terminal_failed": 0,
+        "unique_count": 20
+      },
+      "checks_passed": true,
+      "same_day_repeat": {
+        "wall_seconds": 1.84,
+        "new_llm_requests": 0,
+        "status": "success"
+      }
+    }
+  ]
+}

@@ -1,0 +1,165 @@
+{
+  "measured_at": "2026-10-07T05:13:50.612654+00:00",
+  "python": "3.12.2",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "sqlite": "3.43.1",
+  "scope": "Real application pipeline + isolated SQLite + synthetic HTTP/LLM. No paid model calls.",
+  "limits": [
+    "Single run per case, not repeated statistical trials.",
+    "Synthetic matching/output/token counts; no model-quality or provider-quota measurement.",
+    "Mock delays are unscaled wall-clock sleeps, not real provider latency.",
+    "No historical database, active runtime, interactive job, or catch-up workload."
+  ],
+  "source_sha256": {
+    "tests\\benchmark_pipeline.py": "05f4bb67b49b0e86288d2127a4d013a590fbb2a9599681b186ee060d4c660025",
+    "daily_coolpapers\\services.py": "208370c72e1e850212e8917ac2c6dfcfdd1794e30731bf2e5cf0391218a5d086",
+    "daily_coolpapers\\crawler.py": "2335a669cca402e304dd9cb1b67dfcc7898076d4bf70710b22ec14d8ed800203",
+    "daily_coolpapers\\db.py": "a6450a772b8994988fbe738e4c06bf0c9415df5703f2cfe5a1e1df96d8bccabc",
+    "daily_coolpapers\\jobs.py": "540eaa840511f631ddc4b08c2c206b9065b26efff9d4cb4cc0013cf7deb845a3",
+    "daily_coolpapers\\llm.py": "e3e164b08eb19597b79100002535588e7e1914d50fc2cb022a49b952be9c963e",
+    "daily_coolpapers\\call_attempts.py": "d7c3fcc8accfc38fbb681eafbd46430a153a38d8e1b7ea10a118f8a41354fb0c"
+  },
+  "offline": [],
+  "live_source": {
+    "mode": "real_read_only_source_temporary_db_no_llm",
+    "date": "2026-10-06",
+    "concurrency": 6,
+    "fetch_parse_wall_seconds": 93.917,
+    "serial_upsert_wall_seconds": 0.135,
+    "fetch_then_upsert_wall_seconds": 94.053,
+    "unique_papers": 1475,
+    "category_appearances": 2119,
+    "parse_timings": {
+      "response_parse": {
+        "count": 20,
+        "sum_ms": 7430.077,
+        "p50_ms": 52.826,
+        "p95_ms": 1980.664,
+        "max_ms": 2164.806
+      }
+    },
+    "units": [
+      {
+        "category": "cs.AI",
+        "status": "success",
+        "fetch_parse_seconds": 76.415,
+        "upsert_seconds": 0.025,
+        "paper_count": 554,
+        "declared_total": 554,
+        "http_response_ms": 74421,
+        "completeness_verified": true,
+        "persisted_count": 554,
+        "error_codes": []
+      },
+      {
+        "category": "cs.CL",
+        "status": "success",
+        "fetch_parse_seconds": 30.363,
+        "upsert_seconds": 0.015,
+        "paper_count": 243,
+        "declared_total": 243,
+        "http_response_ms": 29560,
+        "completeness_verified": true,
+        "persisted_count": 243,
+        "error_codes": []
+      },
+      {
+        "category": "cs.CV",
+        "status": "success",
+        "fetch_parse_seconds": 31.865,
+        "upsert_seconds": 0.017,
+        "paper_count": 285,
+        "declared_total": 285,
+        "http_response_ms": 30922,
+        "completeness_verified": true,
+        "persisted_count": 285,
+        "error_codes": []
+      },
+      {
+        "category": "cs.HC",
+        "status": "success",
+        "fetch_parse_seconds": 6.81,
+        "upsert_seconds": 0.008,
+        "paper_count": 46,
+        "declared_total": 46,
+        "http_response_ms": 6647,
+        "completeness_verified": true,
+        "persisted_count": 46,
+        "error_codes": []
+      },
+      {
+        "category": "cs.IR",
+        "status": "success",
+        "fetch_parse_seconds": 5.812,
+        "upsert_seconds": 0.008,
+        "paper_count": 33,
+        "declared_total": 33,
+        "http_response_ms": 5705,
+        "completeness_verified": true,
+        "persisted_count": 33,
+        "error_codes": []
+      },
+      {
+        "category": "cs.LG",
+        "status": "success",
+        "fetch_parse_seconds": 93.576,
+        "upsert_seconds": 0.024,
+        "paper_count": 600,
+        "declared_total": 600,
+        "http_response_ms": 91352,
+        "completeness_verified": true,
+        "persisted_count": 600,
+        "error_codes": []
+      },
+      {
+        "category": "cs.RO",
+        "status": "success",
+        "fetch_parse_seconds": 20.783,
+        "upsert_seconds": 0.012,
+        "paper_count": 174,
+        "declared_total": 174,
+        "http_response_ms": 20234,
+        "completeness_verified": true,
+        "persisted_count": 174,
+        "error_codes": []
+      },
+      {
+        "category": "cs.SE",
+        "status": "success",
+        "fetch_parse_seconds": 6.308,
+        "upsert_seconds": 0.009,
+        "paper_count": 58,
+        "declared_total": 58,
+        "http_response_ms": 6153,
+        "completeness_verified": true,
+        "persisted_count": 58,
+        "error_codes": []
+      },
+      {
+        "category": "eess.IV",
+        "status": "success",
+        "fetch_parse_seconds": 2.33,
+        "upsert_seconds": 0.007,
+        "paper_count": 12,
+        "declared_total": 12,
+        "http_response_ms": 2238,
+        "completeness_verified": true,
+        "persisted_count": 12,
+        "error_codes": []
+      },
+      {
+        "category": "stat.ML",
+        "status": "success",
+        "fetch_parse_seconds": 13.406,
+        "upsert_seconds": 0.011,
+        "paper_count": 114,
+        "declared_total": 114,
+        "http_response_ms": 12985,
+        "completeness_verified": true,
+        "persisted_count": 114,
+        "error_codes": []
+      }
+    ],
+    "all_complete": true
+  }
+}

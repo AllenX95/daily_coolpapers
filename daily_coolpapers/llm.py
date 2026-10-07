@@ -1,13 +1,18 @@
 import json
 import logging
+import math
 import re
+import time
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 
 from . import call_attempts
-from .db import get_bool_setting, loads_json
+from .db import get_bool_setting, get_int_setting, loads_json
+from .llm_concurrency import DEFAULT_CONCURRENCY, is_concurrency_limit, provider_limiter
 from .network import httpx_proxy_kwargs
 from .security import secret_store
 
@@ -173,7 +178,10 @@ def _headers(profile: dict[str, Any]) -> dict[str, str]:
 
 
 def make_llm_client(profile: dict[str, Any]) -> httpx.Client:
-    return httpx.Client(**_llm_client_kwargs(profile))
+    concurrency = max(1, get_int_setting('llm.abstract_concurrency', DEFAULT_CONCURRENCY))
+    client = httpx.Client(**_llm_client_kwargs(profile))
+    client._dcp_concurrency = concurrency
+    return client
 
 
 def _llm_client_kwargs(profile: dict[str, Any]) -> dict[str, Any]:
@@ -303,16 +311,45 @@ def _tracked_post(
     fallback_reason: str | None = None,
 ) -> Any:
     """Persist one request at the HTTP boundary while preserving client injection."""
-    attempt_id, started = call_attempts.begin_provider_request(
-        provider, payload, fallback_reason=fallback_reason,
-    )
+    configured = getattr(client, '_dcp_concurrency', DEFAULT_CONCURRENCY)
+    if not isinstance(configured, int):  # Preserve injected Mock/Fake clients.
+        configured = DEFAULT_CONCURRENCY
+    limiter = provider_limiter(provider, url, headers, configured, client=client)
+    # Four reductions (10 -> 4 -> 3 -> 2 -> 1), then a final attempt at the floor.
+    # These explicit rejections are retried without consuming the business retry budget.
+    for index in range(5):
+        with limiter.slot() as ticket:
+            attempt_id, started = call_attempts.begin_provider_request(
+                provider, payload, fallback_reason=fallback_reason,
+                transport_retry_reason='provider_concurrency_limit' if index else None,
+            )
+            try:
+                response = client.post(url, headers=headers, json=payload)
+            except Exception as exc:
+                call_attempts.finish_provider_transport_error(attempt_id, started, exc)
+                raise
+            retry = is_concurrency_limit(response) and limiter.throttled(ticket)
+            call_attempts.finish_provider_response(attempt_id, started, provider, response)
+        if not retry or index == 4:
+            return response
+        # Release the permit during backoff; respect a bounded Retry-After when present.
+        time.sleep(_concurrency_retry_delay(getattr(response, 'headers', {}).get('retry-after')))
+
+
+def _concurrency_retry_delay(value: Any) -> float:
     try:
-        response = client.post(url, headers=headers, json=payload)
-    except Exception as exc:
-        call_attempts.finish_provider_transport_error(attempt_id, started, exc)
-        raise
-    call_attempts.finish_provider_response(attempt_id, started, provider, response)
-    return response
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(str(value))
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            delay = target.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            delay = 1.0
+    if not math.isfinite(delay):
+        delay = 1.0
+    return min(30.0, max(1.0, delay))
 
 
 def _response_format_unsupported(response: Any) -> bool:

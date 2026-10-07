@@ -172,7 +172,16 @@ def fetch_category_report(
     missing_field_warning_rate: float = 0.0,
     attempt_progress: Callable[[dict[str, Any]], None] | None = None,
     client: httpx.Client | None = None,
+    collection_mode: str = 'top_n',
+    full_max_papers: int = 10000,
 ) -> CategoryFetchResult:
+    if collection_mode == 'full':
+        return fetch_full_category_report(category, sort_param=sort_param, timeout_seconds=timeout_seconds,
+            retries=retries, user_agent=user_agent, trust_env_proxy=trust_env_proxy, proxy_url=proxy_url,
+            crawl_date=crawl_date, missing_field_warning_rate=missing_field_warning_rate,
+            attempt_progress=attempt_progress, client=client, full_max_papers=full_max_papers)
+    if collection_mode != 'top_n':
+        raise ValueError('未知采集模式')
     url = build_category_url(category, sort_param, top_n, crawl_date=crawl_date)
     last_error: Exception | None = None
     last_error_code = "network_http_error"
@@ -324,6 +333,89 @@ def fetch_category_report(
     ) from last_error
 
 
+def fetch_full_category_report(category, *, sort_param='sort=1', timeout_seconds=20, retries=2,
+        user_agent='DailyCoolPapers/0.1', trust_env_proxy=False, proxy_url='', crawl_date=None,
+        missing_field_warning_rate=0.0, attempt_progress=None, client=None, full_max_papers=10000):
+    """Discover Total, then verify a bounded full response. Never treat a cap as complete."""
+    if not crawl_date:
+        raise ValueError('全量采集必须指定日期')
+    date.fromisoformat(crawl_date)
+    if not 1 <= full_max_papers <= 100000:
+        raise ValueError('全量采集上限无效')
+    owned = client is None
+    if owned:
+        client = httpx.Client(timeout=timeout_seconds, follow_redirects=True,
+                              **httpx_proxy_kwargs(proxy_url, trust_env_proxy))
+    reports = []
+    base_query = dict(parse_qsl(sort_param or 'sort=1'))
+    base_query.pop('date', None)
+    def request(show):
+        query = {**base_query, 'show': str(show)}
+        request_index = len(reports) + 1
+        def annotate(event):
+            return {**event, 'request_index': request_index,
+                    'metrics': {**event.get('metrics', {}), 'request_index': request_index}}
+        def progress(event):
+            if attempt_progress:
+                attempt_progress(annotate(event))
+        try:
+            report = fetch_category_report(category, top_n=show, sort_param=urlencode(query),
+                timeout_seconds=timeout_seconds, retries=retries, user_agent=user_agent,
+                trust_env_proxy=trust_env_proxy, proxy_url=proxy_url, crawl_date=crawl_date,
+                missing_field_warning_rate=missing_field_warning_rate,
+                attempt_progress=progress, client=client)
+        except CrawlFetchError as exc:
+            exc.attempt_events = tuple(annotate(event) for event in exc.attempt_events)
+            raise
+        report = CategoryFetchResult(report.papers, report.status, report.error_codes, report.metrics,
+                                     tuple(annotate(event) for event in report.attempt_events))
+        reports.append(report)
+        return report
+    try:
+        first = request(1)
+        total = first.metrics.get('declared_total')
+        result = first
+        if first.metrics.get('page_date') == crawl_date and isinstance(total, int) and total > 1 and first.status != 'failed':
+            result = request(min(total, full_max_papers))
+        errors = list(result.error_codes)
+        distinct = {paper['arxiv_id'] for paper in result.papers}
+        source_duplicates = len(result.papers) - len(distinct)
+        if result.metrics.get('page_date') != crawl_date:
+            errors.append('page_date_mismatch' if result.metrics.get('page_date') else 'page_date_unknown')
+        if total is None:
+            errors.append('declared_total_unknown')
+        elif total > full_max_papers:
+            errors.append('full_resource_limit')
+        if result.metrics.get('declared_total') != total:
+            errors.append('declared_total_changed')
+        if total is not None and result.metrics.get('response_heading_count') != total:
+            errors.append('source_heading_count_mismatch')
+        if source_duplicates:
+            errors.append('source_duplicate_ids')
+        if total is not None and len(distinct) != total:
+            errors.append('full_count_mismatch')
+        errors = list(dict.fromkeys(errors))
+        complete = not errors and result.status in ('success', 'empty_success')
+        status = ('empty_success' if total == 0 else 'success') if complete else ('failed' if result.status == 'failed' or 'page_date_mismatch' in errors else 'warning')
+        metrics = {**result.metrics, 'collection_mode': 'full', 'expected_count': total,
+            'full_max_papers': full_max_papers, 'request_count': len(reports),
+            'total_response_bytes': sum(item.metrics.get('response_bytes', 0) for item in reports),
+            'total_response_ms': sum(item.metrics.get('response_ms', 0) for item in reports),
+            'valid_unique_id_count': len(distinct), 'missing_count': max(0, total - len(distinct)) if total is not None else None, 'source_duplicate_count': source_duplicates,
+            'completeness_verified': complete, 'integrity_status': status,
+            'error_codes': errors, 'primary_error_code': errors[0] if errors else None}
+        papers = list({paper['arxiv_id']: paper for paper in result.papers}.values())
+        return CategoryFetchResult(papers, status, tuple(errors), metrics,
+            tuple(event for item in reports for event in item.attempt_events))
+    except CrawlFetchError as exc:
+        exc.metrics.update(collection_mode='full', completeness_verified=False)
+        exc.attempt_events = tuple(event for item in reports for event in item.attempt_events) + exc.attempt_events
+        raise
+    finally:
+        if owned:
+            client.close()
+
+
 def parse_papers(html: str, category: str, top_n: int, source_url: str) -> list[CrawledPaper]:
     return parse_papers_with_diagnostics(html, category, top_n, source_url).papers
 
@@ -369,6 +461,7 @@ def parse_papers_with_diagnostics(
         papers=papers,
         metrics={
             "heading_count": len(considered),
+            "response_heading_count": len(headings),
             "parsed_count": len(considered),
             "valid_arxiv_count": len(papers),
             "critical_missing_entries": critical_missing_entries,

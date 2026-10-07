@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
+from .cache_manager import read_cached_markdown
 from . import call_attempts, db
 from .crawler import (
     CategoryFetchResult,
@@ -1055,6 +1056,7 @@ def _append_http_attempt_events(
     for event in events:
         attempt = max(1, int(event.get("attempt") or 1))
         max_attempts = max(attempt, int(event.get("max_attempts") or attempt))
+        event_prefix = f"request:{int(event['request_index'])}:" if event.get('request_index') else ''
         event_name = str(event.get("event") or "")
         if event_name in {"attempt", "attempt_started"}:
             if attempt <= 1:
@@ -1063,7 +1065,7 @@ def _append_http_attempt_events(
                 pipeline_job_id,
                 crawl_date,
                 category,
-                f"attempt:{attempt}:retrying",
+                f"{event_prefix}attempt:{attempt}:retrying",
                 "crawl_http",
                 "crawl.http_retrying",
                 level="warning",
@@ -1080,7 +1082,7 @@ def _append_http_attempt_events(
                 pipeline_job_id,
                 crawl_date,
                 category,
-                f"attempt:{attempt}:http_succeeded",
+                f"{event_prefix}attempt:{attempt}:http_succeeded",
                 "crawl_http",
                 "crawl.http_succeeded",
                 attempt=attempt,
@@ -1094,7 +1096,7 @@ def _append_http_attempt_events(
                 pipeline_job_id,
                 crawl_date,
                 category,
-                f"attempt:{attempt}:http_failed",
+                f"{event_prefix}attempt:{attempt}:http_failed",
                 "crawl_http",
                 "crawl.http_failed",
                 level="error" if is_final else "warning",
@@ -1347,6 +1349,7 @@ def _fetch_category_from_config(
         missing_field_warning_rate=missing_field_warning_rate,
         attempt_progress=attempt_progress,
         client=client,
+        **({"collection_mode": "full"} if category.get("collection_mode") == "full" else {}),
     )
 
 
@@ -1422,6 +1425,7 @@ def build_daily_pipeline_plan(
         category_plan.append({
             "id": int(item['id']), "category": item['category'], "name": item.get('name', ''),
             "top_n": int(item.get('top_n') or 30),
+            "collection_mode": item.get("collection_mode", "top_n"),
             "sort_param": urlencode([(key, value) for key, value in parse_qsl(item.get('sort_param') or 'sort=1') if key == 'sort']),
         })
     plan: dict[str, Any] = {
@@ -1430,7 +1434,7 @@ def build_daily_pipeline_plan(
         "dates": dates, "target_date": latest,
         "start_date": dates[0] if dates else latest, "end_date": dates[-1] if dates else latest,
         "categories": category_plan,
-        "abstract_concurrency": max(1, db.get_int_setting("llm.abstract_concurrency", 4)),
+        "abstract_concurrency": max(1, db.get_int_setting("llm.abstract_concurrency", 10)),
         "abstract_retries": max(0, db.get_int_setting("llm.abstract_retries", 2)),
         "directions": db.list_attention_directions(active_only=True),
     }
@@ -1650,7 +1654,7 @@ def build_direction_backfill_plan(direction_id,date_from,date_to):
     plan = {'directions':[preview['direction']], 'paper_ids':preview['paper_ids'],'inputs':preview['inputs'],
             'start_date':preview['date_from'],'end_date':preview['date_to'],'preview':preview['counts'],
             'trigger_source':'historical_backfill','plan_created_at':db.now_iso(),
-            'abstract_concurrency':max(1,db.get_int_setting('llm.abstract_concurrency',4)),
+            'abstract_concurrency':max(1,db.get_int_setting('llm.abstract_concurrency',10)),
             'abstract_retries':min(2,max(0,db.get_int_setting('llm.abstract_retries',2)))}
     for kind,key in [('direction_classification','classification_config'),('abstract_review','abstract_config')]:
         try:
@@ -1898,7 +1902,7 @@ def evaluate_missing_abstracts(
     if total == 0:
         return {"success": 0, "failed": 0, "skipped": 0, "total": 0}
 
-    concurrency = max(1, db.get_int_setting("llm.abstract_concurrency", 4))
+    concurrency = max(1, db.get_int_setting("llm.abstract_concurrency", 10))
     concurrency = min(concurrency, total)
     completed = 0
     lock = Lock()
@@ -2034,7 +2038,7 @@ class EvaluationRunner:
         variables = paper_variables(paper)
         if request.evaluation_type == "fulltext_review":
             md_path, _created = ensure_markdown(paper, force=request.force_markdown)
-            variables["markdown"] = md_path.read_text(encoding="utf-8")
+            variables["markdown"] = read_cached_markdown(paper["arxiv_id"], md_path)
 
         prompt_text = render_prompt(config.prompt["template"], variables)
         if request.evaluation_type == "fulltext_review":

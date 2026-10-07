@@ -382,7 +382,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", type=Path, default=Path("S4_BASELINE.md"))
+    parser.add_argument("--report", type=Path, default=Path(__file__).resolve().parents[1] / "doc" / "S4_BASELINE.md")
     args = parser.parse_args()
     if args.report.exists():
         parser.error(f"report already exists; choose a new --report path: {args.report}")

@@ -12,7 +12,7 @@ from .default_prompts import DEFAULT_ABSTRACT_PROMPT, DEFAULT_FULLTEXT_PROMPT, D
 from .form_commands import (InvestmentThemeCommand, FormValidationError, parse_theme_ids, parse_choice,
                             ResearchEntityCommand, TeamTrackingCommand, normalized_research_name,
                             AUTHOR_CATEGORIES, ORGANIZATION_TYPES, parse_int, research_text)
-from . import investment_themes_db, research_entities_db
+from . import investment_themes_db, research_entities_db, cache_db
 from .domain_errors import (
     ArchivedThemeError,
     InvestmentThemeNotFoundError,
@@ -562,6 +562,10 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     init_memo_schema(conn)
     from .call_attempts import init_schema as init_call_attempt_schema
     init_call_attempt_schema(conn)
+    category_columns = {row[1] for row in conn.execute('PRAGMA table_info(categories)')}
+    if 'collection_mode' not in category_columns:
+        conn.execute("ALTER TABLE categories ADD COLUMN collection_mode TEXT NOT NULL DEFAULT 'top_n' CHECK(collection_mode IN ('top_n','full'))")
+    cache_db.init_schema(conn)
 
 
 FULLTEXT_EVALUATION_PROJECTION_MIGRATION = "fulltext_evaluation_projection_v1"
@@ -945,6 +949,9 @@ def get_category(category_id: int) -> dict[str, Any] | None:
 
 
 def save_category(data: dict[str, Any]) -> int:
+    mode = data.get('collection_mode', 'top_n')
+    if mode not in {'full', 'top_n'}:
+        raise ValueError('未知采集模式')
     now = now_iso()
     enabled = 1 if data.get("enabled") else 0
     category_id = data.get("id")
@@ -953,7 +960,7 @@ def save_category(data: dict[str, Any]) -> int:
             conn.execute(
                 """
                 UPDATE categories
-                SET category = ?, name = ?, enabled = ?, top_n = ?, sort_param = ?, updated_at = ?
+                SET category = ?, name = ?, enabled = ?, top_n = ?, sort_param = ?, collection_mode = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -962,6 +969,7 @@ def save_category(data: dict[str, Any]) -> int:
                     enabled,
                     int(data.get("top_n") or 30),
                     data.get("sort_param") or "sort=1",
+                    mode,
                     now,
                     category_id,
                 ),
@@ -969,8 +977,8 @@ def save_category(data: dict[str, Any]) -> int:
             return int(category_id)
         cur = conn.execute(
             """
-            INSERT INTO categories(category, name, enabled, top_n, sort_param, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO categories(category, name, enabled, top_n, sort_param, collection_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["category"],
@@ -978,6 +986,7 @@ def save_category(data: dict[str, Any]) -> int:
                 enabled,
                 int(data.get("top_n") or 30),
                 data.get("sort_param") or "sort=1",
+                mode,
                 now,
                 now,
             ),
@@ -1737,14 +1746,15 @@ def set_paper_decision(paper_id: int, decision: str) -> None:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        if decision == 'clear':
-            conn.execute('DELETE FROM paper_dispositions WHERE paper_id=?', (paper_id,))
-        else:
-            now = now_iso()
-            conn.execute("""INSERT INTO paper_dispositions(paper_id,decision,created_at,updated_at)
-                VALUES (?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET
-                decision=excluded.decision, updated_at=excluded.updated_at
-                WHERE paper_dispositions.decision != excluded.decision""", (paper_id, decision, now, now))
+        with cache_db.track_tier_change(conn,[paper_id]):
+            if decision == 'clear':
+                conn.execute('DELETE FROM paper_dispositions WHERE paper_id=?', (paper_id,))
+            else:
+                now = now_iso()
+                conn.execute("""INSERT INTO paper_dispositions(paper_id,decision,created_at,updated_at)
+                    VALUES (?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET
+                    decision=excluded.decision, updated_at=excluded.updated_at
+                    WHERE paper_dispositions.decision != excluded.decision""", (paper_id, decision, now, now))
 
 
 def _require_paper_fulltext(conn: sqlite3.Connection, paper_id: int) -> None:
@@ -1801,7 +1811,8 @@ def set_paper_investment_themes(paper_id: int, theme_ids: Iterable[int]) -> None
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        investment_themes_db.set_paper_investment_themes(conn, paper_id, ids, now_iso)
+        with cache_db.track_tier_change(conn,[paper_id]):
+            investment_themes_db.set_paper_investment_themes(conn, paper_id, ids, now_iso)
 
 
 def paper_investment_theme_options(paper_id: int) -> list[dict[str, Any]]:
@@ -1813,7 +1824,8 @@ def remove_paper_investment_theme(paper_id: int, theme_id: int) -> None:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        investment_themes_db.remove_paper_investment_theme(conn, paper_id, theme_id)
+        with cache_db.track_tier_change(conn,[paper_id]):
+            investment_themes_db.remove_paper_investment_theme(conn, paper_id, theme_id)
 
 
 def _research_table(kind: str) -> str:
@@ -1842,14 +1854,16 @@ def save_paper_team_tracking(paper_id: int, form: Mapping[str, Any]) -> int:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        return research_entities_db.save_paper_team_tracking(conn, paper_id, command, now_iso)
+        with cache_db.track_tier_change(conn,[paper_id]):
+            return research_entities_db.save_paper_team_tracking(conn, paper_id, command, now_iso)
 
 
 def archive_paper_team_tracking(paper_id: int) -> None:
     with connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         _require_paper_fulltext(conn, paper_id)
-        research_entities_db.archive_paper_team_tracking(conn, paper_id, now_iso)
+        with cache_db.track_tier_change(conn,[paper_id]):
+            research_entities_db.archive_paper_team_tracking(conn, paper_id, now_iso)
 
 
 def update_research_entity(kind: str, entity_id: int, action: str, form: Mapping[str, Any] | None = None) -> None:

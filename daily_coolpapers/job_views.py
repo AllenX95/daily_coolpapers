@@ -35,6 +35,9 @@ EVENT_LABELS = {
     'abstract.stage_completed': '摘要阶段完成',
 }
 ERROR_LABELS = {
+    'full_resource_limit': '全量采集触及资源上限', 'declared_total_changed': '两次请求的总数变化',
+    'source_duplicate_ids': '源列表 ID 重复', 'full_count_mismatch': '全量唯一 ID 数量不符',
+    'source_heading_count_mismatch': '源列表条目数不符',
     'memo_config_invalid':'备忘录配置不可用','memo_context_exceeded':'备忘录上下文超限','memo_auth_error':'模型认证失败',
     'memo_transport_error':'模型连接失败','memo_provider_error':'模型服务错误','memo_json_invalid':'备忘录 JSON 无效',
     'memo_schema_invalid':'备忘录结构不符合契约','memo_evidence_invalid':'论文引用编号不合法',
@@ -54,6 +57,10 @@ ERROR_LABELS = {
     'pipeline_system_error': '流水线系统错误',
 }
 METRIC_LABELS = {
+    'request_index':'采集请求批次序号','valid_unique_id_count':'全量唯一 ID','missing_count':'未取得条数',
+    'source_duplicate_count':'源列表重复 ID','request_count':'采集请求批次',
+    'total_response_bytes':'合计响应字节','total_response_ms':'合计请求耗时 ms',
+    'full_max_papers':'全量资源上限',
     'version_id':'备忘录版本 ID','paper_count':'确认论文数','estimated_input_tokens':'预计输入 token',
     'direction_count':'方向数','calls':'模型调用','call_success':'有效调用','call_failed':'失败调用',
     'matched':'明确匹配','possible':'可能匹配（待确认）','unmatched':'不匹配',
@@ -205,6 +212,10 @@ def pipeline_card(job: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
 def event_view(event: dict[str, Any]) -> dict[str, Any]:
     metrics = event.get('metrics') or {}
     safe_metrics = {key: _number(metrics[key], None) for key in METRIC_LABELS if key in metrics}
+    if metrics.get('collection_mode') in ('top_n', 'full'):
+        safe_metrics['collection_mode'] = '每日全量' if metrics['collection_mode'] == 'full' else 'Top N'
+    if isinstance(metrics.get('completeness_verified'), bool):
+        safe_metrics['completeness_verified'] = '是' if metrics['completeness_verified'] else '否'
     if isinstance(metrics.get('terminal_failure'), bool):
         safe_metrics['terminal_failed'] = int(metrics['terminal_failure'])
     for key in ('request_url', 'final_url'):
@@ -247,6 +258,6 @@ def event_view(event: dict[str, Any]) -> dict[str, Any]:
         'paper_title': redact_text(event.get('paper_title'))[:200], 'attempt': _number(event.get('attempt'), 1),
         'created_at': local_time(event.get('created_at')), 'error_code': code,
         'error_label': ERROR_LABELS.get(code, '未知错误' if code else ''), 'metrics': safe_metrics,
-        'metric_rows': [{'label': METRIC_LABELS.get(key, {'request_url': '请求 URL', 'final_url': '最终 URL', 'target_date': '目标日期', 'page_date': '页面日期', 'crawl_date': '入库日期', 'final_status': '终态', 'skip_reason': '跳过原因', 'usage': 'Token 用量'}.get(key, key)),
+        'metric_rows': [{'label': METRIC_LABELS.get(key, {'collection_mode':'采集模式','completeness_verified':'全量完整性已验证','request_url': '请求 URL', 'final_url': '最终 URL', 'target_date': '目标日期', 'page_date': '页面日期', 'crawl_date': '入库日期', 'final_status': '终态', 'skip_reason': '跳过原因', 'usage': 'Token 用量'}.get(key, key)),
                          'value': value if value is not None else '未知'} for key, value in safe_metrics.items()],
     }

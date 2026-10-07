@@ -1,5 +1,7 @@
 # Daily Cool Papers
 
+Development PRDs, design reviews, benchmarks, and release reports are collected in [doc/](doc/README.md). See the [full collection and tiered storage plan](doc/PRD_全量采集与梯次存储优化.md) for the implemented policy and the [implementation report](doc/TIERED_STORAGE_RELEASE_REPORT.md) for validation and rollout details.
+
 A lightweight, local-first web service that helps early-stage VC investors and researchers track and digest arXiv papers from [papers.cool](https://papers.cool). It uses **papers.cool reading stars** (PDF + Kimi clicks) as a crowd-sourced quality signal, then leverages large language models to evaluate abstracts and, on demand, read full texts from a VC investment perspective.
 
 [![GitHub](https://img.shields.io/badge/GitHub-AllenX95%2Fdaily__coolpapers-blue)](https://github.com/AllenX95/daily_coolpapers)
@@ -21,7 +23,7 @@ A lightweight, local-first web service that helps early-stage VC investors and r
 
 - **Local web UI** built with Flask + Jinja2 templates.
 - **No browser automation** — plain HTTP + HTML parsing, lightweight and reliable.
-- **Category management**: enable/disable categories, configure `top_n` and sort parameters.
+- **Category management**: enable/disable categories, choose daily `full` collection or `top_n`, and configure sort parameters.
 - **Prompt engine**: edit, copy, and bind different prompts to different LLM profiles. Prompts use `{{variable}}` substitution.
 - **LLM profile manager**: support OpenAI-compatible APIs and Anthropic Messages API; API keys are encrypted locally (Windows DPAPI when available, otherwise Fernet).
 - **Job queue**: background worker handles crawling, catch-up, abstract evaluation, full-text reading, and cache cleanup with live progress.
@@ -97,7 +99,7 @@ http://127.0.0.1:8765
 
 1. **Configure LLM**: Go to the **LLM Profiles** page and add an OpenAI-compatible or Anthropic profile. The API key is encrypted before being saved.
 2. **Review Prompts**: On the **Prompts** page, check the default abstract-review and fulltext-review prompts and make sure each is bound to a suitable model.
-3. **Set Categories**: Enable the arXiv categories you care about and adjust `top_n` if needed.
+3. **Set Categories**: Enable the arXiv categories you care about and choose `full` for daily complete collection or `top_n` for a limited list. Existing categories retain their previous mode until changed.
 4. **Crawl**: Click **"Crawl & Evaluate Abstracts"** on the home page. The job runner will fetch metadata and then run abstract evaluations in the background.
 5. **Screen**: Sort by rank, reading stars, score, or attention level. Use date/category filters to narrow results.
 6. **Deep Read**: Click **"Full Text Read"** on any paper to download the PDF and run a full-text LLM evaluation.
@@ -156,7 +158,8 @@ Settings are stored in SQLite and editable via the web UI:
 - `crawler.default_top_n` — default number of papers per category.
 - `crawler.concurrency` — parallel fetch threads for crawling.
 - `llm.abstract_concurrency` — parallel LLM calls for abstract evaluation.
-- `cache.pdf_retention_days` / `cache.markdown_retention_days` — auto cleanup.
+- `cache.ordinary_pdf_retention_days` / `cache.ordinary_markdown_retention_days` — ordinary cache TTL, defaults 7 / 30 days.
+- `cache.core_pdf_retention_days` / `cache.core_markdown_retention_days` — core cache TTL, defaults 30 / 180 days. Actual use refreshes each artifact separately; metadata and research evidence remain stored. Legacy global cache keys are retained for rollback.
 - `scheduler.enabled` / `scheduler.daily_times` — automatic daily crawl times.
 
 ---

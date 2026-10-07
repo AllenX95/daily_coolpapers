@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pdfminer.high_level import extract_text
 
-from .cache_manager import atomic_write_text, cache_lock, download_pdf, has_markdown, markdown_path, touch
+from .cache_manager import atomic_write_text, cache_lock, download_pdf, has_markdown, markdown_path, record_cache_use
 from .db import get_int_setting
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,6 @@ def ensure_markdown(paper: dict, force: bool = False) -> tuple[Path, bool]:
     with cache_lock(arxiv_id):
         md_path = markdown_path(arxiv_id)
         if not force and has_markdown(arxiv_id):
-            touch(md_path)
             return md_path, False
 
         pdf_url = paper.get("pdf_url")
@@ -28,7 +27,9 @@ def ensure_markdown(paper: dict, force: bool = False) -> tuple[Path, bool]:
             retries=get_int_setting("llm.pdf_download_retries", 2),
         )
         markdown = convert_pdf_to_markdown(pdf)
+        record_cache_use(arxiv_id, "pdf", pdf)
         atomic_write_text(md_path, markdown)
+        record_cache_use(arxiv_id, "markdown", md_path, generated=True)
         return md_path, True
 
 

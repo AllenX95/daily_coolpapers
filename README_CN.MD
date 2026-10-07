@@ -1,5 +1,7 @@
 # Daily Cool Papers
 
+开发 PRD、设计评估、性能基线与验收报告统一收录在 [doc/](doc/README.md)。最新方案见[全量采集与梯次存储优化](doc/PRD_全量采集与梯次存储优化.md)，T0–T4 开发与隔离验收见[实施报告](doc/TIERED_STORAGE_RELEASE_REPORT.md)。
+
 一个轻量、本地优先的 Web 服务，帮助早期 VC 投资人和科研人员跟踪并消化 [papers.cool](https://papers.cool) 上的 arXiv 论文。项目以 **papers.cool 的阅读星星数**（PDF 点击 + Kimi 点击）作为众包质量信号，再利用大语言模型从 VC 投资视角评估摘要，并在需要时按需精读全文。
 
 [![GitHub](https://img.shields.io/badge/GitHub-AllenX95%2Fdaily__coolpapers-blue)](https://github.com/AllenX95/daily_coolpapers)
@@ -21,7 +23,7 @@
 
 - **本地 Web UI**：基于 Flask + Jinja2 模板。
 - **无需浏览器自动化**：仅使用普通 HTTP + HTML 解析，轻量且稳定。
-- **类目管理**：启用/禁用类目，配置每个类目的 `top_n` 和排序参数。
+- **类目管理**：启用/禁用类目，选择每日全量 `full` 或 `top_n`，并配置排序参数。
 - **Prompt 引擎**：编辑、复制 Prompt，并将不同 Prompt 绑定到不同 LLM 模型；Prompt 支持 `{{变量}}` 替换。
 - **LLM Profile 管理器**：支持 OpenAI-compatible API 和 Anthropic Messages API；API key 本地加密存储（Windows 优先 DPAPI，否则 Fernet）。
 - **任务队列**：后台工作线程处理抓取、补抓、摘要评估、全文阅读和缓存清理，并显示实时进度。
@@ -97,7 +99,7 @@ http://127.0.0.1:8765
 
 1. **配置 LLM**：进入 **LLM Profiles** 页面，添加 OpenAI-compatible 或 Anthropic 模型配置。API key 会在保存前被加密。
 2. **检查 Prompt**：在 **Prompts** 页面查看默认的摘要评估和全文阅读 Prompt，并确保它们绑定到了合适的模型。
-3. **设置类目**：启用你关心的 arXiv 类目，并按需调整 `top_n`。
+3. **设置类目**：启用你关心的 arXiv 类目，选择 `full` 每日全量或 `top_n` 限量采集；已有类目保留原模式，需手动切换。
 4. **抓取**：在首页点击 **"抓取并摘要评估"**。任务队列会在后台抓取元数据并运行摘要评估。
 5. **筛选**：按排名、阅读星星数、评分或关注等级排序；使用日期/类目过滤器缩小范围。
 6. **深读**：对感兴趣的论文点击 **"全文阅读"**，下载 PDF 并运行全文 LLM 评估。
@@ -157,7 +159,8 @@ API key 在静态存储时加密；界面中只显示掩码，不会写入日志
 - `crawler.default_top_n` — 每个类目默认抓取的论文数量。
 - `crawler.concurrency` — 抓取时的并行线程数。
 - `llm.abstract_concurrency` — 摘要评估时的并行 LLM 调用数。
-- `cache.pdf_retention_days` / `cache.markdown_retention_days` — 自动清理保留天数。
+- `cache.ordinary_pdf_retention_days` / `cache.ordinary_markdown_retention_days` — 普通缓存默认 7 / 30 天。
+- `cache.core_pdf_retention_days` / `cache.core_markdown_retention_days` — 核心缓存默认 30 / 180 天。各文件按实际使用独立计时，元数据及研究证据继续保留；旧全局键只保留供回退。
 - `scheduler.enabled` / `scheduler.daily_times` — 每日自动抓取时间。
 
 ---

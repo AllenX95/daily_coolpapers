@@ -4,6 +4,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Iterable
 
+from .cache_db import RETENTION_DEFAULTS
+
 
 class FormValidationError(ValueError):
     def __init__(self, errors: Mapping[str, str]) -> None:
@@ -184,11 +186,12 @@ class TeamTrackingCommand:
 
 
 SETTINGS_DEFAULTS: dict[str, Any] = {
+    **RETENTION_DEFAULTS,
     "cache.pdf_retention_days": 5,
     "cache.markdown_retention_days": 7,
     "cache.cleanup_on_start": True,
     "cache.cleanup_daily": True,
-    "llm.abstract_concurrency": 4,
+    "llm.abstract_concurrency": 10,
     "llm.abstract_retries": 2,
     "job_events.retention_days": 30,
     "crawler.missing_field_warning_rate": 0.0,
@@ -208,52 +211,45 @@ class SettingsCommand:
 
     @classmethod
     def from_form(cls, form: Mapping[str, Any]) -> "SettingsCommand":
-        return cls(
-            {
-                "cache.pdf_retention_days": parse_int(
-                    form.get("pdf_retention_days"),
-                    "pdf_retention_days",
-                    default=5,
-                    minimum=0,
-                ),
-                "cache.markdown_retention_days": parse_int(
-                    form.get("markdown_retention_days"),
-                    "markdown_retention_days",
-                    default=7,
-                    minimum=0,
-                ),
-                "cache.cleanup_on_start": parse_bool(form.get("cleanup_on_start"), "cleanup_on_start"),
-                "cache.cleanup_daily": parse_bool(form.get("cleanup_daily"), "cleanup_daily"),
-                "llm.abstract_concurrency": parse_int(
-                    form.get("abstract_concurrency"),
-                    "abstract_concurrency",
-                    default=4,
-                    minimum=1,
-                    maximum=20,
-                ),
-                "crawler.trust_env_proxy": parse_bool(
-                    form.get("crawler_trust_env_proxy"),
-                    "crawler_trust_env_proxy",
-                ),
-                "llm.abstract_retries": parse_int(form.get('abstract_retries'), 'abstract_retries', default=2, minimum=0, maximum=5),
-                "job_events.retention_days": parse_int(form.get('event_retention_days'), 'event_retention_days', default=30, minimum=1, maximum=3650),
-                "crawler.missing_field_warning_rate": parse_float(form.get('missing_field_warning_rate'), 'missing_field_warning_rate', default=0.0, minimum=0, maximum=1),
-                "crawler.proxy_url": str(form.get("crawler_proxy_url") or "").strip(),
-                "llm.trust_env_proxy": parse_bool(form.get("llm_trust_env_proxy"), "llm_trust_env_proxy"),
-                "llm.pdf_download_timeout_seconds": parse_int(
-                    form.get("pdf_download_timeout_seconds"),
-                    "pdf_download_timeout_seconds",
-                    default=300,
-                    minimum=30,
-                ),
-                "llm.pdf_download_retries": parse_int(
-                    form.get("pdf_download_retries"),
-                    "pdf_download_retries",
-                    default=2,
-                    minimum=0,
-                    maximum=5,
-                ),
-                "scheduler.enabled": parse_bool(form.get("scheduler_enabled"), "scheduler_enabled"),
-                "scheduler.daily_times": str(form.get("scheduler_daily_times") or "10:30,12:00").strip(),
-            }
-        )
+        values = {
+            "cache.cleanup_on_start": parse_bool(form.get("cleanup_on_start"), "cleanup_on_start"),
+            "cache.cleanup_daily": parse_bool(form.get("cleanup_daily"), "cleanup_daily"),
+            "llm.abstract_concurrency": parse_int(
+                form.get("abstract_concurrency"),
+                "abstract_concurrency",
+                default=10,
+                minimum=1,
+                maximum=20,
+            ),
+            "crawler.trust_env_proxy": parse_bool(
+                form.get("crawler_trust_env_proxy"),
+                "crawler_trust_env_proxy",
+            ),
+            "llm.abstract_retries": parse_int(form.get('abstract_retries'), 'abstract_retries', default=2, minimum=0, maximum=5),
+            "job_events.retention_days": parse_int(form.get('event_retention_days'), 'event_retention_days', default=30, minimum=1, maximum=3650),
+            "crawler.missing_field_warning_rate": parse_float(form.get('missing_field_warning_rate'), 'missing_field_warning_rate', default=0.0, minimum=0, maximum=1),
+            "crawler.proxy_url": str(form.get("crawler_proxy_url") or "").strip(),
+            "llm.trust_env_proxy": parse_bool(form.get("llm_trust_env_proxy"), "llm_trust_env_proxy"),
+            "llm.pdf_download_timeout_seconds": parse_int(
+                form.get("pdf_download_timeout_seconds"),
+                "pdf_download_timeout_seconds",
+                default=300,
+                minimum=30,
+            ),
+            "llm.pdf_download_retries": parse_int(
+                form.get("pdf_download_retries"),
+                "pdf_download_retries",
+                default=2,
+                minimum=0,
+                maximum=5,
+            ),
+            "scheduler.enabled": parse_bool(form.get("scheduler_enabled"), "scheduler_enabled"),
+            "scheduler.daily_times": str(form.get("scheduler_daily_times") or "10:30,12:00").strip(),
+        }
+        for key, default in RETENTION_DEFAULTS.items():
+            field = key.removeprefix('cache.')
+            values[key] = parse_int(form.get(field), field, default=default, minimum=1, maximum=3650)
+        for kind in ('pdf', 'markdown'):
+            if values[f'cache.core_{kind}_retention_days'] < values[f'cache.ordinary_{kind}_retention_days']:
+                raise FormValidationError({'cache_retention': '核心缓存期限不得短于普通缓存'})
+        return cls(values)
