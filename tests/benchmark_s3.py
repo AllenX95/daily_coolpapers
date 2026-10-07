@@ -7,7 +7,7 @@ only temporary SQLite databases and the deterministic fixture from
 
     python -B -m tests.benchmark_s3
     python -B -m tests.benchmark_s3 --sizes 10000 --case reviewed/html
-    python -B -m tests.benchmark_s3 --report S3_BASELINE.json
+    python -B -m tests.benchmark_s3 --report doc/S3_BASELINE.json
 
 The default run is intentionally a small representative matrix: first page
 at 30 items and a deep page at 100 items for each ordinary collection, plus
@@ -582,7 +582,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--case", action="append", help="Only cases containing this substring; repeatable")
-    parser.add_argument("--report", type=Path, default=Path("S3_BASELINE.md"))
+    parser.add_argument("--report", type=Path, default=Path(__file__).resolve().parents[1] / "doc" / "S3_BASELINE.md")
     args = parser.parse_args()
     if args.samples < 1 or args.warmup < 0 or any(size < 1 for size in args.sizes):
         parser.error("sizes/samples must be positive and warmup must be nonnegative")

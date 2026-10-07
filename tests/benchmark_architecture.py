@@ -165,7 +165,7 @@ def main():
     parser.add_argument('--warmup',type=int,default=5)
     parser.add_argument('--samples',type=int,default=30)
     parser.add_argument('--case', action='append', help='Only cases containing this substring; repeatable')
-    parser.add_argument('--report',type=Path,default=Path('ARCHITECTURE_BASELINE.md'))
+    parser.add_argument('--report',type=Path,default=Path(__file__).resolve().parents[1]/'doc'/'ARCHITECTURE_BASELINE.md')
     args = parser.parse_args()
     if args.samples<1 or args.warmup<0 or any(n<1 for n in args.sizes):
         parser.error('sizes/samples must be positive, warmup nonnegative')

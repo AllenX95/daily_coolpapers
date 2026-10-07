@@ -351,10 +351,15 @@ def finish_generation(version_id,*,result=None,markdown=None,raw_output=None,err
         for key,alias in [('input_tokens','prompt_tokens'),('output_tokens','completion_tokens')]:
             value = usage.get(key,usage.get(alias))
             tokens[key] = value if isinstance(value,int) and not isinstance(value,bool) else None
-        conn.execute('''UPDATE investment_memo_versions SET status=?,result_json=?,rendered_markdown=?,raw_output=?,
-            input_tokens=?,output_tokens=?,error_code=?,error_message=?,finished_at=? WHERE id=?''',
-            (status,json.dumps(result,ensure_ascii=False) if result is not None else None,markdown if result is not None else None,
-             raw_output,tokens['input_tokens'],tokens['output_tokens'],error_code,error_message,now,version_id))
+        from . import cache_db
+        paper_ids = [row[0] for row in conn.execute("""SELECT DISTINCT p.id FROM investment_memo_version_papers vp
+            JOIN papers p ON p.id=vp.paper_id OR p.arxiv_id=vp.paper_arxiv_id_snapshot
+            WHERE vp.memo_version_id=?""", (version_id,))]
+        with cache_db.track_tier_change(conn, paper_ids):
+            conn.execute('''UPDATE investment_memo_versions SET status=?,result_json=?,rendered_markdown=?,raw_output=?,
+                input_tokens=?,output_tokens=?,error_code=?,error_message=?,finished_at=? WHERE id=?''',
+                (status,json.dumps(result,ensure_ascii=False) if result is not None else None,markdown if result is not None else None,
+                 raw_output,tokens['input_tokens'],tokens['output_tokens'],error_code,error_message,now,version_id))
         snapshot = json.loads(version['input_snapshot_json'])
         metrics = {'version_id':version_id,'series_id':version['series_id'],'source_mode':version['source_mode_snapshot'],
                    'paper_count':len(snapshot['papers']),'prompt_id':version['prompt_id'],'profile_id':version['profile_id'],

@@ -3,11 +3,15 @@
 {% block content %}
 <section>
   <h1>流水线、缓存与调度设置</h1>
+  <p>数据库 {{ cache_usage.database_bytes }} 字节；PDF {{ cache_usage.pdf_files }} 个 / {{ cache_usage.pdf_bytes }} 字节；Markdown {{ cache_usage.markdown_files }} 个 / {{ cache_usage.markdown_bytes }} 字节。数据库属于长期研究记录。</p>
   <form method="post" action="{{ url_for('save_settings') }}" class="form-grid settings-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label>PDF 保留天数 <input name="pdf_retention_days" type="number" min="0" value="{{ settings.pdf_retention_days }}"></label>
-    <label>Markdown 保留天数 <input name="markdown_retention_days" type="number" min="0" value="{{ settings.markdown_retention_days }}"></label>
-    <label>摘要评估并发数 <input name="abstract_concurrency" type="number" min="1" max="20" value="{{ settings.abstract_concurrency }}"></label>
+    <p class="small muted">PDF 和 Markdown 均为缓存。收藏、投资主题关联、团队跟踪或成功备忘录引用的论文采用核心期限。元数据、摘要和评估结果长期保留；实际使用分别刷新期限。期限和研究状态变更在下一轮清理生效；降级后旧缓存可能立即到期。</p>
+    <label>普通论文 PDF 缓存天数 <input name="ordinary_pdf_retention_days" type="number" min="1" max="3650" value="{{ settings.ordinary_pdf_retention_days }}"></label>
+    <label>普通论文 Markdown 缓存天数 <input name="ordinary_markdown_retention_days" type="number" min="1" max="3650" value="{{ settings.ordinary_markdown_retention_days }}"></label>
+    <label>核心论文 PDF 缓存天数 <input name="core_pdf_retention_days" type="number" min="1" max="3650" value="{{ settings.core_pdf_retention_days }}"></label>
+    <label>核心论文 Markdown 缓存天数 <input name="core_markdown_retention_days" type="number" min="1" max="3650" value="{{ settings.core_markdown_retention_days }}"></label>
+    <label>LLM 并发数 <input name="abstract_concurrency" type="number" min="1" max="20" value="{{ settings.abstract_concurrency }}"><span class="small muted">默认 10；provider 并发限流时降至 4，仍限流则逐步降至 1，本任务内不自动升档</span></label>
     <label>摘要额外重试次数 <input name="abstract_retries" type="number" min="0" max="5" value="{{ settings.abstract_retries }}"><span class="small muted">仅重试可恢复的模型错误</span></label>
     <label>结构化事件保留天数 <input name="event_retention_days" type="number" min="1" max="3650" value="{{ settings.event_retention_days }}"><span class="small muted">清理过期事件，不删除任务汇总；活跃任务保留</span></label>
     <label>关键字段缺失率警告阈值 <input name="missing_field_warning_rate" type="number" min="0" max="1" step="0.01" value="{{ settings.missing_field_warning_rate }}"><span class="small muted">0–1，超过阈值时记录警告</span></label>

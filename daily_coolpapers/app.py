@@ -26,11 +26,13 @@ from flask import (
     url_for,
 )
 
-from . import call_attempts, db
+from . import cache_db, call_attempts, db
 from . import job_views
 from . import memo_candidates, memo_db, memo_drafts, memos
 from . import schedule_db
-from .cache_manager import cleanup_caches, has_markdown, has_pdf, markdown_path, pdf_path
+from .cache_manager import (cache_lock, cache_usage, cache_status, read_cached_markdown,
+                            record_cache_use, register_legacy_caches, cleanup_caches,
+                            has_markdown, has_pdf, markdown_path, pdf_path)
 from .config import CURRENT_LOG, INSTANCE_DIR, ensure_directories
 from .form_commands import (
     SETTINGS_DEFAULTS,
@@ -123,6 +125,7 @@ def start_runtime(
         schedule_db.migrate_legacy_scheduled_jobs()
         db.mark_unfinished_jobs_interrupted()
         setup_logging(clear_on_start=db.get_bool_setting("logs.clear_on_start", True))
+        register_legacy_caches()
         if db.get_bool_setting("cache.cleanup_on_start", True):
             cleanup_caches()
         if start_worker is None:
@@ -1048,6 +1051,10 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("index"))
         collection = _collection_context(request.args, from_form=False)
         personal_decision = paper_decision_model(paper_id)
+        cache_info = cache_status(paper['arxiv_id'])
+        for artifact in cache_info['artifacts']:
+            artifact['last_used_at'] = job_views.local_time(artifact['last_used_at'])
+            artifact['expires_at'] = job_views.local_time(artifact['expires_at'])
         with db.connect() as conn:
             call_details = call_attempts.details_for_paper(conn, paper_id)
         return render_template(
@@ -1062,6 +1069,7 @@ def register_routes(app: Flask) -> None:
             paper_themes=paper_themes_model(paper_id) if personal_decision['eligible'] else None,
             team_form=team_form_model(paper, selections=request.args) if personal_decision['eligible'] else None,
             evaluation_actions=_paper_evaluation_actions(paper_id),
+            cache_info=cache_info,
             has_pdf=has_pdf(paper["arxiv_id"]),
             has_markdown=has_markdown(paper["arxiv_id"]),
             pdf_path=pdf_path(paper["arxiv_id"]),
@@ -1070,6 +1078,15 @@ def register_routes(app: Flask) -> None:
             collection_return_url=_collection_redirect_url(collection) if collection else None,
         )
 
+    @app.post('/papers/<int:paper_id>/cache')
+    def prepare_paper_cache(paper_id: int):
+        paper = db.get_paper(paper_id)
+        if not paper:
+            abort(404)
+        job_id = runtime_runner.enqueue('prepare_cache', {'paper_id': paper_id})
+        flash(f'已创建缓存生成任务 #{job_id}，已有评估保留')
+        return redirect(url_for('paper_detail', paper_id=paper_id))
+
     @app.get("/papers/<int:paper_id>/markdown")
     def view_markdown(paper_id: int):
         paper = db.get_paper(paper_id)
@@ -1077,10 +1094,12 @@ def register_routes(app: Flask) -> None:
             flash("论文不存在")
             return redirect(url_for("index"))
         path = markdown_path(paper["arxiv_id"])
-        if not has_markdown(paper["arxiv_id"]):
-            flash("Markdown 缓存不存在，请先触发全文阅读")
-            return redirect(url_for("paper_detail", paper_id=paper_id))
-        return render_template("markdown_view.html", paper=paper, markdown=path.read_text(encoding="utf-8"))
+        with cache_lock(paper['arxiv_id']):
+            if not has_markdown(paper['arxiv_id']):
+                flash('Markdown 缓存不存在，可在详情页重新生成缓存')
+                return redirect(url_for('paper_detail', paper_id=paper_id))
+            markdown = read_cached_markdown(paper['arxiv_id'], path)
+        return render_template('markdown_view.html', paper=paper, markdown=markdown)
 
     @app.get("/papers/<int:paper_id>/pdf")
     def open_pdf(paper_id: int):
@@ -1089,8 +1108,17 @@ def register_routes(app: Flask) -> None:
             flash("论文不存在")
             return redirect(url_for("index"))
         path = pdf_path(paper["arxiv_id"])
-        if has_pdf(paper["arxiv_id"]):
-            return send_file(path, mimetype="application/pdf", as_attachment=False)
+        with cache_lock(paper['arxiv_id']):
+            if has_pdf(paper['arxiv_id']):
+                # send_file opens its stream while the cache lock is held and
+                # preserves conditional/range responses for browser PDF viewers.
+                response = send_file(path, mimetype='application/pdf', as_attachment=False)
+                try:
+                    record_cache_use(paper['arxiv_id'], 'pdf', path)
+                    return response
+                except BaseException:
+                    response.close()
+                    raise
         if paper.get("pdf_url"):
             return redirect(paper["pdf_url"])
         flash("PDF 不存在")
@@ -1125,12 +1153,14 @@ def register_routes(app: Flask) -> None:
 
     @app.post("/api/categories")
     def save_category():
+        mode = parse_choice(request.form.get('collection_mode') or 'top_n', 'collection_mode', {'top_n', 'full'})
         data = {
+            'collection_mode': mode,
             "id": _optional_int(request.form.get("id")),
             "category": parse_required_text(request.form.get("category"), "category"),
             "name": parse_required_text(request.form.get("name"), "name"),
             "enabled": parse_bool(request.form.get("enabled"), "enabled"),
-            "top_n": parse_int(request.form.get("top_n"), "top_n", default=30, minimum=1, maximum=200),
+            "top_n": parse_int(request.form.get("top_n"), "top_n", default=30, minimum=1, maximum=200) if mode == "top_n" else 30,
             "sort_param": request.form.get("sort_param") or "sort=1",
         }
         db.save_category(data)
@@ -1443,6 +1473,7 @@ def register_routes(app: Flask) -> None:
         return render_template(
             "settings.html",
             settings=_settings_form_values(),
+            cache_usage=cache_usage(),
             jobs=_job_status_payloads(db.list_job_summaries(30)),
         )
 
@@ -1455,6 +1486,7 @@ def register_routes(app: Flask) -> None:
             return render_template(
                 "settings.html",
                 settings=_settings_form_values(),
+                cache_usage=cache_usage(),
                 jobs=_job_status_payloads(db.list_job_summaries(30)),
             ), 400
         db.save_settings(command.values)
@@ -1597,6 +1629,8 @@ def _valid_json_or_empty(value: str | None) -> str:
 def _settings_form_values() -> dict[str, Any]:
     values = db.get_settings(SETTINGS_DEFAULTS)
     return {
+        **{key.removeprefix('cache.'): _safe_setting_int(values, key, default, minimum=1, maximum=3650)
+           for key, default in cache_db.RETENTION_DEFAULTS.items()},
         "pdf_retention_days": _safe_setting_int(values, "cache.pdf_retention_days", 5, minimum=0),
         "markdown_retention_days": _safe_setting_int(values, "cache.markdown_retention_days", 7, minimum=0),
         "cleanup_on_start": _safe_setting_bool(values, "cache.cleanup_on_start", True),
@@ -1607,7 +1641,7 @@ def _settings_form_values() -> dict[str, Any]:
         "abstract_concurrency": _safe_setting_int(
             values,
             "llm.abstract_concurrency",
-            4,
+            10,
             minimum=1,
             maximum=20,
         ),
@@ -1874,6 +1908,7 @@ def _job_type_label(job_type: str | None) -> str:
         "crawl_catch_up": "补抓到最新",
         "abstract_eval": "摘要评估",
         "fulltext_eval": "全文阅读",
+        "prepare_cache": "生成全文缓存",
         "cleanup": "缓存清理",
     }.get(str(job_type or ""), str(job_type or "任务"))
 
@@ -1961,6 +1996,10 @@ def _job_status_payloads(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _job_detail_payload(details: dict[str, Any]) -> dict[str, Any] | None:
     phase = details.get("phase")
+    if phase == 'cleanup':
+        return {'summary_lines': [
+            f"扫描 {details.get('scanned',0)} · 普通删除 {details.get('ordinary_deleted',0)} / {details.get('ordinary_deleted_bytes',0)} 字节 · 核心删除 {details.get('core_deleted',0)} / {details.get('core_deleted_bytes',0)} 字节",
+            f"保护跳过 {details.get('protected_skipped',0)} · 孤立跳过 {details.get('orphan_skipped',0)} · 无效文件 {details.get('invalid_skipped',0)} · 错误 {details.get('errors',0)}"], 'item_rows': []}
     if phase == 'investment_memo':
         return {'summary_lines':[f"备忘录版本 #{details.get('version_id')} · {details.get('paper_count',0)} 篇论文",
                                  f"输入 token {details.get('input_tokens')} / 输出 {details.get('output_tokens')}"], 'item_rows':[]}

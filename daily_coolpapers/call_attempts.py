@@ -187,6 +187,7 @@ def begin_provider_request(
     payload: dict[str, Any],
     *,
     fallback_reason: str | None = None,
+    transport_retry_reason: str | None = None,
 ) -> tuple[int | None, float]:
     """Commit provider_started before the transport is allowed to send."""
     operation = _operation.get()
@@ -222,7 +223,8 @@ def begin_provider_request(
                 _safe_provider(provider), _safe_model(payload.get("model") or operation.model),
                 db.now_iso(), input_hash,
                 json.dumps(request_config, ensure_ascii=False, sort_keys=True),
-                operation.retry_reason, _safe_reason(fallback_reason), "response_not_received",
+                _safe_reason(transport_retry_reason) or operation.retry_reason,
+                _safe_reason(fallback_reason), "response_not_received",
             ),
         )
         if operation.memo_version_id is not None:
@@ -509,7 +511,7 @@ def _safe_schema_version(value: Any) -> str | None:
 
 
 def _safe_reason(value: Any) -> str | None:
-    allowed = {"provider_retry", "response_format_unsupported", "format_fallback", "business_retry"}
+    allowed = {"provider_retry", "provider_concurrency_limit", "response_format_unsupported", "format_fallback", "business_retry"}
     return str(value) if isinstance(value, str) and value in allowed else None
 
 

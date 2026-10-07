@@ -1,3 +1,4 @@
+from .cache_db import RETENTION_DEFAULTS
 from pathlib import Path
 
 
@@ -13,6 +14,7 @@ DB_PATH = DATA_DIR / "daily_coolpapers.sqlite3"
 LLM_PROFILES_DB_PATH = INSTANCE_DIR / "llm_profiles.sqlite3"
 
 DEFAULT_SETTINGS = {
+    **RETENTION_DEFAULTS,
     "crawler.default_top_n": 30,
     "crawler.concurrency": 6,
     "crawler.timeout_seconds": 20,
@@ -21,7 +23,7 @@ DEFAULT_SETTINGS = {
     "crawler.trust_env_proxy": False,
     "crawler.proxy_url": "",
     "crawler.missing_field_warning_rate": 0.0,
-    "llm.abstract_concurrency": 4,
+    "llm.abstract_concurrency": 10,
     "llm.abstract_retries": 2,
     "llm.trust_env_proxy": False,
     "llm.pdf_download_timeout_seconds": 300,

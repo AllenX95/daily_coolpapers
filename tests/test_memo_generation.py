@@ -43,6 +43,40 @@ class MemoGenerationTests(unittest.TestCase):
     def get(self,created):
         return memo_db.get_version(created['series_id'],created['id'])[1]
 
+    def test_successful_memo_promotes_cache_pending_and_failed_do_not(self):
+        from daily_coolpapers import cache_db
+        created=self.create()
+        with db.connect() as conn:
+            paper_id=conn.execute('SELECT paper_id FROM investment_memo_version_papers WHERE memo_version_id=?',(created['id'],)).fetchone()[0]
+        db.set_paper_decision(paper_id,'clear')
+        key=db.get_paper(paper_id)['arxiv_id']
+        with db.connect() as conn:
+            cache_db.register_artifact(conn,key,'pdf',1234,generated_at='2026-01-01T00:00:00+00:00',used=True)
+            self.assertFalse(cache_db.core_reasons(conn,[key])[key])
+        _,call=self.run_version(created)
+        self.assertEqual(call.call_count,1)
+        memo_db.archive_series(created['series_id'])
+        with db.connect_readonly() as conn:
+            self.assertEqual(cache_db.core_reasons(conn,[key])[key],['successful_memo_reference'])
+            self.assertIsNotNone(conn.execute('SELECT tier_promoted_at FROM paper_cache_artifacts').fetchone()[0])
+        with db.connect() as conn:
+            conn.execute('UPDATE investment_memo_version_papers SET paper_id=NULL WHERE memo_version_id=?',(created['id'],))
+            self.assertEqual(cache_db.core_reasons(conn,[key])[key],['successful_memo_reference'])
+
+    def test_failed_memo_does_not_promote_cache(self):
+        from daily_coolpapers import cache_db
+        created=self.create()
+        with db.connect() as conn:
+            paper_id=conn.execute('SELECT paper_id FROM investment_memo_version_papers WHERE memo_version_id=?',(created['id'],)).fetchone()[0]
+        db.set_paper_decision(paper_id,'clear')
+        key=db.get_paper(paper_id)['arxiv_id']
+        with db.connect() as conn:
+            cache_db.register_artifact(conn,key,'pdf',1234,generated_at='2026-01-01T00:00:00+00:00',used=True)
+        _,call=self.run_version(created,error=LLMError('Synthetic failure'))
+        with db.connect_readonly() as conn:
+            self.assertFalse(cache_db.core_reasons(conn,[key])[key])
+            self.assertIsNone(conn.execute('SELECT tier_promoted_at FROM paper_cache_artifacts').fetchone()[0])
+
     def test_success_atomic_job_version_markdown_index_and_usage(self):
         created = self.create()
         outcome,call = self.run_version(created)

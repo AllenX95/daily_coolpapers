@@ -7,6 +7,7 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="category" placeholder="cs.AI" required>
     <input name="name" placeholder="Artificial Intelligence" required>
+    <label>采集模式 <select name="collection_mode"><option value="full" selected>每日全量</option><option value="top_n">Top N</option></select></label>
     <input name="top_n" type="number" min="1" max="200" value="30">
     <input name="sort_param" value="sort=1">
     <label class="check"><input type="checkbox" name="enabled" value="1" checked> 启用</label>
@@ -15,7 +16,7 @@
 </section>
 <section class="table-wrap">
   <table>
-    <thead><tr><th>类目</th><th>名称</th><th>Top N</th><th>排序参数</th><th>启用</th><th>保存</th></tr></thead>
+    <thead><tr><th>类目</th><th>名称</th><th>采集模式</th><th>Top N（仅限 Top N 模式）</th><th>排序参数</th><th>启用</th><th>保存</th></tr></thead>
     <tbody>
       {% for category in categories %}
         <tr>
@@ -24,6 +25,7 @@
             <input type="hidden" name="id" value="{{ category.id }}">
             <td><input name="category" value="{{ category.category }}"></td>
             <td><input name="name" value="{{ category.name }}"></td>
+            <td><select name="collection_mode"><option value="top_n" {% if category.collection_mode == 'top_n' %}selected{% endif %}>Top N</option><option value="full" {% if category.collection_mode == 'full' %}selected{% endif %}>每日全量</option></select></td>
             <td><input name="top_n" type="number" value="{{ category.top_n }}" min="1" max="200"></td>
             <td><input name="sort_param" value="{{ category.sort_param }}"></td>
             <td><input type="checkbox" name="enabled" value="1" {% if category.enabled %}checked{% endif %}></td>

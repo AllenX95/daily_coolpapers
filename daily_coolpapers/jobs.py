@@ -10,6 +10,7 @@ from typing import Any, Callable
 from . import db
 from .cache_manager import cleanup_caches
 from . import schedule_db
+from .llm_concurrency import reset_idle_provider_limits
 from .services import (SHANGHAI_TZ, build_daily_pipeline_plan, run_daily_pipeline,
                        crawl_all_categories, crawl_to_latest, evaluate_missing_abstracts, evaluate_paper,
                        safe_evaluation_error)
@@ -347,6 +348,7 @@ class JobRunner:
         if not job or job['status'] != 'pending':
             return
         payload = job.get("payload_data") or {}
+        reset_idle_provider_limits()
         if job['type'] == 'investment_memo_generation':
             # Memo and job transitions must share one SQLite transaction.
             from .memos import generate_memo
@@ -445,11 +447,24 @@ class JobRunner:
                 )
                 progress(1, 1, "全文阅读完成")
                 return result
+            if job_type == 'prepare_cache':
+                from .fulltext import ensure_markdown
+                from .cache_manager import download_pdf
+                paper = db.get_paper(int(payload['paper_id']))
+                if paper is None:
+                    raise ValueError('论文不存在')
+                progress(0, 1, '下载并生成全文缓存')
+                download_pdf(paper['arxiv_id'], paper['pdf_url'],
+                    timeout_seconds=db.get_int_setting('llm.pdf_download_timeout_seconds', 300),
+                    retries=db.get_int_setting('llm.pdf_download_retries', 2))
+                path, created = ensure_markdown(paper)
+                progress(1, 1, '全文缓存已就绪')
+                return {'paper_id': paper['id'], 'created': created}
             if job_type == "cleanup":
                 progress(0, 1, "准备清理缓存")
                 result = cleanup_caches()
-                progress(1, 1, "缓存清理完成")
-                return result
+                progress(1, 1, "缓存清理完成" if not result.get("errors") else "缓存清理有错误，未完成项已保留", {"phase": "cleanup", **result})
+                return JobExecutionResult(result, "partial_success" if result.get("errors") and (result.get("pdf_deleted") or result.get("markdown_deleted")) else "failed" if result.get("errors") else "success")
             raise ValueError(f"未知任务类型: {job_type}")
         finally:
             with progress_lock:

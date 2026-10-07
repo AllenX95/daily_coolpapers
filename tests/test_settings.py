@@ -33,6 +33,9 @@ class SettingsCommandTests(unittest.TestCase):
             SettingsCommand.from_form({"abstract_concurrency": "21"})
         self.assertIn("abstract_concurrency", caught.exception.errors)
 
+    def test_omitted_concurrency_uses_ten(self):
+        self.assertEqual(SettingsCommand.from_form({}).values['llm.abstract_concurrency'], 10)
+
 
 class SettingsPersistenceTests(unittest.TestCase):
     def test_save_settings_rolls_back_all_values_on_serialization_failure(self):
@@ -72,7 +75,7 @@ class SettingsPersistenceTests(unittest.TestCase):
         with patch.object(app_module.db, "get_settings", return_value=malformed):
             values = app_module._settings_form_values()
 
-        self.assertEqual(values["abstract_concurrency"], 4)
+        self.assertEqual(values["abstract_concurrency"], 10)
         self.assertTrue(values["cleanup_on_start"])
 
 

@@ -1,0 +1,132 @@
+[
+  {
+    "measured_at": "2026-10-07T02:30:56.735997+00:00",
+    "runtime": {
+      "python": "3.12.2",
+      "sqlite": "3.43.1",
+      "platform": "win32"
+    },
+    "source_sha256": {
+      "cache_db.py": "f4eddce9a7aab3a1361aa364e943a0a749b4d481e35b6af01195e458d54fdfe2",
+      "cache_manager.py": "a158cab4e4eb677115d9d040752f88180e8c22bddd5ca32222be97c8b9ae78ed",
+      "db.py": "a6450a772b8994988fbe738e4c06bf0c9415df5703f2cfe5a1e1df96d8bccabc"
+    },
+    "paper_count": 10000,
+    "counts_before": {
+      "papers": 10000,
+      "paper_categories": 20000,
+      "evaluations": 2500,
+      "paper_cache_artifacts": 10000
+    },
+    "database_growth_bytes": 36503552,
+    "database_bytes_per_paper": 3650.36,
+    "preparation_seconds": 4.588,
+    "cleanup_seconds": 2.499,
+    "cache_lock_hold": {
+      "count": 100,
+      "median_ms": 9.72,
+      "p95_ms": 12.431,
+      "max_ms": 150.421
+    },
+    "storage_before": {
+      "database_bytes": 36958208,
+      "pdf_bytes": 0,
+      "markdown_bytes": 2700000,
+      "pdf_files": 0,
+      "markdown_files": 10000
+    },
+    "storage_after": {
+      "database_bytes": 36958208,
+      "pdf_bytes": 0,
+      "markdown_bytes": 2673000,
+      "pdf_files": 0,
+      "markdown_files": 9900
+    },
+    "cleanup": {
+      "pdf_deleted": 0,
+      "markdown_deleted": 100,
+      "pdf_tmp_deleted": 0,
+      "markdown_tmp_deleted": 0,
+      "job_events_deleted": 0,
+      "deleted_bytes": 27000,
+      "ordinary_deleted": 100,
+      "core_deleted": 0,
+      "ordinary_deleted_bytes": 27000,
+      "core_deleted_bytes": 0,
+      "missing_records_repaired": 0,
+      "skipped": 0,
+      "errors": 0,
+      "scanned": 10000,
+      "protected_skipped": 9900,
+      "orphan_skipped": 0,
+      "invalid_skipped": 0
+    },
+    "restart_preserves_times": true,
+    "note": "Synthetic metadata/evaluations; no classification or memo snapshots. One MD per paper is scan stress, not production fulltext rate."
+  },
+  {
+    "measured_at": "2026-10-07T02:31:06.240922+00:00",
+    "runtime": {
+      "python": "3.12.2",
+      "sqlite": "3.43.1",
+      "platform": "win32"
+    },
+    "source_sha256": {
+      "cache_db.py": "f4eddce9a7aab3a1361aa364e943a0a749b4d481e35b6af01195e458d54fdfe2",
+      "cache_manager.py": "a158cab4e4eb677115d9d040752f88180e8c22bddd5ca32222be97c8b9ae78ed",
+      "db.py": "a6450a772b8994988fbe738e4c06bf0c9415df5703f2cfe5a1e1df96d8bccabc"
+    },
+    "paper_count": 100000,
+    "counts_before": {
+      "papers": 100000,
+      "paper_categories": 200000,
+      "evaluations": 25000,
+      "paper_cache_artifacts": 100000
+    },
+    "database_growth_bytes": 366817280,
+    "database_bytes_per_paper": 3668.17,
+    "preparation_seconds": 82.335,
+    "cleanup_seconds": 46.577,
+    "cache_lock_hold": {
+      "count": 1000,
+      "median_ms": 27.927,
+      "p95_ms": 88.611,
+      "max_ms": 330.63
+    },
+    "storage_before": {
+      "database_bytes": 367271936,
+      "pdf_bytes": 0,
+      "markdown_bytes": 27000000,
+      "pdf_files": 0,
+      "markdown_files": 100000
+    },
+    "storage_after": {
+      "database_bytes": 367271936,
+      "pdf_bytes": 0,
+      "markdown_bytes": 26730000,
+      "pdf_files": 0,
+      "markdown_files": 99000
+    },
+    "cleanup": {
+      "pdf_deleted": 0,
+      "markdown_deleted": 1000,
+      "pdf_tmp_deleted": 0,
+      "markdown_tmp_deleted": 0,
+      "job_events_deleted": 0,
+      "deleted_bytes": 270000,
+      "ordinary_deleted": 1000,
+      "core_deleted": 0,
+      "ordinary_deleted_bytes": 270000,
+      "core_deleted_bytes": 0,
+      "missing_records_repaired": 0,
+      "skipped": 0,
+      "errors": 0,
+      "scanned": 100000,
+      "protected_skipped": 99000,
+      "orphan_skipped": 0,
+      "invalid_skipped": 0
+    },
+    "restart_preserves_times": true,
+    "note": "Synthetic metadata/evaluations; no classification or memo snapshots. One MD per paper is scan stress, not production fulltext rate."
+  }
+]
