@@ -2,7 +2,7 @@
 
 开发 PRD、设计评估、性能基线与验收报告统一收录在 [doc/](doc/README.md)。最新方案见[全量采集与梯次存储优化](doc/PRD_全量采集与梯次存储优化.md)，T0–T4 开发与隔离验收见[实施报告](doc/TIERED_STORAGE_RELEASE_REPORT.md)。
 
-一个轻量、本地优先的 Web 服务，帮助早期 VC 投资人和科研人员跟踪并消化 [papers.cool](https://papers.cool) 上的 arXiv 论文。项目以 **papers.cool 的阅读星星数**（PDF 点击 + Kimi 点击）作为众包质量信号，再利用大语言模型从 VC 投资视角评估摘要，并在需要时按需精读全文。
+一个轻量、本地优先的 Web 服务，帮助早期 VC 投资人和科研人员跟踪并消化 [papers.cool](https://papers.cool) 上的 arXiv 论文。项目以 **papers.cool 的阅读星星数**（PDF 点击 + Kimi 点击）作为读者兴趣信号，再利用大语言模型从 VC 投资视角评估摘要，并在需要时按需精读全文。
 
 [![GitHub](https://img.shields.io/badge/GitHub-AllenX95%2Fdaily__coolpapers-blue)](https://github.com/AllenX95/daily_coolpapers)
 
@@ -36,6 +36,8 @@
 ## 为什么阅读星星数很重要
 
 在 papers.cool 上，每篇论文都会显示读者点击 **PDF** 和 **Kimi** 的次数。本项目将两者加总为 **reading_stars（阅读星星数）**，作为读者关注度的代理指标。结合类目排名，它能在你花费 LLM token 之前，快速给出哪些论文正在吸引注意的数据化信号。
+
+阅读热度只作辅助参考，不是技术质量评分，也不是独立认可人数。进入 **新方向探索** 页面，选择独立探索模型，预览最近七个完整自然日，每周手动生成一次周报。系统结合相对热度、随机和方向边缘样本，最多读取 40 篇原始摘要，正常五次模型调用、含重试最多十次实际请求，提出最多三个候选方向。你可以继续观察、忽略，或先编辑范围再加入关注方向；不会下载全文或自动补分类历史论文。详情见 [轻量新方向探索 PRD](doc/PRD_轻量新方向探索.md)。
 
 ---
 

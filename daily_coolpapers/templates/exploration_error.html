@@ -1,0 +1,2 @@
+{% extends 'base.html' %}
+{% block content %}<section><h1>探索操作未完成</h1>{% for key,value in errors.items() %}<p role="alert">{{ value }}</p>{% endfor %}<a href="{{ url_for('exploration_list') }}">返回新方向探索</a></section>{% endblock %}

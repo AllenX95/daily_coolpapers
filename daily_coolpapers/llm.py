@@ -3,6 +3,8 @@ import logging
 import math
 import re
 import time
+import contextvars
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -17,6 +19,18 @@ from .network import httpx_proxy_kwargs
 from .security import secret_store
 
 logger = logging.getLogger(__name__)
+
+_request_reservation = contextvars.ContextVar('llm_request_reservation', default=None)
+
+
+@contextmanager
+def request_budget(reserve):
+    """Apply a durable reservation before every HTTP attempt, including fallbacks."""
+    token = _request_reservation.set(reserve)
+    try:
+        yield
+    finally:
+        _request_reservation.reset(token)
 
 
 class LLMError(RuntimeError):
@@ -319,6 +333,9 @@ def _tracked_post(
     # These explicit rejections are retried without consuming the business retry budget.
     for index in range(5):
         with limiter.slot() as ticket:
+            reserve = _request_reservation.get()
+            if reserve is not None:
+                reserve()
             attempt_id, started = call_attempts.begin_provider_request(
                 provider, payload, fallback_reason=fallback_reason,
                 transport_retry_reason='provider_concurrency_limit' if index else None,

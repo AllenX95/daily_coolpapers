@@ -9,12 +9,14 @@ from . import db
 LOCAL_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
 STAGES = {'plan': '计划', 'crawl_http': '抓取', 'crawl_parse': '完整性检查', 'persist': '入库',
           'direction_backfill': '历史补分类', 'classification': '关注方向分类',
-          'abstract_plan': '候选选择', 'abstract_eval': '摘要评估', 'investment_memo':'备忘录生成', 'finalize': '完成'}
+          'abstract_plan': '候选选择', 'abstract_eval': '摘要评估', 'investment_memo':'备忘录生成', 'exploration':'新方向探索', 'finalize': '完成'}
 SOURCES = {'scheduled': '定时运行', 'manual_latest': '手动最新', 'manual_catch_up': '手动补抓'}
 STATUS_LABELS = {'pending': '排队中', 'running': '运行中', 'success': '已完成',
                  'partial_success': '部分完成', 'failed': '失败', 'interrupted': '已中断',
                  'warning': '警告', 'empty_success': '合法空结果'}
 EVENT_LABELS = {
+    'exploration.plan_created':'探索计划已固化','exploration.started':'探索开始',
+    'exploration.batch_completed':'研究信号提取完成','exploration.completed':'探索周报已保存',
     'investment_memo.version_created':'备忘录版本已创建','investment_memo.generation_started':'备忘录生成开始',
     'investment_memo.generation_succeeded':'备忘录生成成功','investment_memo.generation_failed':'备忘录生成失败／中断',
     'classification.plan_created':'分类计划已创建','classification.skipped_no_active_directions':'没有启用方向，合法跳过分类',

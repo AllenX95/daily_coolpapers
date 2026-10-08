@@ -205,6 +205,24 @@ class JobRunner:
                 self.queue.put(created['job_id'])
         return created
 
+    def enqueue_exploration(self, *, run_id=None, synthesis_only=False, acknowledged=False):
+        from . import exploration, exploration_db
+        with self._state_lock:
+            self._require_accepting_locked()
+            if run_id is None:
+                plan = exploration.build_plan()
+                if plan['papers'] and plan['config_error']:
+                    from .form_commands import FormValidationError
+                    raise FormValidationError({'profile':plan['config_error']})
+                created = exploration_db.create(plan)
+            else:
+                created = exploration_db.retry(run_id,synthesis_only=synthesis_only,acknowledged=acknowledged)
+            _, job_id, is_new = created
+            if is_new:
+                self._queued_job_ids.add(job_id)
+                self.queue.put(job_id)
+        return created
+
     def enqueue_pipeline(
         self, trigger_source: str, category_ids: list[int] | None = None, *,
         start_date: str | None = None, end_date: str | None = None,
@@ -412,6 +430,10 @@ class JobRunner:
                 progress_writer.update(current, total, message, details)
 
         try:
+            if job_type == 'direction_exploration':
+                from .exploration import run_exploration
+                result = run_exploration(job_id,int(payload['run_id']),progress=progress)
+                return JobExecutionResult(result,result['status'])
             if job_type == db.DAILY_PIPELINE_JOB_TYPE:
                 result = run_daily_pipeline(job_id, payload, progress=progress)
                 return JobExecutionResult(result, result['status'])
