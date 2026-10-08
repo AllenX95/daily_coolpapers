@@ -2,7 +2,7 @@
 
 Development PRDs, design reviews, benchmarks, and release reports are collected in [doc/](doc/README.md). See the [full collection and tiered storage plan](doc/PRD_全量采集与梯次存储优化.md) for the implemented policy and the [implementation report](doc/TIERED_STORAGE_RELEASE_REPORT.md) for validation and rollout details.
 
-A lightweight, local-first web service that helps early-stage VC investors and researchers track and digest arXiv papers from [papers.cool](https://papers.cool). It uses **papers.cool reading stars** (PDF + Kimi clicks) as a crowd-sourced quality signal, then leverages large language models to evaluate abstracts and, on demand, read full texts from a VC investment perspective.
+A lightweight, local-first web service that helps early-stage VC investors and researchers track and digest arXiv papers from [papers.cool](https://papers.cool). It uses **papers.cool reading stars** (PDF + Kimi clicks) as a reader-interest signal, then uses large language models to evaluate abstracts and, on demand, read full texts from a VC investment perspective.
 
 [![GitHub](https://img.shields.io/badge/GitHub-AllenX95%2Fdaily__coolpapers-blue)](https://github.com/AllenX95/daily_coolpapers)
 
@@ -36,6 +36,8 @@ A lightweight, local-first web service that helps early-stage VC investors and r
 ## Why Reading Stars Matter
 
 On papers.cool, each paper shows how many readers clicked **PDF** and **Kimi**. This project sums them into a **reading_stars** metric as a proxy for reader interest. Combined with category rank, it gives a quick, data-driven signal of which papers are drawing attention before you spend LLM tokens on them.
+
+Reading stars are auxiliary popularity data, not a technical-quality score or a count of unique endorsing readers. The **New Direction Exploration** page uses relative heat alongside random and adjacent-direction samples. Select a dedicated exploration model, preview the previous seven complete days, and manually generate a weekly report: up to 40 abstracts, normally five model calls, at most ten physical requests including retries, and up to three candidate directions. Observe, ignore, or edit a candidate before adding it to your reading focus. No PDF download or automatic historical backfill occurs. See the [exploration PRD](doc/PRD_轻量新方向探索.md).
 
 ---
 

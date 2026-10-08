@@ -11,8 +11,9 @@
   <section class="theme-create"><h2>新增关注方向</h2>
     <form method="post" action="{{ url_for('create_attention_direction') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>方向名称<input name="name" required></label>
-      <label>范围简介<textarea name="scope_text" required rows="6" placeholder="用自然语言描述你关心的范围，也可以加入排除项或例子。"></textarea></label>
+      {% if prefill %}<input type="hidden" name="exploration_run" value="{{ prefill.run_id }}"><input type="hidden" name="candidate_id" value="{{ prefill.id }}"><input type="hidden" name="version" value="{{ prefill.version }}"><p>来自探索候选；请确认范围后保存。保存后不自动补分类历史论文。</p>{% endif %}
+      <label>方向名称<input name="name" value="{{ prefill.name if prefill else '' }}" required></label>
+      <label>范围简介<textarea name="scope_text" required rows="6" placeholder="用自然语言描述你关心的范围，也可以加入排除项或例子。">{{ prefill.scope_text if prefill else '' }}</textarea></label>
       <button type="submit">保存新方向</button>
     </form>
     <p class="small muted">分类使用独立模型。请在 <a href="{{ url_for('llm_profiles') }}">LLM 设置</a>选择默认分类模型，或在 <a href="{{ url_for('prompts') }}">Prompt 管理</a>单独绑定。</p>

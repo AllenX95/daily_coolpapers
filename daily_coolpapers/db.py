@@ -566,6 +566,8 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     if 'collection_mode' not in category_columns:
         conn.execute("ALTER TABLE categories ADD COLUMN collection_mode TEXT NOT NULL DEFAULT 'top_n' CHECK(collection_mode IN ('top_n','full'))")
     cache_db.init_schema(conn)
+    from .exploration_db import init_schema as init_exploration_schema
+    init_exploration_schema(conn)
 
 
 FULLTEXT_EVALUATION_PROJECTION_MIGRATION = "fulltext_evaluation_projection_v1"
@@ -786,7 +788,7 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             (category, name, now, now),
         )
 
-    existing_prompts = conn.execute("SELECT COUNT(*) FROM prompts WHERE type != 'direction_classification'").fetchone()[0]
+    existing_prompts = conn.execute("SELECT COUNT(*) FROM prompts WHERE type NOT IN ('direction_classification','direction_exploration_extract','direction_exploration_synthesis')").fetchone()[0]
     if existing_prompts == 0:
         conn.execute(
             """
@@ -3535,7 +3537,7 @@ def list_job_event_page(
     order = """COALESCE(e.crawl_date,''),COALESCE(e.category,''),
         CASE e.stage WHEN 'plan' THEN 0 WHEN 'crawl_http' THEN 1 WHEN 'crawl_parse' THEN 2
         WHEN 'persist' THEN 3 WHEN 'direction_backfill' THEN 4 WHEN 'classification' THEN 5 WHEN 'abstract_plan' THEN 6 WHEN 'abstract_eval' THEN 7
-        WHEN 'investment_memo' THEN 8 WHEN 'finalize' THEN 9 ELSE 10 END,e.id""" if view == 'grouped' else 'e.id'
+        WHEN 'investment_memo' THEN 8 WHEN 'exploration' THEN 9 WHEN 'finalize' THEN 10 ELSE 11 END,e.id""" if view == 'grouped' else 'e.id'
     page_size = min(100, max(1, int(page_size)))
     with connect() as conn:
         conn.execute('BEGIN')

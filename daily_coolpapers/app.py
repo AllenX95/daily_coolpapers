@@ -154,9 +154,13 @@ def create_app(
     register_template_helpers(app)
     register_request_security(app)
     register_routes(app)
+    from .exploration_routes import register_exploration_routes
+    register_exploration_routes(app)
 
     @app.errorhandler(FormValidationError)
     def handle_form_validation(error: FormValidationError):
+        if request.endpoint and request.endpoint.startswith('exploration_'):
+            return render_template('exploration_error.html',errors=error.errors),400
         if request.endpoint and request.endpoint.startswith('memo_'):
             return _memo_error_response({'errors':error.errors},400)
         if request.endpoint in DIRECTION_ENDPOINTS:
@@ -1317,12 +1321,27 @@ def register_routes(app: Flask) -> None:
 
     @app.get('/attention-directions')
     def attention_directions():
+        prefill = None
+        if request.args.get('exploration_run'):
+            from . import exploration_db
+            run_id = parse_int(request.args.get('exploration_run'),'run',minimum=1,maximum=2**63-1)
+            candidate_id = parse_int(request.args.get('candidate_id'),'candidate',minimum=1,maximum=3)
+            run,candidate = exploration_db.candidate(run_id,candidate_id)
+            prefill = {'run_id':run_id,'candidate_id':candidate_id,'version':run['version'],**candidate}
         return render_template('attention_directions.html', directions=db.list_attention_directions(),
-                               show_archived=request.args.get('archived') == '1')
+                               show_archived=request.args.get('archived') == '1',prefill=prefill)
 
     @app.post('/attention-directions')
     def create_attention_direction():
-        direction_id = db.create_attention_direction(request.form.get('name'), request.form.get('scope_text'))
+        if request.form.get('exploration_run'):
+            from . import exploration_db
+            direction_id = exploration_db.decide(
+                parse_int(request.form.get('exploration_run'),'run',minimum=1,maximum=2**63-1),
+                parse_int(request.form.get('candidate_id'),'candidate',minimum=1,maximum=3),
+                'added','',parse_int(request.form.get('version'),'version',minimum=0,maximum=2**63-1),
+                name=request.form.get('name'),scope_text=request.form.get('scope_text'))
+        else:
+            direction_id = db.create_attention_direction(request.form.get('name'), request.form.get('scope_text'))
         flash('关注方向已创建；历史论文不会自动重跑。名称和范围保存后不可修改。')
         return redirect(url_for('attention_directions', _anchor=f'direction-{direction_id}'))
 
@@ -1365,7 +1384,8 @@ def register_routes(app: Flask) -> None:
         prompt_type = parse_choice(
             request.form.get("type"),
             "type",
-            {"abstract_review", "fulltext_review", "direction_classification", "investment_memo"},
+            {"abstract_review", "fulltext_review", "direction_classification", "investment_memo",
+             "direction_exploration_extract", "direction_exploration_synthesis"},
         )
         data = {
             "id": _optional_int(request.form.get("id")),
@@ -1903,6 +1923,7 @@ def _job_type_label(job_type: str | None) -> str:
     return {
         "daily_pipeline": "每日情报流水线",
         "direction_backfill": "关注方向历史补分类",
+        "direction_exploration": "新方向探索周报",
         "investment_memo_generation": "研究备忘录生成",
         "crawl": "抓取 Metadata",
         "crawl_catch_up": "补抓到最新",

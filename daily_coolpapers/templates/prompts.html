@@ -12,6 +12,8 @@
         <option value="fulltext_review">全文阅读</option>
         <option value="direction_classification">关注方向分类</option>
         <option value="investment_memo">研究备忘录</option>
+        <option value="direction_exploration_extract">新方向探索：提取</option>
+        <option value="direction_exploration_synthesis">新方向探索：汇总</option>
       </select>
       <select name="llm_profile_id">
         <option value="">使用默认模型</option>
@@ -46,6 +48,8 @@
             <option value="fulltext_review" {% if prompt.type == "fulltext_review" %}selected{% endif %}>全文阅读</option>
             <option value="direction_classification" {% if prompt.type == "direction_classification" %}selected{% endif %}>关注方向分类</option>
             <option value="investment_memo" {% if prompt.type == "investment_memo" %}selected{% endif %}>研究备忘录</option>
+            <option value="direction_exploration_extract" {% if prompt.type == "direction_exploration_extract" %}selected{% endif %}>新方向探索：提取</option>
+            <option value="direction_exploration_synthesis" {% if prompt.type == "direction_exploration_synthesis" %}selected{% endif %}>新方向探索：汇总</option>
           </select>
           <select name="llm_profile_id">
             <option value="">使用默认模型</option>

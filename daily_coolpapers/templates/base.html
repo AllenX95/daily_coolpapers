@@ -24,6 +24,7 @@
         <a class="nav-link {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}active{% endif %}" {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}aria-current="page"{% endif %} href="{{ url_for('investment_themes') }}">投资主题</a>
         <a class="nav-link {% if request.endpoint == 'research_entities' %}active{% endif %}" {% if request.endpoint == 'research_entities' %}aria-current="page"{% endif %} href="{{ url_for('research_entities') }}">研究对象</a>
         <a class="nav-link {% if request.endpoint == 'attention_directions' %}active{% endif %}" href="{{ url_for('attention_directions') }}">关注方向</a>
+        <a class="nav-link {% if request.endpoint and request.endpoint.startswith('exploration_') %}active{% endif %}" href="{{ url_for('exploration_list') }}">新方向探索</a>
         <a class="nav-link {% if request.endpoint and request.endpoint.startswith('memo_') %}active{% endif %}" href="{{ url_for('memo_list') }}">备忘录</a>
         <a class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}" {% if request.endpoint == 'categories' %}aria-current="page"{% endif %} href="{{ url_for('categories') }}">类目</a>
         <a class="nav-link {% if request.endpoint == 'prompts' %}active{% endif %}" {% if request.endpoint == 'prompts' %}aria-current="page"{% endif %} href="{{ url_for('prompts') }}">Prompt</a>

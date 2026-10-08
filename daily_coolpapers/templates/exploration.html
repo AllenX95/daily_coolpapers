@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block title %}新方向探索 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head"><div><span class="eyebrow">Weekly discovery / 每周探索</span><h1>新方向探索</h1><p class="muted">从已采集论文中发现值得继续观察的研究问题。每周手动运行一次，最多 40 篇、3 个候选。</p><p>阅读热度只辅助选样。探索只使用标题及原始摘要，不下载全文。</p></div></section>
+<div class="theme-workspace">
+<section class="theme-create"><h2>本周预览</h2><p>{{ plan.date_from }} 至 {{ plan.date_to }} · 北京时间，最近七个完整自然日</p>
+<p>热度 {{ plan.sample_counts.get('heat',0) }} / 随机 {{ plan.sample_counts.get('random',0) }} / 边缘 {{ plan.sample_counts.get('edge',0) }} 篇</p>
+<p>候选池 {{ plan.counts.total }} 篇；输入不完整 {{ plan.counts.get('incomplete',0) }}；分类待完成 {{ plan.counts.get('classification_pending',0) }}；已探索 {{ plan.counts.get('explored',0) }}；上下文超限 {{ plan.counts.get('context_excluded',0) }}。</p>
+{% if not plan.directions %}<p>未设关注方向，使用未设方向探索池。</p>{% endif %}
+<p>预计 {{ plan.logical_calls }} 次逻辑调用；本次最多 {{ 10 if plan.papers else 0 }} 次实际请求（含重试）。入队时重新固化实际样本。</p>
+{% for kind,config in plan.configs.items() %}<p class="small">{{ '提取' if kind.endswith('extract') else '汇总' }}：{{ config.profile.model }} · Prompt v{{ config.prompt.version }} · 输出上限 {{ config.profile.max_output_tokens }} tokens</p>{% endfor %}
+{% if plan.config_error %}<p role="alert">{{ plan.config_error }}</p>{% endif %}
+<form method="post" action="{{ url_for('exploration_generate') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button {% if plan.papers and plan.config_error %}disabled{% endif %}>生成探索周报</button></form>
+<h3>独立探索模型</h3><form method="post" action="{{ url_for('exploration_profile') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>探索模型<select name="profile_id" required><option value="">请选择</option>{% for profile in profiles %}<option value="{{ profile.id }}" {% if profile.id==profile_id %}selected{% endif %}>{{ profile.name }} · {{ profile.model }}</option>{% endfor %}</select></label><button class="secondary">保存模型</button></form>
+<p class="small muted">也可在 <a href="{{ url_for('prompts') }}">Prompt 管理</a>分别绑定探索提取与汇总模型；绑定优先于此选择。</p>
+</section>
+<section class="theme-catalog"><h2>探索周报</h2>{% for report in reports %}<article class="theme-record"><h3><a href="{{ url_for('exploration_detail',run_id=report.id) }}">{{ report.date_from }} — {{ report.date_to }}</a></h3><p>{{ report.job_status }} · {{ report.candidate_count }} 个候选 · #{{ report.id }}</p></article>{% else %}<p class="empty">尚未生成周报。先预览，再开始第一次探索。</p>{% endfor %}
+<nav aria-label="周报分页">{% if page>1 %}<a href="{{ url_for('exploration_list',page=page-1) }}">上一页</a>{% endif %} 第 {{ page }} 页 {% if page*10<total %}<a href="{{ url_for('exploration_list',page=page+1) }}">下一页</a>{% endif %}</nav></section>
+</div>
+{% endblock %}
