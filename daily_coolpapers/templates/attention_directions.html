@@ -2,7 +2,7 @@
 {% block title %}关注方向 - Daily Cool Papers{% endblock %}
 {% block content %}
 <section class="favorites-head"><div><span class="eyebrow">Reading focus / 阅读前筛选</span><h1>关注方向</h1>
-  <p class="muted">你定义边界，模型依据原始摘要筛选。与阅读后手动归档的投资主题相互独立。</p>
+  <p class="muted">你定义关注范围，分类初筛依据论文原始摘要判断，待判断项目可继续精筛或人工处理。投资主题有独立说明与分类结果。</p>
   <p>保存后不能修改；归档后不可恢复。新增方向不会自动重跑历史论文。</p>
   {% if not directions|selectattr('status','equalto','active')|list %}<p role="status">当前未启用关注方向，将对全部新论文执行摘要评估。</p>{% endif %}
   <a href="{{ url_for('attention_directions', archived='0' if show_archived else '1') }}">{{ '只看启用方向' if show_archived else '查看归档历史' }}</a>
@@ -23,6 +23,11 @@
     <article class="theme-record {{ direction.status }}" id="direction-{{ direction.id }}">
       <header><h2>{{ direction.name }}</h2><span class="decision-badge">{{ '启用' if direction.status == 'active' else '已归档（终态）' }}</span></header>
       <p class="theme-description">{{ direction.scope_text }}</p><p class="small muted">#{{ direction.id }} · {{ direction.created_at }}</p>
+      <div class="classification-counts">
+        <a href="{{ url_for('classification_target_page',target_type='attention_direction',target_id=direction.id,view='selected') }}">已入选 {{ direction.selected_count }} 篇</a>
+        <a href="{{ url_for('classification_target_page',target_type='attention_direction',target_id=direction.id,view='pending') }}">待处理 {{ direction.pending_count }} 篇</a>
+        <a href="{{ url_for('classification_target_page',target_type='attention_direction',target_id=direction.id,view='removed') }}">已移出 {{ direction.removed_count }} 篇</a>
+      </div>
       {% if direction.status == 'active' %}
       <details><summary>手动补分类历史论文</summary>
         <p class="small muted">按抓取日期选择闭区间；跨类目去重，只处理本方向尚无成功结果的论文。先预览调用上限，再确认执行。</p>

@@ -1,36 +1,73 @@
-<div class="paper-themes" aria-labelledby="paper-themes-heading" data-testid="paper-themes">
+{% if paper_themes is defined and paper_themes %}
+<section class="paper-themes" aria-labelledby="paper-themes-heading" data-testid="paper-themes">
   <div class="personal-decision-head">
-    <div><span class="eyebrow">Research folders / 研究归档</span><h3 id="paper-themes-heading">加入投资主题</h3></div>
+    <div><span class="eyebrow">Investment themes / 投资主题</span><h2 id="paper-themes-heading">投资主题</h2></div>
     <a href="{{ url_for('investment_themes', paper_id=paper.id) }}">创建／管理主题</a>
   </div>
-  <p class="small muted">主题归档与收藏、跳过独立。保存只更新下方活跃主题；已归档关系需明确移除。</p>
+  <p class="small muted">这里的归类独立于收藏、跳过和全文评估。手动加入主题不要求已有成功全文结果；Pro 复核只给建议，移出和恢复由你确认。</p>
   {% for message in get_flashed_messages(category_filter=['themes']) %}<p class="decision-feedback" role="status">{{ message }}</p>{% endfor %}
-  {% if paper_themes.assigned %}
-    <ul class="assigned-themes" aria-label="已加入的投资主题">
-      {% for theme in paper_themes.assigned %}
-        <li><a class="theme-tag {{ theme.status }}" href="{{ url_for('investment_theme_papers', theme_id=theme.id) }}">{{ theme.name }}{% if theme.status == 'archived' %} · 已归档{% endif %}</a>
-          <form method="post" action="{{ url_for('remove_paper_investment_theme', paper_id=paper.id, theme_id=theme.id) }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            {% if collection_context %}{% for key in ('collection', 'theme_id', 'decision', 'sort', 'page', 'page_size') %}{% if collection_context.get(key) is not none %}<input type="hidden" name="{{ 'return_decision' if key == 'decision' else key }}" value="{{ collection_context.get(key) }}">{% endif %}{% endfor %}{% endif %}
-            <button type="submit" class="secondary" aria-label="从论文移除主题：{{ theme.name }}">从论文移除</button>
-          </form>
-        </li>
-      {% endfor %}
-    </ul>
-  {% else %}<p class="small muted">尚未加入投资主题。</p>{% endif %}
+
   {% if paper_themes.active %}
-    <form method="post" action="{{ url_for('save_paper_investment_themes', paper_id=paper.id) }}">
+    <form method="post" action="{{ url_for('save_paper_investment_themes', paper_id=paper.id) }}" class="theme-picker-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       {% if collection_context %}{% for key in ('collection', 'theme_id', 'decision', 'sort', 'page', 'page_size') %}{% if collection_context.get(key) is not none %}<input type="hidden" name="{{ 'return_decision' if key == 'decision' else key }}" value="{{ collection_context.get(key) }}">{% endif %}{% endfor %}{% endif %}
-      <fieldset class="theme-picker"><legend>选择活跃主题（可多选）</legend>
+      <fieldset class="theme-picker"><legend>手动加入或确认主题（可多选）</legend>
         {% for theme in paper_themes.active %}
           <label class="theme-choice"><input type="checkbox" name="theme_ids" value="{{ theme.id }}" {% if theme.selected %}checked{% endif %}>
             <span><strong>{{ theme.name }}</strong>{% if theme.description %}<small>{{ theme.description }}</small>{% endif %}</span>
           </label>
         {% endfor %}
       </fieldset>
-      <p class="small muted">全部取消勾选并保存，将移除所有活跃主题关系，不影响上方已归档关系。</p>
+      <p class="small muted">保存时会按勾选结果更新活跃主题；全部取消勾选会移除这篇论文的所有活跃主题。</p>
       <button type="submit">保存投资主题</button>
     </form>
-  {% else %}<p class="empty">暂无可选的活跃主题。<a href="{{ url_for('investment_themes', paper_id=paper.id) }}">创建投资主题</a>，或恢复已有归档主题后再选择。</p>{% endif %}
-</div>
+  {% else %}<p class="small muted">当前没有可选的活跃主题。<a href="{{ url_for('investment_themes', paper_id=paper.id) }}">创建或恢复投资主题</a>后即可手动加入。</p>{% endif %}
+
+  <div class="paper-theme-classifications">
+    <h3>这篇论文的主题状态</h3>
+    {% set theme_rows = paper_classifications if paper_classifications is defined else [] %}
+    {% for theme in theme_rows if theme.target_type == 'investment_theme' %}
+      {% set theme_id = theme.target_id %}
+      {% if theme.manual_removed %}{% set status_label = '已移出' %}{% elif theme.effective %}{% set status_label = '已入选' %}{% elif theme.manual_decision == 'rejected' %}{% set status_label = '人工排除' %}{% elif theme.pending and theme.model_decision == 'possible' and theme.pro_decision in [none, 'failed'] and theme.pro_confidence != 'low' %}{% set status_label = '等待精筛' %}{% elif theme.pending or theme.pro_confidence == 'low' %}{% set status_label = '需人工确认' %}{% elif theme.pro_decision == 'unmatched' %}{% set status_label = '精筛已排除' %}{% else %}{% set status_label = '未入选' %}{% endif %}
+      {% set review_proposal = namespace(item=none) %}
+      {% if latest_classification_refinement_review is defined and latest_classification_refinement_review and latest_classification_refinement_review.proposed %}
+        {% for proposed in latest_classification_refinement_review.proposed if proposed.target_type == 'investment_theme' and proposed.target_id == theme_id %}{% set review_proposal.item = proposed %}{% endfor %}
+      {% endif %}
+      <article class="theme-record paper-theme-record">
+        <header><div><h4><a href="{{ url_for('classification_target_page',target_type='investment_theme',target_id=theme_id,view='selected') }}">{{ theme.name }}</a> · #{{ theme_id }}</h4><p class="small muted">{{ theme.effective_source or ('人工移出' if theme.manual_removed else '人工排除' if theme.manual_decision == 'rejected' else '需人工确认' if theme.pending or theme.pro_confidence == 'low' else 'Pro 精筛排除' if theme.pro_decision == 'unmatched' else '尚未入选') }}</p></div><span class="decision-badge {{ 'favorite' if theme.effective else 'skipped' if theme.manual_removed or (theme.pro_decision == 'unmatched' and theme.pro_confidence != 'low') or theme.manual_decision == 'rejected' else '' }}">{{ status_label }}</span></header>
+        {% if theme.definition %}<p class="theme-description">{{ theme.definition }}</p>{% endif %}
+        {% if theme.model_reason %}<p><strong>初筛理由：</strong>{{ theme.model_reason }}</p>{% endif %}
+        {% if theme.pro_decision %}<p><strong>精筛判断：</strong>{% if theme.pro_confidence == 'low' %}{{ {'matched':'入选判断','possible':'待确认判断','unmatched':'排除判断','failed':'失败'}.get(theme.pro_decision,theme.pro_decision) }}（低把握，需人工确认）{% else %}{{ {'matched':'入选','possible':'仍待确认','unmatched':'排除','failed':'失败'}.get(theme.pro_decision,theme.pro_decision) }}{% if theme.pro_confidence %} · 把握{{ {'medium':'中','high':'高','low':'低'}.get(theme.pro_confidence,theme.pro_confidence) }}{% endif %}{% endif %}</p>{% endif %}
+        {% if theme.pro_reason %}<p><strong>精筛理由：</strong>{{ theme.pro_reason }}</p>{% endif %}
+        {% if theme.pro_uncertainty %}<p><strong>待核对问题：</strong>{{ theme.pro_uncertainty }}</p>{% endif %}
+        {% if theme.manual_removed or theme.removal_reason or theme.removal_note or theme.removed_at %}<p><strong>{{ '移出理由：' if theme.manual_removed else '最近移出记录：' }}</strong>{{ {'scope_mismatch':'范围不符','weak_relevance':'仅弱相关','incorrect':'判断错误','other':'其他'}.get(theme.removal_reason,theme.removal_reason or '未填写') }}{% if theme.removal_note %} · {{ theme.removal_note }}{% endif %}{% if theme.removed_at %} · {{ theme.removed_at }}{% endif %}</p>{% endif %}
+        {% if review_proposal.item %}<div class="classification-review-suggestion" role="status"><strong>最近一次 Pro 复核建议：{{ {'matched':'建议保留','unmatched':'建议移出','possible':'仍需人工确认'}.get(review_proposal.item.decision,review_proposal.item.decision) }}</strong>{% if review_proposal.item.confidence %} · 把握{{ {'medium':'中','high':'高','low':'低'}.get(review_proposal.item.confidence,review_proposal.item.confidence) }}{% endif %}{% if review_proposal.item.reason %}<p>{{ review_proposal.item.reason }}</p>{% endif %}</div>
+        {% elif latest_classification_refinement_review is defined and latest_classification_refinement_review and latest_classification_refinement_review.status == 'failed' and theme.effective %}<p class="small danger">最近一次 Pro 复核失败；现有入选状态保留。</p>{% endif %}
+        {% if theme.target_status != 'archived' %}
+          {% if theme.effective %}
+            <div class="classification-detail-actions">
+              <form method="post" action="{{ url_for('classification_refinement_review',paper_id=paper.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="target_type" value="investment_theme"><input type="hidden" name="target_id" value="{{ theme_id }}"><button type="submit" class="secondary">Pro 复核此主题</button></form>
+              <form method="post" action="{{ url_for('remove_classification_targets',target_type='investment_theme',target_id=theme_id) }}" class="classification-remove-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="paper_id" value="{{ paper.id }}">
+                <label>移出理由<select name="reason"><option value="scope_mismatch">范围不符</option><option value="weak_relevance">仅弱相关</option><option value="incorrect">判断错误</option><option value="other">其他</option></select></label><label>备注<input name="note" maxlength="300" placeholder="可选"></label><button type="submit" class="secondary">确认移出</button>
+              </form>
+            </div>
+          {% elif theme.manual_removed or theme.manual_decision == 'rejected' or (theme.pro_decision == 'unmatched' and theme.pro_confidence != 'low') %}
+            <form method="post" action="{{ url_for('restore_classification_target',target_type='investment_theme',target_id=theme_id,paper_id=paper.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">恢复入选</button></form>
+          {% elif theme.pending %}<p class="small muted">可等待 Pro 精筛，或在上方勾选主题并保存，直接人工确认加入。</p>{% endif %}
+          {% if theme.pending and theme.pro_confidence == 'low' %}
+            <form method="post" action="{{ url_for('save_classification_decision',paper_id=paper.id) }}" class="inline-actions">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="target_type" value="investment_theme"><input type="hidden" name="target_id" value="{{ theme_id }}">
+              <button name="decision" value="confirmed" type="submit">人工确认保留</button><button class="secondary" name="decision" value="rejected" type="submit">人工排除</button>
+            </form>
+            <p class="small muted">精筛把握较低，请人工确认入选判断。</p>
+          {% endif %}
+        {% endif %}
+      </article>
+    {% else %}
+      {% if paper_themes.assigned %}<ul class="assigned-themes" aria-label="已加入的投资主题">{% for theme in paper_themes.assigned %}<li><a class="theme-tag {{ theme.status }}" href="{{ url_for('classification_target_page',target_type='investment_theme',target_id=theme.id,view='selected') }}">{{ theme.name }}{% if theme.status == 'archived' %} · 已归档{% endif %}</a></li>{% endfor %}</ul>
+      {% else %}<p class="small muted">这篇论文尚未加入投资主题。</p>{% endif %}
+    {% endfor %}
+  </div>
+</section>
+{% endif %}

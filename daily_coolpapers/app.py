@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -69,6 +70,9 @@ from .services import (
     paper_evaluation_result_model,
     resolve_evaluation_config,
     direction_backfill_preview,
+    classification_refinement_preview as get_classification_refinement_preview,
+    classification_review_plan,
+    classification_target_backfill_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,7 +210,9 @@ def create_app(
 
 
 TEAM_WRITE_ENDPOINTS = {'save_team_tracking', 'archive_team_tracking', 'update_research_author', 'update_research_organization'}
-DIRECTION_ENDPOINTS = {'create_attention_direction', 'archive_attention_direction', 'direction_backfill', 'save_direction_decision'}
+DIRECTION_ENDPOINTS = {'create_attention_direction', 'archive_attention_direction', 'direction_backfill', 'save_direction_decision',
+                       'classification_target_page', 'remove_classification_targets', 'restore_classification_target',
+                       'classification_target_backfill', 'save_classification_decision', 'classification_refinement_review'}
 
 
 def _direction_error_response(payload, status):
@@ -1066,11 +1072,14 @@ def register_routes(app: Flask) -> None:
             paper=paper,
             call_details=call_details,
             direction_results=db.paper_direction_results([paper_id]).get(paper_id,[]),
+            paper_classifications=db.classification_results([paper_id]).get(paper_id,[]),
             attention_directions=db.list_attention_directions(active_only=True),
+            investment_themes=db.list_investment_themes(),
+            latest_classification_refinement_review=db.latest_classification_refinement_review(paper_id),
             categories=db.get_paper_categories(paper_id),
             evaluation_results=paper_evaluation_result_model(paper_id),
             personal_decision=personal_decision,
-            paper_themes=paper_themes_model(paper_id) if personal_decision['eligible'] else None,
+            paper_themes=paper_themes_model(paper_id),
             team_form=team_form_model(paper, selections=request.args) if personal_decision['eligible'] else None,
             evaluation_actions=_paper_evaluation_actions(paper_id),
             cache_info=cache_info,
@@ -1331,6 +1340,148 @@ def register_routes(app: Flask) -> None:
         return render_template('attention_directions.html', directions=db.list_attention_directions(),
                                show_archived=request.args.get('archived') == '1',prefill=prefill)
 
+    @app.get('/pending-classifications')
+    def pending_classifications():
+        try:
+            filters = _pending_classification_filters(request.args)
+        except FormValidationError as error:
+            return _pending_classification_page(
+                {'target_type': '', 'target_id': None, 'status': 'refinement', 'date_from': '', 'date_to': '', 'page': 1, 'page_size': 30},
+                error_message='；'.join(error.errors.values()), status=400,
+            )
+        return _pending_classification_page(filters)
+
+    @app.post('/pending-classifications/batch')
+    def bulk_pending_classification_decision():
+        filters = {'target_type': '', 'target_id': None, 'status': 'manual', 'date_from': '', 'date_to': '', 'page': 1, 'page_size': 30}
+        try:
+            filters = _pending_classification_filters(request.args)
+            decision = parse_choice(request.form.get('decision'), 'decision', {'confirmed', 'rejected'})
+            relations = _pending_relationships_from_form(request.form.getlist('relationship'))
+            changed = db.set_classification_decisions(relations, decision)
+        except FormValidationError as error:
+            return _pending_classification_page(
+                filters, error_message='；'.join(error.errors.values()), status=400,
+            )
+        except db.PendingDirectionConflictError as error:
+            return _pending_classification_page(filters, error_message=str(error), status=409)
+        label = '确认' if decision == 'confirmed' else '否决'
+        flash(f'已批量{label} {changed} 项待确认分类。模型原始判断已保留。')
+        if decision == 'confirmed':
+            _enqueue_missing_classification_abstracts(runtime_runner,[item[0] for item in relations])
+        return redirect(url_for('pending_classifications', **_pending_filter_url_args(filters)))
+
+    @app.post('/pending-classifications/refine-preview')
+    def classification_refinement_preview():
+        try:
+            filters=_pending_classification_filters(request.args)
+            relations=_pending_relationships_from_form(request.form.getlist('relationship'))
+            preview=get_classification_refinement_preview(relations)
+        except FormValidationError as error:
+            flash('无法预览精筛：'+'；'.join(error.errors.values()))
+            return redirect(url_for('pending_classifications',status=request.args.get('status','refinement')))
+        except db.PendingDirectionConflictError as error:
+            flash(f'无法预览精筛：{error}')
+            return redirect(url_for('pending_classifications',**_pending_filter_url_args(filters)))
+        return render_template('classification_refinement_preview.html',preview=preview,filters=filters,
+                               filter_url_args=_pending_filter_url_args(filters))
+
+    @app.post('/pending-classifications/refine')
+    def enqueue_classification_refinement():
+        filters={'target_type':'','target_id':None,'status':'refinement','date_from':'','date_to':'','page':1,'page_size':30}
+        try:
+            filters=_pending_classification_filters(request.args)
+            relations=_pending_relationships_from_form(request.form.getlist('relationship'))
+            preview=get_classification_refinement_preview(relations)
+            if not preview['calls']:
+                raise FormValidationError({'profile':'请先配置启用的分类精筛模型和 Prompt'})
+            job_id=runtime_runner.enqueue_classification_refinement(relations)
+        except FormValidationError as error:
+            return _pending_classification_page(filters,error_message='；'.join(error.errors.values()),status=400)
+        except db.PendingDirectionConflictError as error:
+            return _pending_classification_page(filters,error_message=str(error),status=409)
+        flash(f'已创建分类精筛任务 #{job_id}：{preview["paper_count"]} 篇论文，预计 {preview["calls"]} 次逻辑调用。')
+        return redirect(url_for('job_detail',job_id=job_id))
+
+    @app.get('/classification-targets/<target_type>/<int:target_id>')
+    def classification_target_page(target_type: str, target_id: int):
+        target_type=parse_choice(target_type,'target_type',{'attention_direction','investment_theme'})
+        filters=_classification_target_filters(request.args)
+        page_model=db.list_classification_target_page(target_type,target_id,view=filters['view'],
+            date_from=filters['date_from'] or None,date_to=filters['date_to'] or None,
+            page=filters['page'],page_size=filters['page_size'])
+        directory=(db.list_attention_directions() if target_type=='attention_direction' else db.list_investment_themes())
+        counts=next((row for row in directory if int(row['id'])==target_id),{})
+        target={**page_model['target'],**{key:counts.get(key,0) for key in ('selected_count','pending_count','removed_count')}}
+        filters['page']=page_model['page']
+        return render_template('classification_target_papers.html',target=target,view=filters['view'],
+            filters=filters,page_model=page_model,
+            filter_url_args=_classification_target_url_args(filters))
+
+    @app.post('/classification-targets/<target_type>/<int:target_id>/remove')
+    def remove_classification_targets(target_type: str, target_id: int):
+        target_type=parse_choice(target_type,'target_type',{'attention_direction','investment_theme'})
+        paper_ids=[parse_int(value,'paper_id',minimum=1,maximum=2**63-1) for value in request.form.getlist('paper_id')]
+        reason_code=parse_choice(request.form.get('reason'),'reason',{'scope_mismatch','weak_relevance','incorrect','other'})
+        note=(request.form.get('note') or '').strip()
+        if len(note)>500:
+            raise FormValidationError({'note':'备注不能超过 500 字'})
+        reason={'scope_mismatch':'范围不符','weak_relevance':'仅弱相关','incorrect':'判断错误','other':'其他'}[reason_code]
+        changed=db.remove_classification_targets([(paper_id,target_type,target_id) for paper_id in paper_ids],reason,note)
+        flash(f'已从该方向移出 {changed} 篇论文；可以在“已移出”中恢复。')
+        return redirect(url_for('classification_target_page',target_type=target_type,target_id=target_id,view='selected'))
+
+    @app.post('/classification-targets/<target_type>/<int:target_id>/<int:paper_id>/restore')
+    def restore_classification_target(target_type: str, target_id: int, paper_id: int):
+        target_type=parse_choice(target_type,'target_type',{'attention_direction','investment_theme'})
+        try:
+            db.restore_classification_target(paper_id,target_type,target_id)
+        except db.PendingDirectionConflictError as error:
+            flash(f'无法恢复分类：{error}')
+            return redirect(url_for('classification_target_page',target_type=target_type,target_id=target_id,view='removed'))
+        _enqueue_missing_classification_abstracts(runtime_runner,[paper_id])
+        flash('分类已恢复；已有摘要评估会复用，没有摘要评估时会排队补评。')
+        return redirect(url_for('classification_target_page',target_type=target_type,target_id=target_id,view='removed'))
+
+    @app.post('/classification-targets/investment_theme/<int:target_id>/backfill')
+    def classification_target_backfill(target_id: int):
+        date_from=request.form.get('date_from') or ''
+        date_to=request.form.get('date_to') or ''
+        try:
+            preview=classification_target_backfill_preview('investment_theme',target_id,date_from,date_to)
+            if parse_bool(request.form.get('confirmed'),'confirmed'):
+                job_id=runtime_runner.enqueue_classification_target_backfill('investment_theme',target_id,date_from,date_to)
+                flash(f'已创建投资主题历史补分类任务 #{job_id}。')
+                return redirect(url_for('job_detail',job_id=job_id))
+        except (FormValidationError,ValueError) as error:
+            message='；'.join(error.errors.values()) if isinstance(error,FormValidationError) else str(error)
+            flash(f'无法执行历史补分类：{message}')
+            return redirect(url_for('classification_target_page',target_type='investment_theme',target_id=target_id))
+        return render_template('direction_backfill_preview.html',preview=preview)
+
+    @app.post('/papers/<int:paper_id>/classification-decision')
+    def save_classification_decision(paper_id: int):
+        target_type=parse_choice(request.form.get('target_type'),'target_type',{'attention_direction','investment_theme'})
+        target_id=parse_int(request.form.get('target_id'),'target_id',minimum=1,maximum=2**63-1)
+        decision=parse_choice(request.form.get('decision'),'decision',{'confirmed','rejected'})
+        db.set_classification_decision(paper_id,target_type,target_id,decision)
+        if decision=='confirmed': _enqueue_missing_classification_abstracts(runtime_runner,[paper_id])
+        flash('人工分类已保存，优先于模型判断。')
+        return redirect(url_for('paper_detail',paper_id=paper_id,_anchor='paper-directions'))
+
+    @app.post('/papers/<int:paper_id>/classification-refinement-review')
+    def classification_refinement_review(paper_id: int):
+        target_type=parse_choice(request.form.get('target_type'),'target_type',{'attention_direction','investment_theme'})
+        target_id=parse_int(request.form.get('target_id'),'target_id',minimum=1,maximum=2**63-1)
+        try:
+            plan=classification_review_plan(paper_id,target_type,target_id)
+            job_id=runtime_runner.enqueue_classification_review(plan)
+        except (ValueError,db.PendingDirectionConflictError) as error:
+            flash(f'无法创建 Pro 复核：{error}')
+            return redirect(url_for('paper_detail',paper_id=paper_id,_anchor='paper-directions'))
+        flash(f'已创建 Pro 复核任务 #{job_id}；结果作为建议，不会自动移出。')
+        return redirect(url_for('job_detail',job_id=job_id))
+
     @app.post('/attention-directions')
     def create_attention_direction():
         if request.form.get('exploration_run'):
@@ -1384,7 +1535,7 @@ def register_routes(app: Flask) -> None:
         prompt_type = parse_choice(
             request.form.get("type"),
             "type",
-            {"abstract_review", "fulltext_review", "direction_classification", "investment_memo",
+            {"abstract_review", "fulltext_review", "direction_classification", "classification_refinement", "investment_memo",
              "direction_exploration_extract", "direction_exploration_synthesis"},
         )
         data = {
@@ -1460,6 +1611,7 @@ def register_routes(app: Flask) -> None:
             "is_default_abstract": parse_bool(request.form.get("is_default_abstract"), "is_default_abstract"),
             "is_default_fulltext": parse_bool(request.form.get("is_default_fulltext"), "is_default_fulltext"),
             "is_default_classification": parse_bool(request.form.get('is_default_classification'), 'is_default_classification'),
+            "is_default_refinement": parse_bool(request.form.get('is_default_refinement'), 'is_default_refinement'),
             "is_default_memo": parse_bool(request.form.get('is_default_memo'),'is_default_memo'),
         }
         db.save_llm_profile(data)
@@ -1616,6 +1768,136 @@ def _direction_filters():
     return filters
 
 
+def _pending_classification_filters(source) -> dict[str, Any]:
+    target_type=(source.get('target_type') or '').strip()
+    target_id_raw=source.get('target_id') or source.get('direction_id')
+    if not target_type and source.get('direction_id'):
+        target_type='attention_direction'
+    if target_type:
+        target_type=parse_choice(target_type,'target_type',{'attention_direction','investment_theme'})
+    target_id=parse_int(target_id_raw,'target_id',minimum=1,maximum=2**63-1) if target_id_raw else None
+
+    def normalized_date(raw, field):
+        value = (raw or '').strip()
+        if not value:
+            return ''
+        if value.isdigit() and len(value) == 8:
+            value = f'{value[:4]}-{value[4:6]}-{value[6:8]}'
+        else:
+            value = value.replace('/', '-').replace('.', '-')
+        try:
+            date.fromisoformat(value)
+        except ValueError as error:
+            raise FormValidationError({field: '请输入有效日期'}) from error
+        return value
+
+    date_from = normalized_date(source.get('date_from'), 'date_from')
+    date_to = normalized_date(source.get('date_to'), 'date_to')
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+    return {
+        'target_type': target_type,
+        'target_id': target_id,
+        'status': parse_choice(source.get('status') or 'refinement','status',{'refinement','manual'}),
+        'date_from': date_from,
+        'date_to': date_to,
+        'page': _query_int(source.get('page'), 1, 1),
+        'page_size': _query_int(source.get('page_size'), 30, 1, 100),
+    }
+
+
+def _pending_relationships_from_form(values: list[str]) -> list[tuple[int, str, int]]:
+    if not values or len(values) > db.PENDING_DIRECTION_BATCH_LIMIT:
+        raise FormValidationError({
+            'relations': f'请选择 1 至 {db.PENDING_DIRECTION_BATCH_LIMIT} 项待确认分类',
+        })
+    relations = []
+    seen = set()
+    for value in values:
+        match = re.fullmatch(r'([1-9][0-9]*):(?:(attention_direction|investment_theme):)?([1-9][0-9]*)', value or '')
+        if not match:
+            raise FormValidationError({'relations': '所选论文与方向分类项无效，请刷新后重试'})
+        relation = (int(match.group(1)), match.group(2) or 'attention_direction', int(match.group(3)))
+        if max(relation[0],relation[2]) > 2**63 - 1 or relation in seen:
+            raise FormValidationError({'relations': '所选论文与方向分类项无效或重复，请刷新后重试'})
+        seen.add(relation)
+        relations.append(relation)
+    return relations
+
+
+def _pending_filter_url_args(filters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'target_type': filters['target_type'],
+        'target_id': filters['target_id'],
+        'status': filters['status'],
+        'date_from': filters['date_from'],
+        'date_to': filters['date_to'],
+        'page': filters['page'],
+        'page_size': filters['page_size'],
+    }
+
+
+def _pending_classification_page(filters: dict[str, Any], *, error_message: str = '', status: int = 200):
+    refinement_available=bool(db.get_setting('llm.classification_refinement_enabled',True))
+    try:
+        resolve_evaluation_config('classification_refinement')
+    except ValueError:
+        refinement_available=False
+    page_model = db.list_pending_classification_page(
+        target_type=filters['target_type'] or None,status=filters['status'],
+        refinement_available=refinement_available,date_from=filters['date_from'] or None,
+        date_to=filters['date_to'] or None,page=filters['page'],page_size=filters['page_size'],
+    )
+    filters['page'] = page_model['page']
+    return render_template(
+        'pending_classifications.html',
+        pending_page=page_model,
+        filters=filters,
+        filter_url_args=_pending_filter_url_args(filters),
+        directions=db.list_attention_directions(),
+        investment_themes=db.list_investment_themes(),
+        error_message=error_message,
+    ), status
+
+
+def _classification_target_filters(source) -> dict[str,Any]:
+    view=parse_choice(source.get('view') or 'selected','view',{'selected','pending','removed'})
+    def normalized_date(raw,field):
+        value=(raw or '').strip()
+        if not value: return ''
+        if value.isdigit() and len(value)==8: value=f'{value[:4]}-{value[4:6]}-{value[6:8]}'
+        else: value=value.replace('/','-').replace('.','-')
+        try: date.fromisoformat(value)
+        except ValueError as error: raise FormValidationError({field:'请输入有效日期'}) from error
+        return value
+    date_from=normalized_date(source.get('date_from'),'date_from')
+    date_to=normalized_date(source.get('date_to'),'date_to')
+    if date_from and date_to and date_from>date_to: date_from,date_to=date_to,date_from
+    return {'view':view,'date_from':date_from,'date_to':date_to,
+            'page':_query_int(source.get('page'),1,1),'page_size':_query_int(source.get('page_size'),30,1,100)}
+
+
+def _classification_target_url_args(filters: dict[str,Any]) -> dict[str,Any]:
+    return {key:filters[key] for key in ('view','date_from','date_to','page','page_size')}
+
+
+def _enqueue_missing_classification_abstracts(runner: JobRunner,paper_ids: list[int]) -> int:
+    selected=list(dict.fromkeys(int(value) for value in paper_ids))
+    to_enqueue=[]
+    with db.connect() as conn:
+        for paper_id in selected:
+            if conn.execute("SELECT 1 FROM evaluations WHERE paper_id=? AND evaluation_type='abstract_review' AND status='success' LIMIT 1",(paper_id,)).fetchone():
+                continue
+            if conn.execute("SELECT 1 FROM evaluation_claims WHERE paper_id=? AND evaluation_type='abstract_review' LIMIT 1",(paper_id,)).fetchone():
+                continue
+            if conn.execute("SELECT 1 FROM jobs WHERE type='abstract_eval' AND status IN ('pending','running') AND json_extract(payload,'$.paper_id')=? LIMIT 1",(paper_id,)).fetchone():
+                continue
+            to_enqueue.append(paper_id)
+    for paper_id in to_enqueue:
+        runner.enqueue('abstract_eval',{'paper_id':paper_id})
+    return len(to_enqueue)
+
+
 def _paper_digest_query_from_request() -> db.PaperDigestQuery:
     return db.PaperDigestQuery.from_raw(
         date_value=request.args.get("date"),
@@ -1656,6 +1938,7 @@ def _settings_form_values() -> dict[str, Any]:
         "cleanup_on_start": _safe_setting_bool(values, "cache.cleanup_on_start", True),
         "cleanup_daily": _safe_setting_bool(values, "cache.cleanup_daily", True),
         "abstract_retries": _safe_setting_int(values, 'llm.abstract_retries', 2, minimum=0, maximum=5),
+        "classification_refinement_enabled": _safe_setting_bool(values, 'llm.classification_refinement_enabled', True),
         "event_retention_days": _safe_setting_int(values, 'job_events.retention_days', 30, minimum=1, maximum=3650),
         "missing_field_warning_rate": values.get('crawler.missing_field_warning_rate', 0.0),
         "abstract_concurrency": _safe_setting_int(
@@ -1919,10 +2202,14 @@ def _enqueue_paper_evaluation(
     return runner.enqueue(job_type, payload)
 
 
-def _job_type_label(job_type: str | None) -> str:
+def _job_type_label(job_type: str | None,payload: dict[str,Any] | None = None) -> str:
+    if job_type=='classification_refinement':
+        return 'Pro 入选复核' if (payload or {}).get('purpose')=='review' else '分类精筛'
     return {
         "daily_pipeline": "每日情报流水线",
         "direction_backfill": "关注方向历史补分类",
+        "classification_target_backfill": "投资主题历史补分类",
+        "classification_refinement": "分类精筛",
         "direction_exploration": "新方向探索周报",
         "investment_memo_generation": "研究备忘录生成",
         "crawl": "抓取 Metadata",
@@ -1958,10 +2245,11 @@ def _job_progress_label(job: dict[str, Any]) -> str:
 
 def _job_progress_payload(job: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "")
+    payload=job.get('payload_data') or db.loads_json(job.get('payload'),{})
     return {
         "id": job["id"],
         "type": job["type"],
-        "type_label": _job_type_label(job.get("type")),
+        "type_label": _job_type_label(job.get("type"),payload),
         "status": status,
         "status_label": _job_status_label(job.get("status")),
         "progress_current": job["progress_current"],

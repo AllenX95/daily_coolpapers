@@ -273,6 +273,9 @@ section {
 }
 
 .toolbar {
+  /* Keep dropdowns above later sections, which create animation stacking contexts. */
+  position: relative;
+  z-index: 3;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
@@ -379,6 +382,24 @@ section {
 .toolbar-actions form,
 .actions form {
   margin: 0;
+}
+
+.catch-up-form {
+  display: flex;
+  width: 206px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}
+
+.catch-up-form label {
+  gap: 4px;
+}
+
+.catch-up-date-hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .date-field {
@@ -1503,6 +1524,10 @@ code {
   .toolbar-action-group form,
   .toolbar-more,
   .toolbar-more > summary {
+    width: 100%;
+  }
+
+  .catch-up-form {
     width: 100%;
   }
 

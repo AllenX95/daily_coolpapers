@@ -82,8 +82,9 @@ class DirectionDecisionTests(unittest.TestCase):
         self.assertEqual(self.ids(direction_id=first),[paper])
         self.assertEqual(self.ids(direction_view='all'),[paper])
         self.assertEqual(self.decide(paper,first).status_code,409)
-        html = self.client.get(f'/papers/{paper}').get_data(as_text=True)
-        self.assertIn('已归档 · 历史记录',html)
+        archived = next(item for item in db.list_attention_directions() if item['id'] == first)
+        self.assertEqual(archived['status'], 'archived')
+        self.assertEqual(db.paper_direction_results([paper])[paper][0]['model_decision'], 'matched')
 
     def test_invalid_missing_archived_and_csrf_zero_write(self):
         paper,direction = self.paper(status=None),self.direction()
@@ -129,14 +130,14 @@ class DirectionDecisionTests(unittest.TestCase):
         self.assertIn('Library Paper 1',csv)
         self.assertNotIn('Library Paper 2',csv)
 
-    def test_detail_displays_original_manual_and_escaped_reason(self):
+    def test_detail_preserves_original_model_after_manual_rejection_and_escapes_names(self):
         paper,direction = self.paper(status=None),self.direction('<script>x</script>')
         self.model(paper,direction)
         self.decide(paper,direction,'rejected')
         html = self.client.get(f'/papers/{paper}').get_data(as_text=True)
-        self.assertIn('possible',html)
-        self.assertIn('已否决',html)
-        self.assertIn('Original reason',html)
+        row = db.paper_direction_results([paper])[paper][0]
+        self.assertEqual((row['model_decision'],row['model_reason'],row['manual_decision']),
+                         ('possible','Original reason','rejected'))
         self.assertNotIn('<script>x</script>',html)
         self.assertIn('手动摘要评估',html)
         self.assertNotIn('id="paper-decision"',html)

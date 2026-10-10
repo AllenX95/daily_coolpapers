@@ -3,6 +3,7 @@
 {% block content %}
 <section>
   <h1>Prompt 管理</h1>
+  <p class="muted">分类初筛与精筛分别使用独立 Prompt。修改内容只影响之后的新判断，不会自动重跑已保存的分类结果。</p>
   <form method="post" action="{{ url_for('save_prompt') }}" class="prompt-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="form-row">
@@ -10,7 +11,8 @@
       <select name="type">
         <option value="abstract_review">摘要评估</option>
         <option value="fulltext_review">全文阅读</option>
-        <option value="direction_classification">关注方向分类</option>
+        <option value="direction_classification">分类初筛（关注方向与投资主题）</option>
+        <option value="classification_refinement">分类精筛（Pro）</option>
         <option value="investment_memo">研究备忘录</option>
         <option value="direction_exploration_extract">新方向探索：提取</option>
         <option value="direction_exploration_synthesis">新方向探索：汇总</option>
@@ -35,7 +37,7 @@
     <details class="editor-block">
       <summary>
         <strong>{{ prompt.name }}</strong>
-        <span class="badge">{{ prompt.type }}</span>
+        <span class="badge">{{ {'abstract_review':'摘要评估','fulltext_review':'全文阅读','direction_classification':'分类初筛','classification_refinement':'分类精筛','investment_memo':'研究备忘录','direction_exploration_extract':'新方向提取','direction_exploration_synthesis':'新方向汇总'}.get(prompt.type,prompt.type) }}</span>
         <span class="muted">v{{ prompt.version }} · {{ "默认" if prompt.is_default else "非默认" }} · {{ prompt.llm_profile_name or "默认模型" }}</span>
       </summary>
       <form method="post" action="{{ url_for('save_prompt') }}" class="prompt-form">
@@ -46,7 +48,8 @@
           <select name="type">
             <option value="abstract_review" {% if prompt.type == "abstract_review" %}selected{% endif %}>摘要评估</option>
             <option value="fulltext_review" {% if prompt.type == "fulltext_review" %}selected{% endif %}>全文阅读</option>
-            <option value="direction_classification" {% if prompt.type == "direction_classification" %}selected{% endif %}>关注方向分类</option>
+            <option value="direction_classification" {% if prompt.type == "direction_classification" %}selected{% endif %}>分类初筛（关注方向与投资主题）</option>
+            <option value="classification_refinement" {% if prompt.type == "classification_refinement" %}selected{% endif %}>分类精筛（Pro）</option>
             <option value="investment_memo" {% if prompt.type == "investment_memo" %}selected{% endif %}>研究备忘录</option>
             <option value="direction_exploration_extract" {% if prompt.type == "direction_exploration_extract" %}selected{% endif %}>新方向探索：提取</option>
             <option value="direction_exploration_synthesis" {% if prompt.type == "direction_exploration_synthesis" %}selected{% endif %}>新方向探索：汇总</option>
