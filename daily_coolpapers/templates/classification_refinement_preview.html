@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}精筛调用预览 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head pending-head">
+  <div><span class="eyebrow">Pro refinement / 调用前预览</span><h1>精筛前确认</h1>
+    <p class="muted">按论文合并所选方向，一篇论文只计一次逻辑调用。确认后会创建后台任务。</p>
+  </div>
+  <div class="pending-total"><span>论文</span><strong>{{ preview.paper_count }}</strong><span>分类项</span><strong>{{ preview.relation_count or (preview.relations|length) }}</strong><span>预计调用</span><strong>{{ preview.call_count or preview.calls or 0 }}</strong></div>
+</section>
+
+{% if preview.reason %}<p class="pending-error" role="status">{{ '分类精筛模型或 Prompt 尚未配置，请先到 LLM 设置或 Prompt 管理完成配置。' if preview.reason == 'evaluation_config_missing' else '自动精筛当前已关闭；可在设置中重新开启。' if preview.reason == 'disabled' else preview.reason }}</p>{% endif %}
+{% if preview.model_name %}<p class="small muted">分类精筛模型：{{ preview.model_name }}</p>{% endif %}
+
+{% if preview.relations %}
+<section class="pending-paper-list" aria-label="本次精筛论文与方向">
+  {% for item in preview.relations %}
+  <article class="pending-paper-card preview-relation-row">
+    <div><a class="paper-title" href="{{ url_for('paper_detail', paper_id=item.paper_id) }}">{{ item.title }}</a>
+      <p class="pending-paper-meta"><span>{{ '关注方向' if item.target_type == 'attention_direction' else '投资主题' }}</span><span>{{ item.target_name or item.name }}</span><span>分类项 #{{ item.target_id }}</span></p>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% else %}<div class="pending-empty"><h2>没有可精筛的所选项</h2><p>{{ preview.reason or '请返回列表重新选择分类项。' }}</p></div>{% endif %}
+
+<div class="preview-actions">
+  <a class="button secondary" href="{{ url_for('pending_classifications', **filter_url_args) }}">返回待分类</a>
+  {% if preview.relations and preview.available is not sameas false and (preview.call_count or preview.calls or 0) > 0 %}
+  <form method="post" action="{{ url_for('enqueue_classification_refinement', **filter_url_args) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% for item in preview.relations %}<input type="hidden" name="relationship" value="{{ item.paper_id }}:{{ item.target_type }}:{{ item.target_id }}">{% endfor %}
+    <button type="submit">确认并发起精筛</button>
+  </form>
+  {% else %}<button type="button" disabled>暂不可发起</button>{% endif %}
+</div>
+{% endblock %}

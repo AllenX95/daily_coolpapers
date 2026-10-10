@@ -47,21 +47,22 @@ class DirectionBackfillTests(unittest.TestCase):
         with patch.object(services,'call_llm') as call:
             response = self.post(key)
         self.assertEqual(response.status_code,200)
-        self.assertIn('成本上限预览',response.get_data(as_text=True))
+        self.assertIn('调用上限预览',response.get_data(as_text=True))
         self.assertEqual(db.list_jobs(),[])
         self.assertTrue(self.runner.queue.empty())
         call.assert_not_called()
 
-    def test_confirm_job_chains_abstract_same_parent_and_preserves_sources(self):
+    def test_possible_waits_for_refinement_without_abstract_and_preserves_sources(self):
         key, paper = self.direction(), self.paper()
         response = self.post(key,confirmed='1')
         self.assertEqual(response.status_code,302)
         job_id = db.list_jobs()[0]['id']
-        with patch.object(services,'call_llm',side_effect=[self.classified((key,'possible')),self.response]) as call:
+        with patch.object(services,'call_llm',return_value=self.classified((key,'possible'))) as call:
             self.runner._run_job(job_id)
-        self.assertEqual(call.call_count,2)
+        self.assertEqual(call.call_count,1)
         self.assertEqual(db.get_job(job_id)['status'],'success')
         self.assertEqual({e['pipeline_job_id'] for e in db.list_evaluations(paper)},{job_id})
+        self.assertIsNone(db.get_latest_evaluation(paper,'abstract_review'))
         classification = db.get_latest_evaluation(paper,'direction_classification')
         self.assertEqual(classification['classification_source'],'historical_backfill')
         self.assertEqual(json.loads(classification['input_snapshot_json'])['categories'],['cs.AI'])
@@ -89,22 +90,26 @@ class DirectionBackfillTests(unittest.TestCase):
             self.run_backfill(key)
         db.set_direction_decision(paper,key,'confirmed')
         original = db.paper_direction_results([paper])
-        with patch.object(services,'call_llm') as call:
+        with patch.object(services,'call_llm',return_value=self.response) as call:
             self.run_backfill(key)
-        call.assert_not_called()
+        call.assert_called_once()
         self.assertEqual(db.paper_direction_results([paper]),original)
+        self.assertIsNotNone(db.get_latest_successful_evaluation(paper,'abstract_review'))
 
-    def test_only_failed_or_absent_retry_and_prior_manual_decision_survives(self):
+    def test_human_rejection_skips_repeated_backfill_and_survives(self):
         key,paper = self.direction(),self.paper()
         db.set_direction_decision(paper,key,'rejected')
-        with patch.object(services,'call_llm',side_effect=LLMError('no')):
+        with patch.object(services,'call_llm') as call:
             first = self.run_backfill(key)
-        self.assertEqual(first['status'],'partial_success')
-        with patch.object(services,'call_llm',side_effect=[self.classified((key,'matched')),self.response]):
+        call.assert_not_called()
+        self.assertEqual(first['status'],'success')
+        # A human rejection owns the relationship; background retry leaves it alone.
+        with patch.object(services,'call_llm') as call:
             second = self.run_backfill(key)
         self.assertEqual(second['status'],'success')
+        call.assert_not_called()
         row = db.paper_direction_results([paper])[paper][0]
-        self.assertEqual((row['model_decision'],row['manual_decision'],row['effective']),('matched','rejected',False))
+        self.assertEqual((row['model_decision'],row['manual_decision'],row['effective']),(None,'rejected',False))
 
     def test_partial_failure_continues_other_papers_and_old_match_not_masked(self):
         old,new = self.direction('Old'),self.direction('New')
@@ -114,7 +119,7 @@ class DirectionBackfillTests(unittest.TestCase):
         def response(_profile,prompt,**_):
             if 'Paper 1' in prompt:
                 raise LLMError('private')
-            if 'directions' in prompt:
+            if '论文范围分类助手' in prompt:
                 return self.classified((new,'matched'))
             return self.response
         with patch.object(services,'call_llm',side_effect=response):

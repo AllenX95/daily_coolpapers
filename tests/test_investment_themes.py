@@ -140,7 +140,8 @@ class InvestmentThemeTests(unittest.TestCase):
         self.assertEqual([item['id'] for item in model['active']], [active])
         self.assertEqual(model['assigned'][0]['status'], 'archived')
         html = self.client.get(f'/papers/{paper_id}').get_data(as_text=True)
-        self.assertIn('Archived · 已归档', html)
+        self.assertIn('Archived', html)
+        self.assertIn('已入选', html)
         self.assertNotIn(f'name="theme_ids" value="{archived}"', html)
         for _ in range(2):
             response = self.post(f'/api/papers/{paper_id}/investment-themes/{archived}/remove')
@@ -160,26 +161,18 @@ class InvestmentThemeTests(unittest.TestCase):
         self.assertEqual(self.assign(paper_id, [other]).status_code, 302)
         self.assertEqual({row['id'] for row in self.members(paper_id)}, {archived, other})
 
-    def test_every_paper_write_requires_historical_success_even_clear_and_remove(self):
+    def test_manual_theme_assignment_and_removal_do_not_require_fulltext_success(self):
         theme_id = db.create_investment_theme('Theme')
         paper_id = self.paper(status='failed')
-        self.evaluate(paper_id, 'success', kind='abstract_review')
-        for ids in ([], [theme_id]):
-            self.assertEqual(self.assign(paper_id, ids).status_code, 409)
-        self.assertEqual(self.post(f'/api/papers/{paper_id}/investment-themes/{theme_id}/remove').status_code, 409)
-        self.assertNotIn('data-testid="paper-themes"', self.client.get(f'/papers/{paper_id}').get_data(as_text=True))
-        self.evaluate(paper_id, 'success')
-        self.evaluate(paper_id, 'failed')
         self.assertEqual(self.assign(paper_id, [theme_id]).status_code, 302)
         self.assertIn('data-testid="paper-themes"', self.client.get(f'/papers/{paper_id}').get_data(as_text=True))
-        original = db.has_successful_fulltext
-        def checked(paper_id, *, conn=None):
-            self.assertTrue(conn.in_transaction)
-            return original(paper_id, conn=conn)
-        with patch.object(db, 'has_successful_fulltext', side_effect=checked) as check:
-            db.set_paper_investment_themes(paper_id, [])
-            db.remove_paper_investment_theme(paper_id, theme_id)
-        self.assertEqual(check.call_count, 2)
+        self.assertEqual(self.members(paper_id)[0]['id'], theme_id)
+        result = next(row for row in db.classification_results([paper_id])[paper_id]
+                      if row['target_type'] == 'investment_theme')
+        self.assertEqual((result['manual_decision'],result['effective']),('confirmed',True))
+        self.assertEqual(self.assign(paper_id, []).status_code, 302)
+        self.assertEqual(self.members(paper_id), [])
+        self.assertEqual(self.post(f'/api/papers/{paper_id}/investment-themes/{theme_id}/remove').status_code, 302)
 
     def test_decisions_and_theme_relations_remain_independent_no_jobs_or_llm(self):
         paper_id, theme_id = self.paper(), db.create_investment_theme('Independent')
@@ -288,7 +281,7 @@ class InvestmentThemeTests(unittest.TestCase):
             conn.set_trace_callback(statements.append)
             return conn
         with patch.object(db, 'connect', side_effect=readonly):
-            for read, maximum in [(db.list_investment_themes, 1), (lambda: services.paper_themes_model(1), 1),
+            for read, maximum in [(db.list_investment_themes, 2), (lambda: services.paper_themes_model(1), 1),
                                   (lambda: services.investment_theme_papers_model(themes[0]), 4),
                                   (services.reviewed_papers_page_model, 3)]:
                 statements.clear()

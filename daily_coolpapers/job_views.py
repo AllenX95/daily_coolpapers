@@ -9,6 +9,8 @@ from . import db
 LOCAL_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
 STAGES = {'plan': '计划', 'crawl_http': '抓取', 'crawl_parse': '完整性检查', 'persist': '入库',
           'direction_backfill': '历史补分类', 'classification': '关注方向分类',
+          'classification_refinement':'分类精筛', 'classification_review':'Pro入选复核',
+          'classification_target_backfill':'投资主题历史补分类',
           'abstract_plan': '候选选择', 'abstract_eval': '摘要评估', 'investment_memo':'备忘录生成', 'exploration':'新方向探索', 'finalize': '完成'}
 SOURCES = {'scheduled': '定时运行', 'manual_latest': '手动最新', 'manual_catch_up': '手动补抓'}
 STATUS_LABELS = {'pending': '排队中', 'running': '运行中', 'success': '已完成',
@@ -25,6 +27,13 @@ EVENT_LABELS = {
     'classification.paper_retrying':'论文分类重试','classification.stage_completed':'分类阶段完成',
     'direction_backfill.started':'历史补分类开始','direction_backfill.previewed':'补分类范围预览',
     'direction_backfill.completed':'历史补分类完成',
+    'classification_refinement.plan_created':'精筛任务计划已创建',
+    'classification_refinement.manual_fallback':'精筛配置不可用，候选留给人工',
+    'classification_refinement.stage_completed':'精筛阶段完成',
+    'classification_refinement.completed':'精筛任务完成',
+    'classification_refinement.review_completed':'Pro复核已完成（只生成建议）',
+    'classification_target_backfill.started':'投资主题历史补分类开始',
+    'classification_target_backfill.completed':'投资主题历史补分类完成',
     'pipeline.plan_created': '计划已创建', 'pipeline.started': '流水线开始',
     'pipeline.completed': '流水线结束', 'pipeline.interrupted': '服务中断',
     'crawl.category_started': '类目开始', 'crawl.http_retrying': 'HTTP 重试',

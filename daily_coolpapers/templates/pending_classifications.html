@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}待分类 - Daily Cool Papers{% endblock %}
+{% block content %}
+<section class="favorites-head pending-head">
+  <div>
+    <span class="eyebrow">Classification queue / 分类待办</span>
+    <h1>待分类</h1>
+    <p class="muted">每行是一篇论文在一个方向中的判断。同一篇论文属于多个方向时，可以分别处理。</p>
+  </div>
+  <div class="pending-total"><span>当前结果</span><strong>{{ pending_page.total }}</strong><span>分类项</span><strong>{{ pending_page['items']|length }}</strong><span>本页</span></div>
+</section>
+
+{% if error_message %}<p class="pending-error" role="alert">{{ error_message }}</p>{% endif %}
+
+<section class="pending-filter-panel" aria-label="筛选待分类项目">
+  <form method="get" action="{{ url_for('pending_classifications') }}" class="pending-filters">
+    <label>分类范围
+      <select name="target_type">
+        <option value="">全部范围</option>
+        <option value="attention_direction" {% if filters.target_type == 'attention_direction' %}selected{% endif %}>关注方向</option>
+        <option value="investment_theme" {% if filters.target_type == 'investment_theme' %}selected{% endif %}>投资主题</option>
+      </select>
+    </label>
+    <label>处理状态
+      <select name="status">
+        <option value="refinement" {% if filters.status == 'refinement' %}selected{% endif %}>等待精筛</option>
+        <option value="manual" {% if filters.status == 'manual' %}selected{% endif %}>需人工确认</option>
+      </select>
+    </label>
+    <label>开始日期<input type="date" name="date_from" value="{{ filters.date_from }}"></label>
+    <label>结束日期<input type="date" name="date_to" value="{{ filters.date_to }}"></label>
+    <label>每页分类项<select name="page_size">{% for size in [15,30,50,100] %}<option value="{{ size }}" {% if filters.page_size == size %}selected{% endif %}>{{ size }}</option>{% endfor %}</select></label>
+    <button type="submit">筛选</button>
+    <a class="button secondary" href="{{ url_for('pending_classifications', status=filters.status) }}">清除筛选</a>
+  </form>
+  <p class="small muted">日期按论文抓取日期筛选；留空时跨所有抓取日期显示。当前共 {{ pending_page.total }} 项，本页 {{ pending_page['items']|length }} 项。</p>
+</section>
+
+{% if filters.status == 'refinement' and not pending_page.refinement_available %}
+  <p class="run-notice">当前没有可用的分类精筛模型或 Prompt。你仍可在“需人工确认”中直接处理，也可以先到 <a href="{{ url_for('llm_profiles') }}">LLM 设置</a>和 <a href="{{ url_for('prompts') }}">Prompt 管理</a>完成配置。</p>
+{% endif %}
+
+{% if pending_page['items'] %}
+<form method="post" action="{{ url_for('bulk_pending_classification_decision', target_type=filters.target_type, status=filters.status, date_from=filters.date_from, date_to=filters.date_to, page=filters.page, page_size=filters.page_size) }}" class="pending-batch-form" id="pending-classification-batch" data-refinement-available="{{ 1 if pending_page.refinement_available else 0 }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="pending-bulk-bar">
+    <label class="pending-select-all"><input id="pending-select-page" type="checkbox"> <span>全选本页</span></label>
+    <span id="pending-selected-count" class="pending-selected-count">已选 0 项</span>
+    <div class="pending-bulk-actions">
+      <button type="submit" name="decision" value="confirmed" disabled>确认加入</button>
+      <button type="submit" name="decision" value="rejected" class="secondary" disabled>排除此项</button>
+      {% if filters.status == 'refinement' %}
+        <button type="submit" class="secondary pending-refine-preview" formnovalidate formaction="{{ url_for('classification_refinement_preview', target_type=filters.target_type, status=filters.status, date_from=filters.date_from, date_to=filters.date_to, page=filters.page, page_size=filters.page_size) }}" id="pending-refine-preview" disabled {% if not pending_page.refinement_available %}title="请先配置分类精筛模型和 Prompt"{% endif %}>预览 Pro 精筛</button>
+      {% endif %}
+    </div>
+  </div>
+</form>
+
+<section class="pending-paper-list" aria-label="待分类论文">
+  {% for item in pending_page['items'] %}
+  {% set target_label = '关注方向' if item.target_type == 'attention_direction' else '投资主题' %}
+  <article class="pending-paper-card">
+    <header class="pending-paper-header">
+      <div class="pending-paper-title-wrap">
+        <a class="paper-title" href="{{ url_for('paper_detail', paper_id=item.paper_id) }}">{{ item.title }}</a>
+        <span class="pending-paper-meta"><span>{{ item.latest_crawl_date or '日期未知' }}</span><span>{{ item.arxiv_id or '无 arXiv 编号' }}</span><span>{{ item.authors_list|join(', ')|truncate_text(120) }}</span></span>
+      </div>
+      <a class="pending-detail-link small" href="{{ url_for('paper_detail', paper_id=item.paper_id) }}">论文详情 →</a>
+    </header>
+    <div class="pending-direction-list">
+      <div class="pending-relation">
+        <input id="pending-{{ item.paper_id }}-{{ item.target_type }}-{{ item.target_id }}" type="checkbox" class="pending-classification-checkbox" name="relationship" value="{{ item.paper_id }}:{{ item.target_type }}:{{ item.target_id }}" form="pending-classification-batch" aria-label="选择 {{ item.title }} 在 {{ item.name }} 中的分类项">
+        <span class="pending-relation-content pending-classification-item">
+        <div class="pending-direction-heading">
+          <div><span class="classification-target-kind">{{ target_label }}</span> <strong>{{ item.name }}</strong></div>
+          <span class="pending-model-state">{{ '等待精筛' if filters.status == 'refinement' else '需人工确认' }}</span>
+        </div>
+        {% if item.definition %}<details><summary>查看分类范围</summary><p class="small muted">{{ item.definition }}</p></details>{% endif %}
+        <p class="small muted">初筛：{% if item.model_decision == 'possible' %}发现具体关联，仍有待判断的问题{% elif item.model_decision == 'matched' %}明确匹配{% elif item.model_decision == 'unmatched' %}未匹配{% else %}{{ item.model_decision or '无结果' }}{% endif %}</p>
+        {% if item.model_reason %}<div><span class="pending-reason-label">初筛理由</span><div class="pending-reason">{{ item.model_reason }}</div></div>{% endif %}
+        {% if item.pro_reason %}<div><span class="pending-reason-label">精筛理由{% if item.pro_confidence %} · 把握{{ {'medium':'中','high':'高','low':'低'}.get(item.pro_confidence,item.pro_confidence) }}{% endif %}</span><div class="pending-reason">{{ item.pro_reason }}</div></div>{% endif %}
+        {% if item.pro_uncertainty %}<div><span class="pending-reason-label">待核对问题</span><div class="pending-reason">{{ item.pro_uncertainty }}</div></div>{% endif %}
+        {% if item.pro_decision == 'failed' %}<p class="small danger">上次精筛失败，可以重新预览并发起。</p>{% endif %}
+        </span>
+      </div>
+    </div>
+    {% if item.abstract %}<p class="pending-abstract">{{ item.abstract|truncate_text(520) }}</p>{% endif %}
+  </article>
+  {% endfor %}
+</section>
+<div class="pending-bulk-bar pending-bulk-bar-bottom">
+  <label class="pending-select-all"><input class="pending-select-page-bottom" type="checkbox"> <span>全选本页</span></label>
+  <span class="pending-selected-count-bottom">已选 0 项</span>
+  <div class="pending-bulk-actions">
+    <button type="submit" form="pending-classification-batch" name="decision" value="confirmed" disabled>确认加入</button>
+    <button type="submit" form="pending-classification-batch" name="decision" value="rejected" class="secondary" disabled>排除此项</button>
+    {% if filters.status == 'refinement' %}<button type="submit" form="pending-classification-batch" class="secondary pending-refine-preview" formnovalidate formaction="{{ url_for('classification_refinement_preview', target_type=filters.target_type, status=filters.status, date_from=filters.date_from, date_to=filters.date_to, page=filters.page, page_size=filters.page_size) }}" disabled {% if not pending_page.refinement_available %}title="请先配置分类精筛模型和 Prompt"{% endif %}>预览 Pro 精筛</button>{% endif %}
+  </div>
+</div>
+{% else %}
+  <div class="pending-empty">
+    <span class="pending-empty-mark">✓</span>
+    <h2>{% if filters.status == 'refinement' %}没有等待精筛的分类项{% else %}没有需要人工确认的分类项{% endif %}</h2>
+    <p>可以更改日期范围或分类范围，查看其他待办。</p>
+    {% if filters.status == 'refinement' %}<a class="button secondary" href="{{ url_for('pending_classifications', target_type=filters.target_type, status='manual', date_from=filters.date_from, date_to=filters.date_to, page_size=filters.page_size) }}">查看需人工确认</a>{% endif %}
+  </div>
+{% endif %}
+
+{% if pending_page.pages > 1 %}
+<nav class="pagination pending-pagination" aria-label="待分类分页">
+  {% if pending_page.has_previous %}<a class="button secondary" href="{{ url_for('pending_classifications', target_type=filters.target_type, status=filters.status, date_from=filters.date_from, date_to=filters.date_to, page=pending_page.page-1, page_size=filters.page_size) }}">上一页</a>{% endif %}
+  <span>第 {{ pending_page.page }} / {{ pending_page.pages }} 页 · {{ pending_page.total }} 项</span>
+  {% if pending_page.has_next %}<a class="button secondary" href="{{ url_for('pending_classifications', target_type=filters.target_type, status=filters.status, date_from=filters.date_from, date_to=filters.date_to, page=pending_page.page+1, page_size=filters.page_size) }}">下一页</a>{% endif %}
+</nav>
+{% endif %}
+
+<script>
+(() => {
+  const form = document.getElementById('pending-classification-batch');
+  if (!form) return;
+  const allTop = document.getElementById('pending-select-page');
+  const allBottom = document.querySelector('.pending-select-page-bottom');
+  const checks = [...document.querySelectorAll('.pending-classification-checkbox')];
+  const buttons = [...form.querySelectorAll('button[type="submit"]'), ...document.querySelectorAll('button[form="pending-classification-batch"]')];
+  const refresh = () => {
+    const selected = checks.filter((item) => item.checked).length;
+    const text = `已选 ${selected} 项`;
+    document.getElementById('pending-selected-count').textContent = text;
+    document.querySelector('.pending-selected-count-bottom').textContent = text;
+    for (const button of buttons) button.disabled = selected === 0 || (button.classList.contains('pending-refine-preview') && form.dataset.refinementAvailable === '0');
+    for (const checkbox of [allTop, allBottom]) {
+      if (!checkbox) continue;
+      checkbox.checked = selected > 0 && selected === checks.length;
+      checkbox.indeterminate = selected > 0 && selected < checks.length;
+    }
+  };
+  const setPage = (checked) => { checks.forEach((item) => { item.checked = checked; }); refresh(); };
+  allTop?.addEventListener('change', () => setPage(allTop.checked));
+  allBottom?.addEventListener('change', () => setPage(allBottom.checked));
+  checks.forEach((item) => item.addEventListener('change', refresh));
+  refresh();
+})();
+</script>
+{% endblock %}

@@ -25,6 +25,7 @@ DEFAULT_SETTINGS = {
     "crawler.missing_field_warning_rate": 0.0,
     "llm.abstract_concurrency": 10,
     "llm.abstract_retries": 2,
+    "llm.classification_refinement_enabled": True,
     "llm.trust_env_proxy": False,
     "llm.pdf_download_timeout_seconds": 300,
     "llm.pdf_download_retries": 2,

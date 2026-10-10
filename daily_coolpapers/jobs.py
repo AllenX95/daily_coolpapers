@@ -195,6 +195,37 @@ class JobRunner:
             self.queue.put(job_id)
         return job_id
 
+    def enqueue_classification_refinement(self,relations):
+        from .services import build_classification_refinement_plan
+        plan=build_classification_refinement_plan(relations)
+        with self._state_lock:
+            self._require_accepting_locked()
+            job_id,created=db.create_classification_refinement_job(plan)
+            if created:
+                db.update_job_progress(job_id,0,1,'分类精筛等待执行')
+            self._queue_persisted_job_locked(job_id)
+        return job_id
+
+    def enqueue_classification_review(self,plan):
+        with self._state_lock:
+            self._require_accepting_locked()
+            job_id,created=db.create_classification_refinement_job(plan)
+            if created:
+                db.update_job_progress(job_id,0,1,'Pro 复核等待执行')
+            self._queue_persisted_job_locked(job_id)
+        return job_id
+
+    def enqueue_classification_target_backfill(self,target_type,target_id,date_from,date_to):
+        from .services import build_classification_target_backfill_plan
+        plan=build_classification_target_backfill_plan(target_type,target_id,date_from,date_to)
+        with self._state_lock:
+            self._require_accepting_locked()
+            job_id,created=db.create_classification_target_backfill_job(plan)
+            if created:
+                db.update_job_progress(job_id,0,1,'历史补分类等待执行')
+            self._queue_persisted_job_locked(job_id)
+        return job_id
+
     def enqueue_memo(self,command):
         from .memos import create_memo_version
         with self._state_lock:
@@ -254,7 +285,15 @@ class JobRunner:
             )
             if original_plan:
                 plan.update({key: original_plan[key] for key in ('dates', 'start_date', 'end_date', 'target_date', 'categories')})
-                original_direction_ids = {item['id'] for item in original_plan.get('directions',[])}
+                original_targets = original_plan.get('classification_targets')
+                if original_targets is None:
+                    original_targets = [{'target_type':'attention_direction','target_id':item['id']}
+                                        for item in original_plan.get('directions',[])]
+                original_target_keys = {(item['target_type'],int(item['target_id'])) for item in original_targets}
+                plan['classification_targets'] = [item for item in plan['classification_targets']
+                    if (item['target_type'],int(item['target_id'])) in original_target_keys]
+                original_direction_ids = {target_id for target_type,target_id in original_target_keys
+                                          if target_type == 'attention_direction'}
                 plan['directions'] = [item for item in plan['directions'] if item['id'] in original_direction_ids]
                 plan['retry_mode'] = retry_mode
             job_id, created = db.create_daily_pipeline_job(plan, idempotency_key=idempotency_key, retry_of_job_id=retry_of_job_id)
@@ -440,6 +479,14 @@ class JobRunner:
             if job_type == 'direction_backfill':
                 from .services import run_direction_backfill
                 result = run_direction_backfill(job_id,payload,progress=progress)
+                return JobExecutionResult(result,result['status'])
+            if job_type == 'classification_target_backfill':
+                from .services import run_classification_target_backfill
+                result=run_classification_target_backfill(job_id,payload,progress=progress)
+                return JobExecutionResult(result,result['status'])
+            if job_type == 'classification_refinement':
+                from .services import run_classification_refinement_job
+                result=run_classification_refinement_job(job_id,payload,progress=progress)
                 return JobExecutionResult(result,result['status'])
             if job_type == "crawl":
                 return crawl_all_categories(

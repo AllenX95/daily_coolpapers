@@ -38,6 +38,7 @@ ProgressCallback = Callable[[int, int, str, dict[str, Any] | None], None]
 
 EVALUATION_TYPE_LABELS = {
     "direction_classification": "关注方向分类",
+    "classification_refinement": "分类精筛",
     "abstract_review": "摘要评估",
     "fulltext_review": "全文评估",
 }
@@ -1401,10 +1402,13 @@ def build_daily_pipeline_plan(
         categories = [item for item in categories if int(item['id']) in set(category_ids)]
     if not categories:
         raise ValueError("请至少启用一个抓取类目")
-    if bool(start_date) != bool(end_date):
-        raise ValueError("起止日期必须同时提供")
-    if start_date and end_date:
-        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    if end_date and not start_date:
+        raise ValueError("补抓结束日期必须与开始日期同时提供")
+    if start_date:
+        start = date.fromisoformat(start_date)
+        # A start-only manual catch-up is bounded to this plan's frozen latest
+        # available arXiv date, so the UI route and worker cannot cross midnight.
+        end = date.fromisoformat(end_date) if end_date else date.fromisoformat(latest)
         if start > end or end.isoformat() > latest:
             raise ValueError("日期范围无效或超出最新可抓日期")
         dates = available_arxiv_dates_after((start - timedelta(days=1)).isoformat(), end.isoformat())
@@ -1437,6 +1441,8 @@ def build_daily_pipeline_plan(
         "abstract_concurrency": max(1, db.get_int_setting("llm.abstract_concurrency", 10)),
         "abstract_retries": max(0, db.get_int_setting("llm.abstract_retries", 2)),
         "directions": db.list_attention_directions(active_only=True),
+        "classification_targets": db.classification_targets(active_only=True),
+        "classification_refinement_enabled": bool(db.get_setting('llm.classification_refinement_enabled', True)),
     }
     try:
         config = resolve_evaluation_config("abstract_review")
@@ -1447,18 +1453,23 @@ def build_daily_pipeline_plan(
         }
     except ValueError:
         plan['abstract_config_error'] = 'evaluation_config_missing'
-    if plan['directions']:
+    if plan['classification_targets']:
         try:
             plan['classification_config'] = evaluation_config_snapshot('direction_classification')
         except ValueError:
             plan['classification_config_error'] = 'evaluation_config_missing'
+        if plan['classification_refinement_enabled']:
+            try:
+                plan['classification_refinement_config'] = evaluation_config_snapshot('classification_refinement')
+            except ValueError:
+                plan['classification_refinement_config_error'] = 'evaluation_config_missing'
     return plan
 
 
 def evaluation_config_snapshot(evaluation_type):
     config = resolve_evaluation_config(evaluation_type)
     profile = {key: config.profile.get(key) for key in PROFILE_SNAPSHOT_FIELDS}
-    if evaluation_type in {'direction_classification','investment_memo'}:
+    if evaluation_type in {'direction_classification','classification_refinement','investment_memo'}:
         profile['allow_response_format_fallback'] = False
     return {'prompt': {key: config.prompt.get(key) for key in ('id','version','type','template','enabled')},
             'profile': profile,
@@ -1466,7 +1477,8 @@ def evaluation_config_snapshot(evaluation_type):
 
 
 def _pipeline_evaluation_config(plan: dict[str, Any], evaluation_type='abstract_review') -> EvaluationConfig:
-    key = 'classification_config' if evaluation_type == 'direction_classification' else 'abstract_config'
+    key = {'direction_classification':'classification_config',
+           'classification_refinement':'classification_refinement_config'}.get(evaluation_type,'abstract_config')
     snapshot = plan.get(key) or {}
     profile = db.get_llm_profile((snapshot.get('profile') or {}).get('id')) if snapshot else None
     if not profile or _profile_binding(profile) != snapshot.get('binding'):
@@ -1474,24 +1486,59 @@ def _pipeline_evaluation_config(plan: dict[str, Any], evaluation_type='abstract_
     return EvaluationConfig(evaluation_type, snapshot['prompt'], {**profile, **snapshot['profile']})
 
 
-def validate_classification_result(result, direction_ids):
+def validate_classification_result(result, targets):
     def invalid():
         raise LLMError('分类结果不符合固定契约', code='invalid_classification_result', retryable=True)
-    if not isinstance(result, dict) or not isinstance(result.get('directions'), list):
+    target_rows = targets if targets and isinstance(targets[0],dict) else [
+        {'target_type':'attention_direction','target_id':int(value)} for value in targets]
+    expected = {(item['target_type'],int(item['target_id'])) for item in target_rows}
+    if not isinstance(result, dict):
+        invalid()
+    raw_rows=result.get('targets')
+    legacy=raw_rows is None and isinstance(result.get('directions'),list)
+    if legacy:
+        raw_rows=[{'target_type':'attention_direction','target_id':row.get('direction_id'),
+                   'decision':row.get('decision'),'reason':row.get('reason')} for row in result['directions']]
+    if not isinstance(raw_rows,list):
         invalid()
     rows, seen = [], set()
-    for row in result['directions']:
+    for row in raw_rows:
         if not isinstance(row, dict):
             invalid()
-        key = row.get('direction_id')
-        if type(key) is not int or key not in direction_ids or key in seen:
+        target_type=row.get('target_type','attention_direction' if legacy else None)
+        key=row.get('target_id',row.get('direction_id') if legacy else None)
+        if target_type not in {'attention_direction','investment_theme'} or type(key) is not int or (target_type,key) not in expected or (target_type,key) in seen:
             invalid()
         if not isinstance(row.get('decision'),str) or row['decision'] not in {'matched','possible','unmatched'} or not isinstance(row.get('reason'), str) or not row['reason'].strip():
             invalid()
-        seen.add(key)
-        rows.append({name:row[name] for name in ('direction_id','decision','reason')})
-    if seen != set(direction_ids):
+        seen.add((target_type,key))
+        rows.append({'target_type':target_type,'target_id':key,'decision':row['decision'],'reason':row['reason'].strip()})
+    if seen != expected:
         invalid()
+    return rows
+
+
+def validate_classification_refinement_result(result, targets):
+    def invalid():
+        raise LLMError('分类精筛结果不符合固定契约',code='invalid_classification_refinement_result',retryable=True)
+    if not isinstance(result,dict) or not isinstance(result.get('targets'),list):
+        invalid()
+    expected={(item['target_type'],int(item['target_id'])) for item in targets}
+    seen=set(); rows=[]
+    for row in result['targets']:
+        if not isinstance(row,dict): invalid()
+        key=(row.get('target_type'),row.get('target_id'))
+        if key[0] not in {'attention_direction','investment_theme'} or type(key[1]) is not int or key not in expected or key in seen: invalid()
+        if row.get('decision') not in {'matched','unmatched','possible'}: invalid()
+        if row.get('confidence') not in {'high','medium','low'}: invalid()
+        if not isinstance(row.get('reason'),str) or not row['reason'].strip(): invalid()
+        uncertainty=row.get('uncertainty','')
+        if not isinstance(uncertainty,str) or (row['decision']=='possible' and not uncertainty.strip()): invalid()
+        seen.add(key)
+        rows.append({'target_type':key[0],'target_id':key[1],'decision':row['decision'],
+                     'confidence':row['confidence'],'reason':row['reason'].strip(),
+                     'uncertainty':uncertainty.strip()})
+    if seen!=expected: invalid()
     return rows
 
 
@@ -1503,8 +1550,10 @@ def aggregate_direction_results(rows):
 
 
 def classify_candidate(paper_id, metadata, plan, job_id, *, config=None, client=None, source='daily', can_classify=True, explicit=False):
-    directions = plan.get('directions', [])
-    snapshot_ids = [d['id'] for d in directions]
+    targets = plan.get('classification_targets') or [
+        {'target_type':'attention_direction','target_id':int(d['id']),'name':d['name'],'definition':d['scope_text'],'status':d['status']}
+        for d in plan.get('directions',[])]
+    target_keys = [(d['target_type'],int(d['target_id'])) for d in targets]
     def event(kind, metrics, *, attempt=1, terminal=False, code=None):
         db.append_job_event(job_id, f'classification:{job_id}:{paper_id}:' + ('terminal' if terminal else f'{attempt}:{kind}'),
                             'classification', f'classification.{kind}', paper_id=paper_id, attempt=attempt,
@@ -1517,12 +1566,12 @@ def classify_candidate(paper_id, metadata, plan, job_id, *, config=None, client=
         outcome = {'already_classified':1}
         event('paper_skipped_existing', outcome, terminal=True)
         return outcome
-    token, missing, reason = db.claim_classification(paper_id, snapshot_ids, job_id, daily=source == 'daily' and not explicit)
+    token, missing, reason = db.claim_classification(paper_id, targets, job_id, daily=source == 'daily' and not explicit)
     if not token:
         outcome = {reason:1}
         event('paper_skipped_existing', outcome, terminal=True)
         return outcome
-    directions = [d for d in directions if d['id'] in missing]
+    targets = [d for d in targets if (d['target_type'],int(d['target_id'])) in set(missing)]
     started = perf_counter()
     outcome = {'calls':0,'call_success':0,'call_failed':0,'retry_count':0,'input_tokens':0,'output_tokens':0}
     try:
@@ -1539,22 +1588,25 @@ def classify_candidate(paper_id, metadata, plan, job_id, *, config=None, client=
             for attempt in range(1,4):
                 with call_attempts.business_attempt(retry_reason='provider_retry' if attempt > 1 else None):
                     evaluation_id = db.start_classification_attempt(
-                        paper_id,job_id,source,directions,metadata,plan.get('classification_config'),attempt,
+                        paper_id,job_id,source,targets,metadata,plan.get('classification_config'),attempt,
                         operation_id=call_attempts.current_operation_id(),
                     )
-                    event('paper_started', {'evaluation_id':evaluation_id, 'direction_count':len(directions)},attempt=attempt)
+                    event('paper_started', {'evaluation_id':evaluation_id, 'target_count':len(targets)},attempt=attempt)
                     response, result, code, retryable = None, None, None, False
                     if not config:
                         code = 'evaluation_config_missing'
                     else:
                         try:
                             prompt = render_prompt(config.prompt['template'], {**metadata,
-                                'directions_json':json.dumps(directions,ensure_ascii=False),
+                                'directions_json':json.dumps([{'direction_id':d['target_id'],'name':d['name'],'scope_text':d['definition']} for d in targets if d['target_type']=='attention_direction'],ensure_ascii=False),
+                                'attention_directions_json':json.dumps([{'direction_id':d['target_id'],'name':d['name'],'scope_text':d['definition']} for d in targets if d['target_type']=='attention_direction'],ensure_ascii=False),
+                                'investment_themes_json':json.dumps([{'theme_id':d['target_id'],'name':d['name'],'description':d['definition']} for d in targets if d['target_type']=='investment_theme'],ensure_ascii=False),
+                                'targets_json':json.dumps(targets,ensure_ascii=False),
                                 'metadata_json':json.dumps(metadata,ensure_ascii=False)})
                             EvaluationRunner()._ensure_context_window(prompt, config.profile)
                             outcome['calls'] += 1
                             response = call_llm(config.profile,prompt,client=client)
-                            result = validate_classification_result(response.result_json, missing)
+                            result = validate_classification_result(response.result_json, targets)
                         except sqlite3.DatabaseError:
                             raise
                         except Exception as exc:
@@ -1583,14 +1635,257 @@ def classify_candidate(paper_id, metadata, plan, job_id, *, config=None, client=
         db.release_classification_claim(token)
 
 
+def _classification_fulltext_evidence(paper_id: int) -> dict[str, Any]:
+    evaluation=db.get_latest_successful_evaluation(paper_id,'fulltext_review')
+    result=(evaluation or {}).get('result') or {}
+    if not isinstance(result,dict): return {}
+    keys=('one_sentence_summary','detailed_summary_zh','problem','method','main_findings','weaknesses')
+    return {key:result[key] for key in keys if result.get(key)}
+
+
+def refine_classification_candidate(paper_id: int, metadata: dict[str,Any], targets: list[dict[str,Any]],
+                                    plan: dict[str,Any], job_id: int, *, config=None, client=None,
+                                    purpose='candidate') -> dict[str,Any]:
+    target_keys=[(item['target_type'],int(item['target_id'])) for item in targets]
+    if purpose=='candidate':
+        token,missing,reason=db.claim_classification_refinement(paper_id,target_keys,job_id)
+        if not token: return {reason or 'already_processed':1}
+        targets=[item for item in targets if (item['target_type'],int(item['target_id'])) in set(missing)]
+    else:
+        token=None
+    candidates=[{'target_type':item['target_type'],'target_id':item['target_id'],'name':item['name'],
+                 'definition':item['definition'],'flash_decision':item.get('model_decision'),
+                 'flash_reason':item.get('model_reason')} for item in targets]
+    input_snapshot={**metadata,'candidates':candidates,'fulltext_evidence':_classification_fulltext_evidence(paper_id)}
+    outcome={'calls':0,'call_success':0,'call_failed':0,'retry_count':0,'input_tokens':0,'output_tokens':0}
+    try:
+        operation=call_attempts.operation_context(
+            'classification_refinement',job_id=job_id,paper_id=paper_id,evaluation_type='classification_refinement',
+            prompt_id=(config.prompt_id if config else None),prompt_version=(config.prompt_version if config else None),
+            profile_id=(config.profile_id if config else None),model=(config.model if config else None),
+            input_schema_version='classification_refinement.input.v1',output_schema_version='classification_refinement.output.v1')
+        with operation:
+            for attempt in range(1,4):
+                with call_attempts.business_attempt(retry_reason='provider_retry' if attempt>1 else None):
+                    evaluation_id=db.start_classification_refinement_attempt(
+                        paper_id,job_id,purpose,targets,input_snapshot,plan.get('classification_refinement_config'),attempt,
+                        operation_id=call_attempts.current_operation_id())
+                    response,result,code,retryable=None,None,None,False
+                    if not config:
+                        code='evaluation_config_missing'
+                    else:
+                        try:
+                            prompt=render_prompt(config.prompt['template'],{
+                                **metadata,'metadata_json':json.dumps(metadata,ensure_ascii=False),
+                                'candidates_json':json.dumps(candidates,ensure_ascii=False),
+                                'fulltext_evidence_json':json.dumps(input_snapshot['fulltext_evidence'],ensure_ascii=False)})
+                            EvaluationRunner()._ensure_context_window(prompt,config.profile)
+                            outcome['calls']+=1
+                            response=call_llm(config.profile,prompt,client=client)
+                            result=validate_classification_refinement_result(response.result_json,targets)
+                        except sqlite3.DatabaseError:
+                            raise
+                        except Exception as exc:
+                            retryable=bool(getattr(exc,'retryable',False))
+                            code='invalid_classification_result' if getattr(exc,'code',None)=='invalid_classification_refinement_result' else ('provider_retryable_error' if retryable else 'provider_terminal_error')
+                    usage=getattr(response,'usage',None) or {}
+                    usage=usage if isinstance(usage,dict) else {}
+                    for key in ('input_tokens','output_tokens'):
+                        value=usage.get(key,usage.get('prompt_tokens' if key=='input_tokens' else 'completion_tokens',0))
+                        if isinstance(value,(int,float)) and not isinstance(value,bool): outcome[key]+=max(0,int(value))
+                    will_retry=bool(code and retryable and attempt<3)
+                    db.finish_classification_refinement_attempt(evaluation_id,result=result,raw_output=response.raw_text if response else None,
+                        error_code=code,retryable=retryable,terminal=not will_retry,usage=usage)
+                outcome['call_success' if result else 'call_failed']+=int(response is not None or outcome['calls']>attempt-1)
+                if will_retry:
+                    outcome['retry_count']+=1; _abstract_retry_wait(attempt); continue
+                outcome.update({'success' if result else 'failed':1,'evaluation_id':evaluation_id})
+                return outcome
+    finally:
+        if token: db.release_classification_claim(token)
+
+
+def run_classification_refinement_stage(job_id,plan,paper_ids,inputs,*,relations=None,progress=None):
+    targets_by_paper={}
+    all_results=db.classification_results(paper_ids)
+    selected={(int(paper_id),str(target_type),int(target_id)) for paper_id,target_type,target_id in relations} if relations else None
+    for paper_id in paper_ids:
+        targets_by_paper[paper_id]=[row for row in all_results.get(paper_id,[])
+            if row.get('model_decision')=='possible' and row.get('manual_decision') is None and not row.get('manual_removed')
+            and row.get('pro_decision') in {None,'failed'} and row.get('target_status')=='active'
+            and (selected is None or (int(paper_id),row['target_type'],int(row['target_id'])) in selected)]
+    candidates=[paper_id for paper_id,rows in targets_by_paper.items() if rows]
+    summary={'candidate_papers':len(candidates),'candidate_relations':sum(len(rows) for rows in targets_by_paper.values()),
+             'calls':0,'call_success':0,'call_failed':0,'retry_count':0,'matched':0,'unmatched':0,'possible':0,
+             'failed':0,'input_tokens':0,'output_tokens':0}
+    if not candidates:
+        summary['status']='no_candidates'; return summary
+    if not plan.get('classification_refinement_enabled',True):
+        summary['status']='manual_fallback'; return summary
+    try:
+        config=_pipeline_evaluation_config(plan,'classification_refinement')
+    except ValueError:
+        summary.update({'status':'manual_fallback','config_error':'evaluation_config_missing'})
+        db.append_job_event(job_id,f'refinement:{job_id}:fallback','classification_refinement',
+            'classification_refinement.manual_fallback',metrics=summary,
+            message='未配置精筛模型，候选保留在人工确认队列。')
+        return summary
+    summary.update({'prompt_id':config.prompt_id,'prompt_version':config.prompt_version,'profile_id':config.profile_id,'model':config.model})
+    with make_llm_client(config.profile) as client:
+        with ThreadPoolExecutor(max_workers=max(1,min(len(candidates),plan.get('abstract_concurrency',4)))) as executor:
+            futures={executor.submit(refine_classification_candidate,paper_id,inputs.get(paper_id) or inputs.get(str(paper_id)) or {},
+                targets_by_paper[paper_id],plan,job_id,config=config,client=client):paper_id for paper_id in candidates}
+            for index,future in enumerate(as_completed(futures),1):
+                outcome=future.result()
+                for key in ('calls','call_success','call_failed','retry_count','input_tokens','output_tokens'):
+                    summary[key]+=outcome.get(key,0)
+                summary['failed']+=outcome.get('failed',0)
+                if progress: progress(index,len(candidates),f'分类精筛 {index}/{len(candidates)}',{'phase':'classification_refinement','summary':dict(summary)})
+    result_rows=db.classification_results(candidates)
+    for paper_id in candidates:
+        for row in result_rows.get(paper_id,[]):
+            if (row.get('target_type'),int(row.get('target_id'))) not in {(item['target_type'],int(item['target_id'])) for item in targets_by_paper[paper_id]}:
+                continue
+            if row.get('pro_decision') in {'matched','unmatched','possible'}:
+                summary['possible' if row.get('pro_confidence')=='low' else row['pro_decision']]+=1
+    summary['status']='partial_success' if summary['failed'] else 'success'
+    db.append_job_event(job_id,f'refinement:{job_id}:completed','classification_refinement',
+        'classification_refinement.stage_completed',metrics=summary)
+    return summary
+
+
+def classification_refinement_preview(relations):
+    preview=db.preview_classification_refinement(relations)
+    enabled=bool(db.get_setting('llm.classification_refinement_enabled',True))
+    try:
+        resolve_evaluation_config('classification_refinement')
+        configured=True
+    except ValueError:
+        configured=False
+    preview['relation_keys']=preview['relations']
+    preview['relations']=preview.pop('relation_details')
+    preview.update({'enabled':enabled,'configured':configured,
+                    'calls':preview['paper_count'] if enabled and configured else 0,
+                    'config_error':None if configured else 'evaluation_config_missing',
+                    'reason':None if enabled and configured else ('disabled' if not enabled else 'evaluation_config_missing')})
+    return preview
+
+
+def build_classification_refinement_plan(relations):
+    preview=classification_refinement_preview(relations)
+    if not preview['calls']:
+        raise ValueError('classification_refinement_config_missing')
+    paper_ids=preview['paper_ids']
+    result_map=db.classification_results(paper_ids)
+    selected={(int(paper_id),target_type,int(target_id)) for paper_id,target_type,target_id in preview['relation_keys']}
+    target_map={}
+    for paper_id,rows in result_map.items():
+        for row in rows:
+            key=(int(paper_id),row['target_type'],int(row['target_id']))
+            if key in selected:
+                target_map[key]={'target_type':row['target_type'],'target_id':int(row['target_id']),
+                    'name':row['name'],'definition':row['definition'],'model_decision':row['model_decision'],
+                    'model_reason':row['model_reason'],'status':row['target_status']}
+    targets=[target_map[key] for key in sorted(target_map)]
+    try:
+        refinement_config=evaluation_config_snapshot('classification_refinement')
+    except ValueError as error:
+        raise ValueError('classification_refinement_config_missing') from error
+    try:
+        abstract_config=evaluation_config_snapshot('abstract_review')
+    except ValueError:
+        abstract_config=None
+    serialized=sorted(f'candidate:{kind}:{target_id}:{paper_id}' for paper_id,kind,target_id in selected)
+    relation_key=hashlib.sha256('|'.join(serialized).encode()).hexdigest()
+    return {'trigger_source':'manual_refinement','purpose':'candidate','relations':preview['relation_keys'],'relation_key':relation_key,
+        'paper_ids':paper_ids,'targets':targets,'inputs':db.classification_inputs(paper_ids),
+        'classification_refinement_config':refinement_config,
+        'classification_refinement_enabled':True,
+        'abstract_config':abstract_config,'abstract_concurrency':max(1,db.get_int_setting('llm.abstract_concurrency',10)),
+        'abstract_retries':min(2,max(0,db.get_int_setting('llm.abstract_retries',2)))}
+
+
+def run_classification_refinement_job(job_id,plan,progress=None):
+    if plan.get('purpose')=='review':
+        return run_classification_review_job(job_id,plan,progress)
+    started=perf_counter()
+    relations=[(int(item[0]),str(item[1]),int(item[2])) for item in plan.get('relations',[])]
+    summary=run_classification_refinement_stage(job_id,plan,plan['paper_ids'],plan['inputs'],
+        relations=relations,progress=progress)
+    selected=finally_selected_papers(plan['paper_ids'],plan.get('targets') or [])
+    abstract,config_error=run_pipeline_abstract_stage(job_id,plan,selected,candidate_count=len(selected),progress=progress)
+    result={'status':'partial_success' if summary.get('failed') or abstract['failed'] else 'success',
+        'refinement':summary,'selected_for_abstract':len(selected),'abstract':abstract,
+        'duration_ms':round((perf_counter()-started)*1000)}
+    if config_error and abstract['failed']:
+        result['status']='partial_success'
+    db.append_job_event(job_id,f'refinement:{job_id}:complete','classification_refinement',
+        'classification_refinement.completed',metrics=result,
+        level='info' if result['status']=='success' else 'warning')
+    if progress: progress(1,1,'分类精筛任务已结束',{'phase':'finalize',**result})
+    return result
+
+
+def classification_review_plan(paper_id: int,target_type: str,target_id: int):
+    rows=db.classification_results([paper_id]).get(paper_id,[])
+    target=next((row for row in rows if row['target_type']==target_type and int(row['target_id'])==int(target_id)),None)
+    if not target or not target.get('effective') or target.get('target_status')!='active':
+        raise db.PendingDirectionConflictError('只有当前有效入选的分类项可以进行 Pro 复核')
+    if not bool(db.get_setting('llm.classification_refinement_enabled',True)):
+        raise ValueError('分类精筛已关闭')
+    try:
+        refinement_config=evaluation_config_snapshot('classification_refinement')
+    except ValueError as error:
+        raise ValueError('请先配置分类精筛模型和 Prompt') from error
+    try: abstract_config=evaluation_config_snapshot('abstract_review')
+    except ValueError: abstract_config=None
+    relation=(int(paper_id),target_type,int(target_id))
+    relation_key=hashlib.sha256(f'review:{target_type}:{target_id}:{paper_id}'.encode()).hexdigest()
+    return {'trigger_source':'paper_review','purpose':'review','relations':[relation],'relation_key':relation_key,
+        'paper_ids':[int(paper_id)],'targets':[target],'inputs':db.classification_inputs([paper_id]),
+        'classification_refinement_config':refinement_config,'classification_refinement_enabled':True,
+        'abstract_config':abstract_config,'abstract_concurrency':1,'abstract_retries':0}
+
+
+def run_classification_review_job(job_id,plan,progress=None):
+    started=perf_counter(); paper_id=int(plan['paper_ids'][0]); targets=plan['targets']
+    config=_pipeline_evaluation_config(plan,'classification_refinement')
+    with make_llm_client(config.profile) as client:
+        outcome=refine_classification_candidate(paper_id,plan['inputs'].get(paper_id) or plan['inputs'].get(str(paper_id)) or {},targets,
+            plan,job_id,config=config,client=client,purpose='review')
+    status='failed' if outcome.get('failed') else 'success'
+    result={'status':status,'purpose':'review','paper_id':paper_id,'target_count':len(targets),
+        'calls':outcome.get('calls',0),'call_failed':outcome.get('call_failed',0),
+        'evaluation_id':outcome.get('evaluation_id'),'duration_ms':round((perf_counter()-started)*1000)}
+    db.append_job_event(job_id,f'refinement:{job_id}:review-complete','classification_review',
+        'classification_refinement.review_completed',paper_id=paper_id,metrics=result,
+        level='warning' if status=='failed' else 'info')
+    if progress: progress(1,1,'Pro 复核已结束；结果仅作为建议',{'phase':'classification_review',**result})
+    return result
+
+
+def finally_selected_papers(paper_ids, targets):
+    target_keys={(item['target_type'],int(item['target_id'])) for item in targets}
+    if not target_keys: return list(paper_ids)
+    results=db.classification_results(paper_ids)
+    return [paper_id for paper_id in paper_ids if any(
+        (row['target_type'],int(row['target_id'])) in target_keys and row.get('effective')
+        for row in results.get(paper_id,[]))]
+
+
 def run_classification_stage(job_id, plan, paper_ids, inputs, *, new_ids=None, source='daily', explicit=False, progress=None):
     started = perf_counter()
+    targets = plan.get('classification_targets') or [
+        {'target_type':'attention_direction','target_id':int(d['id']),'name':d['name'],'definition':d['scope_text'],'status':d['status']}
+        for d in plan.get('directions',[])]
     directions = plan.get('directions', [])
     summary = {key:0 for key in ('success','failed','input_incomplete','already_classified','classification_already_running',
                'calls','call_success','call_failed','retry_count','matched','possible','unmatched','failed_papers','input_tokens','output_tokens')}
-    summary.update({'candidate_count':len(paper_ids),'direction_count':len(directions),'direction_ids':[d['id'] for d in directions]})
+    summary.update({'candidate_count':len(paper_ids),'direction_count':len([t for t in targets if t['target_type']=='attention_direction']),
+                    'theme_count':len([t for t in targets if t['target_type']=='investment_theme']),
+                    'target_count':len(targets),'target_ids':[f"{t['target_type']}:{t['target_id']}" for t in targets]})
     db.append_job_event(job_id,f'classification:{job_id}:plan','classification','classification.plan_created',metrics=summary)
-    if not directions:
+    if not targets:
         summary['status'] = 'skipped_no_active_directions'
         db.append_job_event(job_id,f'classification:{job_id}:skip','classification','classification.skipped_no_active_directions',
             message='当前未启用关注方向，将对全部新论文执行摘要评估。',metrics=summary)
@@ -1616,10 +1911,11 @@ def run_classification_stage(job_id, plan, paper_ids, inputs, *, new_ids=None, s
                     incomplete.add(futures[future])
                 if progress:
                     progress(count,len(paper_ids),f'关注方向分类 {count}/{len(paper_ids)}',{'phase':'classification','classification':dict(summary)})
-    results = db.paper_direction_results(paper_ids)
+    results = db.classification_results(paper_ids)
     eligible, partial = [], False
     for paper_id in paper_ids:
-        rows = [r for r in results.get(paper_id,[]) if r['direction_id'] in summary['direction_ids']]
+        target_keys = {(item['target_type'],int(item['target_id'])) for item in targets}
+        rows = [r for r in results.get(paper_id,[]) if (r['target_type'],int(r['target_id'])) in target_keys]
         aggregate = aggregate_direction_results(rows)
         partial |= aggregate['has_partial_failure']
         state = aggregate['state']
@@ -1627,7 +1923,7 @@ def run_classification_stage(job_id, plan, paper_ids, inputs, *, new_ids=None, s
             summary[state] += 1
         if state == 'failed':
             summary['failed_papers'] += 1
-        if state in ('matched','possible') and paper_id not in incomplete:
+        if (aggregate['effective'] or aggregate['pending']) and paper_id not in incomplete:
             eligible.append(paper_id)
     summary['has_partial_failure'] = partial
     summary['status'] = 'failed' if summary.get('config_error') and summary['failed'] else ('partial_success' if partial or summary['failed'] else 'success')
@@ -1651,16 +1947,49 @@ def direction_backfill_preview(direction_id, date_from, date_to):
 
 def build_direction_backfill_plan(direction_id,date_from,date_to):
     preview = direction_backfill_preview(direction_id,date_from,date_to)
-    plan = {'directions':[preview['direction']], 'paper_ids':preview['paper_ids'],'inputs':preview['inputs'],
+    target={'target_type':'attention_direction','target_id':int(preview['direction']['id']),
+            'name':preview['direction']['name'],'definition':preview['direction']['scope_text'],'status':preview['direction']['status']}
+    plan = {'directions':[preview['direction']], 'classification_targets':[target],
+            'paper_ids':preview['paper_ids'],'inputs':preview['inputs'],
             'start_date':preview['date_from'],'end_date':preview['date_to'],'preview':preview['counts'],
             'trigger_source':'historical_backfill','plan_created_at':db.now_iso(),
             'abstract_concurrency':max(1,db.get_int_setting('llm.abstract_concurrency',10)),
             'abstract_retries':min(2,max(0,db.get_int_setting('llm.abstract_retries',2)))}
-    for kind,key in [('direction_classification','classification_config'),('abstract_review','abstract_config')]:
+    for kind,key in [('direction_classification','classification_config'),('classification_refinement','classification_refinement_config'),('abstract_review','abstract_config')]:
         try:
             plan[key] = evaluation_config_snapshot(kind)
         except ValueError:
             plan[key+'_error'] = 'evaluation_config_missing'
+    return plan
+
+
+def classification_target_backfill_preview(target_type,target_id,date_from,date_to):
+    from .form_commands import FormValidationError
+    try:
+        if not all(isinstance(value,str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}',value) for value in (date_from,date_to)):
+            raise ValueError()
+        start,end=date.fromisoformat(date_from),date.fromisoformat(date_to)
+        if start>end: raise ValueError()
+    except (ValueError,TypeError):
+        raise FormValidationError({'dates':'请填写有效的开始日期与结束日期（YYYY-MM-DD），开始日期不得晚于结束日期'})
+    return db.preview_classification_target_backfill(target_type,target_id,start.isoformat(),end.isoformat())
+
+
+def build_classification_target_backfill_plan(target_type,target_id,date_from,date_to):
+    preview=classification_target_backfill_preview(target_type,target_id,date_from,date_to)
+    target={key:preview['target'][key] for key in ('target_type','target_id','name','definition','status')}
+    targets=[target]
+    plan={'trigger_source':'historical_backfill','classification_targets':targets,
+        'directions':[{'id':target['target_id'],'name':target['name'],'scope_text':target['definition'],'status':target['status']}]
+            if target_type=='attention_direction' else [],
+        'paper_ids':preview['paper_ids'],'inputs':preview['inputs'],'start_date':preview['date_from'],
+        'end_date':preview['date_to'],'preview':preview['counts'],'target_type':target_type,
+        'target_id':int(target_id),'classification_refinement_enabled':bool(db.get_setting('llm.classification_refinement_enabled',True)),
+        'abstract_concurrency':max(1,db.get_int_setting('llm.abstract_concurrency',10)),
+        'abstract_retries':min(2,max(0,db.get_int_setting('llm.abstract_retries',2)))}
+    for kind,key in [('direction_classification','classification_config'),('classification_refinement','classification_refinement_config'),('abstract_review','abstract_config')]:
+        try: plan[key]=evaluation_config_snapshot(kind)
+        except ValueError: plan[key+'_error']='evaluation_config_missing'
     return plan
 
 
@@ -1670,15 +1999,15 @@ def run_direction_backfill(job_id,plan,progress=None):
                         metrics={'candidate_count':len(plan['paper_ids']),'direction_count':1})
     inputs = {int(key):value for key,value in plan['inputs'].items()}
     eligible,classification = run_classification_stage(job_id,plan,plan['paper_ids'],inputs,source='historical_backfill',explicit=True,progress=progress)
-    # A failed new direction never hides a failure behind a previously matched direction.
-    prior_results = db.paper_direction_results(plan['paper_ids'])
-    mixed_failure = any(any(r['model_decision']=='failed' for r in rows) and any(r['model_decision'] in {'matched','possible'} for r in rows)
-                        for rows in prior_results.values())
-    classification['has_partial_failure'] |= mixed_failure
+    scoped_relations=[(paper_id,target['target_type'],int(target['target_id']))
+        for paper_id in eligible for target in plan['classification_targets']]
+    refinement=run_classification_refinement_stage(job_id,plan,eligible,inputs,relations=scoped_relations,progress=progress)
+    eligible=finally_selected_papers(eligible,plan['classification_targets'])
     abstract,config_error = run_pipeline_abstract_stage(job_id,plan,eligible,progress=progress)
+    classification['refinement']=refinement
     classification.update({'abstract_new':abstract['success'],'abstract_reused':abstract['already_successful'],'abstract_failed':abstract['failed']})
     status = classification['status']
-    if status == 'success' and (abstract['failed'] or mixed_failure):
+    if status == 'success' and (abstract['failed'] or refinement.get('failed')):
         status = 'partial_success'
     if config_error and abstract['failed']:
         status = 'failed'
@@ -1688,6 +2017,35 @@ def run_direction_backfill(job_id,plan,progress=None):
                         level='info' if status=='success' else 'warning')
     if progress:
         progress(1,1,'历史补分类已结束',{'phase':'finalize',**result})
+    return result
+
+
+def run_classification_target_backfill(job_id,plan,progress=None):
+    started=perf_counter()
+    db.append_job_event(job_id,f'target-backfill:{job_id}:started','classification_target_backfill',
+        'classification_target_backfill.started',metrics={'target_type':plan.get('target_type'),
+        'target_id':plan.get('target_id'),'paper_count':len(plan['paper_ids'])})
+    inputs={int(key):value for key,value in plan['inputs'].items()}
+    eligible,classification=run_classification_stage(job_id,plan,plan['paper_ids'],inputs,
+        source='historical_backfill',explicit=True,progress=progress)
+    scoped_relations=[(paper_id,target['target_type'],int(target['target_id']))
+        for paper_id in eligible for target in plan['classification_targets']]
+    refinement=run_classification_refinement_stage(job_id,plan,eligible,inputs,relations=scoped_relations,progress=progress)
+    eligible=finally_selected_papers(eligible,plan['classification_targets'])
+    abstract,config_error=run_pipeline_abstract_stage(job_id,plan,eligible,progress=progress)
+    classification['refinement']=refinement
+    classification.update({'abstract_new':abstract['success'],'abstract_reused':abstract['already_successful'],
+        'abstract_failed':abstract['failed']})
+    failed=bool(classification.get('failed') or classification.get('has_partial_failure') or
+        refinement.get('failed') or abstract.get('failed'))
+    status='partial_success' if failed else 'success'
+    if config_error and abstract.get('failed') and not abstract.get('success') and not abstract.get('already_successful'):
+        status='failed'
+    result={'status':status,'classification':classification,'abstract':abstract,'preview':plan['preview'],
+        'duration_ms':round((perf_counter()-started)*1000)}
+    db.append_job_event(job_id,f'target-backfill:{job_id}:complete','classification_target_backfill',
+        'classification_target_backfill.completed',metrics=result,level='info' if status=='success' else 'warning')
+    if progress: progress(1,1,'分类目标历史补分类已结束',{'phase':'finalize',**result})
     return result
 
 
@@ -1726,18 +2084,29 @@ def run_daily_pipeline(job_id: int, plan: dict[str, Any], progress: ProgressCall
     unique_ids = list(dict.fromkeys(candidates))
     new_ids = {key for unit in units for key in unit['metrics'].get('new_paper_ids', [])}
     abstract_only = plan.get('retry_mode') == 'abstract_only'
-    inputs = db.classification_inputs(unique_ids, dates=plan['dates'], categories=[c['category'] for c in plan['categories']]) if plan.get('directions') else {}
+    inputs = db.classification_inputs(unique_ids, dates=plan['dates'], categories=[c['category'] for c in plan['categories']]) if plan.get('classification_targets') else {}
     unique_ids, classification = run_classification_stage(job_id,plan,unique_ids,inputs,new_ids=set() if abstract_only else new_ids,
         explicit=bool(job and job.get('retry_of_job_id')) and not abstract_only,progress=progress)
+    scoped_relations=[(paper_id,target['target_type'],int(target['target_id']))
+        for paper_id in unique_ids for target in plan.get('classification_targets',[])]
+    if abstract_only or not plan.get('classification_targets'):
+        refinement={'status':'skipped','candidate_papers':0,'candidate_relations':0,'calls':0,
+                    'call_success':0,'call_failed':0,'retry_count':0,'matched':0,'unmatched':0,
+                    'possible':0,'failed':0,'input_tokens':0,'output_tokens':0}
+    else:
+        refinement=run_classification_refinement_stage(job_id,plan,unique_ids,inputs,
+            relations=scoped_relations,progress=progress)
+    unique_ids=finally_selected_papers(unique_ids,plan.get('classification_targets',[]))
+    classification['refinement']=refinement
     summary, config_error = run_pipeline_abstract_stage(job_id,plan,unique_ids,
-        candidate_count=len(candidates) if not plan.get('directions') else len(unique_ids),progress=progress,
+        candidate_count=len(candidates) if not plan.get('classification_targets') else len(unique_ids),progress=progress,
         skip_daily_failures=not bool(job and job.get('retry_of_job_id')))
     classification.update({'abstract_new':summary['success'], 'abstract_reused':summary['already_successful'],
                            'abstract_failed':summary['failed']})
     crawl_summary = {status: sum(unit['metrics'].get('final_status') == status for unit in units)
                      for status in ('success', 'empty_success', 'warning', 'failed')}
     status = _crawl_overall_status([{'status': unit['metrics']['final_status']} for unit in units])
-    if (summary['failed'] or classification.get('has_partial_failure') or classification.get('failed')) and status == 'success':
+    if (summary['failed'] or classification.get('has_partial_failure') or classification.get('failed') or refinement.get('failed')) and status == 'success':
         status = 'partial_success'
     if (config_error and summary['failed']) or classification['status'] == 'failed':
         status = 'failed'

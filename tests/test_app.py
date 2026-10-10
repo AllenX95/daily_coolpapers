@@ -144,6 +144,8 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn('name="date_to"'.encode(), response.data)
         self.assertIn("抓取并摘要评估".encode("utf-8"), response.data)
         self.assertIn("补抓并摘要评估".encode("utf-8"), response.data)
+        self.assertIn('name="start_date"'.encode(), response.data)
+        self.assertIn('type="date"'.encode(), response.data)
         self.assertIn("评估缺失摘要".encode("utf-8"), response.data)
         self.assertIn("全文评估".encode("utf-8"), response.data)
 

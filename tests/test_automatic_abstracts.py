@@ -270,7 +270,7 @@ class AutomaticAbstractTests(unittest.TestCase):
         for path, source in [('/api/crawl/run', 'manual_latest'), ('/api/crawl/catch-up', 'manual_catch_up')]:
             form = {'csrf_token': 'test-token', 'category_ids': str(self.ids[0])}
             if source == 'manual_catch_up':
-                form.update(start_date='2026-09-02', end_date='2026-09-03')
+                form.update(start_date='2026-09-02')
             with patch.object(services, '_fetch_category_from_config', side_effect=self.fetch), patch.object(services, 'call_llm', return_value=self.response):
                 response = client.post(path, data=form)
                 self.assertEqual(response.status_code, 302)
@@ -278,6 +278,8 @@ class AutomaticAbstractTests(unittest.TestCase):
                 self.runner._run_job(job_id)
             self.assertEqual(db.get_job(job_id)['payload_data']['trigger_source'], source)
             self.assertEqual(db.get_job(job_id)['status'], 'success')
+            if source == 'manual_catch_up':
+                self.assertEqual(db.get_job(job_id)['payload_data']['dates'], ['2026-09-02', '2026-09-03'])
 
     def test_interruption_after_result_commit_recovers_success_without_unknown(self):
         paper_id = db.upsert_papers([_paper('2609.00001')], 'cs.AI', '2026-09-03')[0]
@@ -332,11 +334,21 @@ class AutomaticAbstractTests(unittest.TestCase):
         self.assertEqual(second['total'], 0)
         call.assert_called_once()
 
+    def test_plan_start_only_catch_up_runs_through_frozen_latest_date(self):
+        plan = services.build_daily_pipeline_plan('manual_catch_up', start_date='2026-08-28')
+        self.assertEqual(plan['dates'], ['2026-08-28', '2026-08-31', '2026-09-01', '2026-09-02', '2026-09-03'])
+        self.assertEqual(plan['end_date'], '2026-09-03')
+        self.assertEqual(plan['target_date'], '2026-09-03')
+
     def test_plan_rejects_bad_date_range_and_no_enabled_categories(self):
         with self.assertRaises(ValueError):
-            services.build_daily_pipeline_plan('manual_catch_up', start_date='2026-09-03')
+            services.build_daily_pipeline_plan('manual_catch_up', end_date='2026-09-03')
         with self.assertRaises(ValueError):
             services.build_daily_pipeline_plan('manual_catch_up', start_date='2026-09-04', end_date='2026-09-03')
+        with self.assertRaises(ValueError):
+            services.build_daily_pipeline_plan('manual_catch_up', start_date='2026-09-04')
+        with self.assertRaises(ValueError):
+            services.build_daily_pipeline_plan('manual_catch_up', start_date='2026-02-30')
         with db.connect() as conn:
             conn.execute('UPDATE categories SET enabled=0')
         with self.assertRaises(ValueError):
