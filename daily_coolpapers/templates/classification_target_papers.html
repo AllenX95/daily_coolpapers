@@ -1,0 +1,113 @@
+{% extends 'base.html' %}
+{% block title %}{{ target.name }} - 分类论文{% endblock %}
+{% block content %}
+<section class="favorites-head classification-target-head">
+  <div>
+    <span class="eyebrow">{{ '关注方向' if target.target_type == 'attention_direction' else '投资主题' }} / 论文归类</span>
+    <h1>{{ target.name }}</h1>
+    <p class="theme-description">{{ target.definition or '暂未填写分类说明。' }}</p>
+    <p class="small muted">{{ '启用中' if target.status == 'active' else '已归档，仅查看和恢复历史分类' }} · 已入选 {{ target.selected_count or 0 }} 篇 · 待处理 {{ target.pending_count or 0 }} 篇 · 已移出 {{ target.removed_count or 0 }} 篇</p>
+  </div>
+  <nav class="classification-view-tabs" aria-label="论文分类状态">
+    {% for key,label in [('selected','已入选'),('pending','待处理'),('removed','已移出')] %}
+      <a class="button {{ 'active' if view == key else 'secondary' }}" href="{{ url_for('classification_target_page',target_type=target.target_type,target_id=target.id,view=key,date_from=filters.date_from,date_to=filters.date_to,page_size=filters.page_size) }}" {% if view == key %}aria-current="page"{% endif %}>{{ label }} <span>{{ target.selected_count if key == 'selected' else target.pending_count if key == 'pending' else target.removed_count or 0 }}</span></a>
+    {% endfor %}
+  </nav>
+</section>
+
+<section class="pending-filter-panel">
+  <form method="get" action="{{ url_for('classification_target_page',target_type=target.target_type,target_id=target.id) }}" class="pending-filters">
+    <input type="hidden" name="view" value="{{ view }}">
+    <label>开始日期<input type="date" name="date_from" value="{{ filters.date_from }}"></label>
+    <label>结束日期<input type="date" name="date_to" value="{{ filters.date_to }}"></label>
+    <label>每页论文<select name="page_size">{% for size in [15,30,50,100] %}<option value="{{ size }}" {% if filters.page_size == size %}selected{% endif %}>{{ size }}</option>{% endfor %}</select></label>
+    <button type="submit">筛选</button>
+    <a class="button secondary" href="{{ url_for('classification_target_page',target_type=target.target_type,target_id=target.id,view=view) }}">清除筛选</a>
+  </form>
+  <p class="small muted">按论文抓取日期筛选；留空时跨所有抓取日期显示。当前 {{ page_model.total }} 篇。</p>
+</section>
+{% if error_message %}<p class="pending-error" role="alert">{{ error_message }}</p>{% endif %}
+
+{% if view == 'selected' and page_model['items'] %}
+<form method="post" action="{{ url_for('remove_classification_targets',target_type=target.target_type,target_id=target.id,view=view,date_from=filters.date_from,date_to=filters.date_to,page=filters.page,page_size=filters.page_size) }}" class="target-batch-form" id="classification-target-batch">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="pending-bulk-bar target-bulk-bar">
+    <label class="pending-select-all"><input id="classification-select-page" type="checkbox"> <span>全选本页</span></label>
+    <span id="classification-selected-count" class="pending-selected-count">已选 0 篇</span>
+    <label>移出理由<select name="reason"><option value="scope_mismatch">范围不符</option><option value="weak_relevance">仅弱相关</option><option value="incorrect">判断错误</option><option value="other">其他</option></select></label>
+    <input name="note" maxlength="300" placeholder="备注（可选）" aria-label="移出备注">
+    <button type="submit" id="classification-remove-selected" disabled>移出所选</button>
+  </div>
+</form>
+{% endif %}
+
+<section class="classification-result-list" aria-label="分类论文">
+  {% for item in page_model['items'] %}
+  <article class="classification-result-card">
+    <header>
+      {% if view == 'selected' %}<label class="classification-result-check"><input type="checkbox" class="classification-result-checkbox" name="paper_id" value="{{ item.paper_id }}" form="classification-target-batch" aria-label="选择 {{ item.title }}"></label>{% endif %}
+      <div class="classification-result-main">
+        <a class="paper-title" href="{{ url_for('paper_detail',paper_id=item.paper_id) }}">{{ item.title }}</a>
+        <p class="pending-paper-meta"><span>{{ item.latest_crawl_date or '日期未知' }}</span><span>{{ item.arxiv_id or '无 arXiv 编号' }}</span><span>{{ item.effective_source or ('人工移出' if item.manual_removed else '人工排除' if item.manual_decision == 'rejected' else '需人工确认' if item.pro_confidence == 'low' or item.pro_decision == 'possible' else 'Pro 排除' if item.pro_decision == 'unmatched' else '等待精筛' if item.model_decision == 'possible' and item.pro_decision in [none, 'failed'] else '未入选') }}</span>{% if view == 'pending' %}<span>{{ '需人工确认' if item.pro_confidence == 'low' or item.pro_decision == 'possible' else '等待精筛' }}</span>{% endif %}</p>
+      </div>
+      {% if view == 'removed' %}
+      <form method="post" action="{{ url_for('restore_classification_target',target_type=target.target_type,target_id=target.id,paper_id=item.paper_id,view=view,date_from=filters.date_from,date_to=filters.date_to,page=filters.page,page_size=filters.page_size) }}" class="target-row-action">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit">{{ '恢复入选' if item.manual_removed or item.pro_decision == 'unmatched' or item.manual_decision == 'rejected' else '恢复分类' }}</button>
+      </form>
+      {% elif view == 'selected' %}
+      <details class="target-row-action target-remove-one"><summary>移出此项</summary>
+        <form method="post" action="{{ url_for('remove_classification_targets',target_type=target.target_type,target_id=target.id,view=view,date_from=filters.date_from,date_to=filters.date_to,page=filters.page,page_size=filters.page_size) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="paper_id" value="{{ item.paper_id }}">
+          <label>理由<select name="reason"><option value="scope_mismatch">范围不符</option><option value="weak_relevance">仅弱相关</option><option value="incorrect">判断错误</option><option value="other">其他</option></select></label>
+          <label>备注<input name="note" maxlength="300" placeholder="可选"></label>
+          <button type="submit" class="secondary">确认移出</button>
+        </form>
+      </details>
+      {% endif %}
+    </header>
+    {% if item.abstract %}<p class="classification-result-abstract">{{ item.abstract|truncate_text(520) }}</p>{% endif %}
+    <div class="classification-result-reasons">
+      {% if item.model_reason %}<p><strong>初筛理由</strong><br>{{ item.model_reason }}</p>{% endif %}
+      {% if item.pro_reason %}<p><strong>精筛理由</strong>{% if item.pro_confidence %}<span class="decision-badge">把握{{ {'medium':'中','high':'高','low':'低'}.get(item.pro_confidence,item.pro_confidence) }}</span>{% endif %}<br>{{ item.pro_reason }}</p>{% endif %}
+      {% if item.pro_uncertainty %}<p><strong>待核对问题</strong><br>{{ item.pro_uncertainty }}</p>{% endif %}
+      {% if item.manual_removed or item.removal_reason or item.removal_note or item.removed_at %}<p><strong>{{ '移出记录' if item.manual_removed else '最近移出记录' }}</strong> {{ {'scope_mismatch':'范围不符','weak_relevance':'仅弱相关','incorrect':'判断错误','other':'其他'}.get(item.removal_reason,item.removal_reason or '未填写') }}{% if item.removal_note %} · {{ item.removal_note }}{% endif %}{% if item.removed_at %} · {{ item.removed_at }}{% endif %}</p>{% endif %}
+      {% if item.pro_decision == 'unmatched' and view == 'removed' %}<p><strong>精筛结果：</strong>排除{% if item.pro_reason %} · {{ item.pro_reason }}{% endif %}</p>{% endif %}
+      {% if item.manual_decision == 'rejected' and view == 'removed' %}<p><strong>人工处理：</strong>已排除</p>{% endif %}
+    </div>
+  </article>
+  {% else %}
+  <div class="pending-empty"><h2>{% if view == 'selected' %}还没有入选论文{% elif view == 'pending' %}没有待处理论文{% else %}没有已移出的论文{% endif %}</h2><p>更改日期范围或切换状态查看其他分类结果。</p></div>
+  {% endfor %}
+</section>
+
+{% if view == 'selected' and page_model['items'] %}
+<script>
+(() => {
+  const form = document.getElementById('classification-target-batch');
+  const all = document.getElementById('classification-select-page');
+  const checks = [...document.querySelectorAll('.classification-result-checkbox')];
+  const count = document.getElementById('classification-selected-count');
+  const button = document.getElementById('classification-remove-selected');
+  const refresh = () => {
+    const selected = checks.filter((item) => item.checked).length;
+    count.textContent = `已选 ${selected} 篇`;
+    button.disabled = selected === 0;
+    all.checked = selected > 0 && selected === checks.length;
+    all.indeterminate = selected > 0 && selected < checks.length;
+  };
+  all.addEventListener('change', () => { checks.forEach((item) => { item.checked = all.checked; }); refresh(); });
+  checks.forEach((item) => item.addEventListener('change', refresh));
+  refresh();
+})();
+</script>
+{% endif %}
+
+{% if page_model.pages > 1 %}
+<nav class="pagination pending-pagination" aria-label="分类论文分页">
+  {% if page_model.has_previous %}<a class="button secondary" href="{{ url_for('classification_target_page',target_type=target.target_type,target_id=target.id,view=view,date_from=filters.date_from,date_to=filters.date_to,page=page_model.page-1,page_size=filters.page_size) }}">上一页</a>{% endif %}
+  <span>第 {{ page_model.page }} / {{ page_model.pages }} 页 · {{ page_model.total }} 篇</span>
+  {% if page_model.has_next %}<a class="button secondary" href="{{ url_for('classification_target_page',target_type=target.target_type,target_id=target.id,view=view,date_from=filters.date_from,date_to=filters.date_to,page=page_model.page+1,page_size=filters.page_size) }}">下一页</a>{% endif %}
+</nav>
+{% endif %}
+{% endblock %}

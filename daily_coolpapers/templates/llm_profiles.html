@@ -2,7 +2,8 @@
 {% block title %}LLM 配置{% endblock %}
 {% block content %}
 <section>
-  <h1>LLM Profile</h1>
+  <h1>模型配置</h1>
+  <p class="muted">分类分两个阶段：初筛通常使用 Flash 等轻量模型；精筛使用 Pro 等能力更强的模型。两者可以配置为不同的默认模型。</p>
   <form method="post" action="{{ url_for('save_llm_profile') }}" class="profile-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="form-row">
@@ -57,7 +58,8 @@
       <label class="check"><input type="checkbox" name="is_default_abstract" value="1"> 默认摘要模型 <span class="field-help inline">未单独绑定模型的摘要 Prompt 会使用它。</span></label>
       <label class="check"><input type="checkbox" name="is_default_fulltext" value="1"> 默认全文模型 <span class="field-help inline">未单独绑定模型的全文 Prompt 会使用它。</span></label>
       <button type="submit">新增 Profile</button>
-      <label class="check"><input type="checkbox" name="is_default_classification" value="1"> 默认分类模型（独立于摘要模型）</label>
+      <label class="check"><input type="checkbox" name="is_default_classification" value="1"> 默认分类初筛模型 <span class="field-help inline">用于新论文快速判断；可选择 Flash 等轻量模型。</span></label>
+      <label class="check"><input type="checkbox" name="is_default_refinement" value="1"> 默认分类精筛模型 <span class="field-help inline">用于判断待精筛候选；可选择 Pro 等模型。</span></label>
       <label class="check"><input type="checkbox" name="is_default_memo" value="1"> 默认研究备忘录模型</label>
     </div>
   </form>
@@ -74,8 +76,10 @@
     <dd>模型 ID。摘要评估可用成本较低模型，全文阅读建议选择长上下文模型。</dd>
     <dt>Context Window Tokens</dt>
     <dd>只用于本地估算，防止整篇 Markdown 超过模型上下文；不会自动分块。</dd>
+    <dt>分类模型</dt>
+    <dd>初筛模型与精筛模型独立配置。未在 Prompt 中单独绑定时，分别使用默认分类初筛模型和默认分类精筛模型。</dd>
     <dt>Prompt 模型绑定</dt>
-    <dd>每个 Prompt 可单独绑定模型。绑定后优先使用绑定模型；未绑定时使用默认摘要模型或默认全文模型。</dd>
+    <dd>每个 Prompt 可单独绑定模型。绑定后优先使用绑定模型；未绑定时使用该类 Prompt 对应的默认模型。</dd>
   </dl>
 </section>
 
@@ -101,13 +105,13 @@
               <div class="muted small">v{{ prompt.version }} · {{ "启用" if prompt.enabled else "停用" }}</div>
             </td>
             <td>
-              <span class="badge">{{ "摘要评估" if prompt.type == "abstract_review" else "全文阅读" }}</span>
+              <span class="badge">{{ {'abstract_review':'摘要评估','fulltext_review':'全文阅读','direction_classification':'分类初筛','classification_refinement':'分类精筛','investment_memo':'研究备忘录','direction_exploration_extract':'新方向提取','direction_exploration_synthesis':'新方向汇总'}.get(prompt.type,prompt.type) }}</span>
             </td>
             <td>{{ "默认 Prompt" if prompt.is_default else "" }}</td>
-            <td>{{ prompt.llm_profile_name or "使用该类型默认模型" }}</td>
+            <td>{{ prompt.llm_profile_name or ('使用默认分类初筛模型' if prompt.type == 'direction_classification' else '使用默认分类精筛模型' if prompt.type == 'classification_refinement' else '使用该类型默认模型') }}</td>
             <td>
               <select name="prompt_{{ prompt.id }}_llm_profile_id">
-                <option value="">使用该类型默认模型</option>
+                <option value="">{{ '使用默认分类初筛模型' if prompt.type == 'direction_classification' else '使用默认分类精筛模型' if prompt.type == 'classification_refinement' else '使用该类型默认模型' }}</option>
                 {% for profile in profiles %}
                   <option value="{{ profile.id }}" {% if prompt.llm_profile_id == profile.id %}selected{% endif %}>
                     {{ profile.name }} · {{ profile.model }}{% if not profile.enabled %}（停用）{% endif %}
@@ -182,7 +186,8 @@
           <label class="check"><input type="checkbox" name="is_default_abstract" value="1" {% if profile.is_default_abstract %}checked{% endif %}> 默认摘要模型</label>
           <label class="check"><input type="checkbox" name="is_default_fulltext" value="1" {% if profile.is_default_fulltext %}checked{% endif %}> 默认全文模型</label>
           <button type="submit">保存</button>
-          <label class="check"><input type="checkbox" name="is_default_classification" value="1" {% if profile.is_default_classification %}checked{% endif %}> 默认分类模型</label>
+          <label class="check"><input type="checkbox" name="is_default_classification" value="1" {% if profile.is_default_classification %}checked{% endif %}> 默认分类初筛模型</label>
+          <label class="check"><input type="checkbox" name="is_default_refinement" value="1" {% if profile.is_default_refinement %}checked{% endif %}> 默认分类精筛模型</label>
           <label class="check"><input type="checkbox" name="is_default_memo" value="1" {% if profile.is_default_memo %}checked{% endif %}> 默认研究备忘录模型</label>
         </div>
       </form>

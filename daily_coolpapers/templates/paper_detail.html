@@ -157,10 +157,11 @@
       </form>
       <div class="small library-links"><a href="{{ url_for('favorites') }}">查看收藏</a><a href="{{ url_for('reviewed_papers') }}">返回全文库</a></div>
     </div>
-    {% include 'partials/paper_themes.html' %}
     {% include 'partials/paper_team.html' %}
   {% endif %}
 </section>
+
+{% include 'partials/paper_themes.html' %}
 
 <section id="evaluations">
   <h2>评估历史</h2>

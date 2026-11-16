@@ -9,6 +9,7 @@
 
 ## 产品需求与设计
 
+- [两阶段分类与方向出清](PRD_两阶段分类与方向出清.md)：方向论文列表、Flash 初筛与 Pro 精筛、投资主题自动归类，以及入选后的批量移出与恢复；实现已交付，约 40 篇人工校准待开展。
 - [基础 PRD](PRD.md)
 - [投资业务优化](PRD_投资业务优化.md)
 - [架构稳定性与性能优化](PRD_架构稳定性与性能优化.md)
@@ -18,6 +19,7 @@
 
 - [新方向探索实施与验收](EXPLORATION_RELEASE_REPORT.md)
 - [全量采集与梯次缓存实施验收](TIERED_STORAGE_RELEASE_REPORT.md)
+- [两阶段分类实施记录](CLASSIFICATION_IMPLEMENTATION_NOTES.md)
 - [梯次存储容量与清理基准](TIERED_STORAGE_BENCHMARK.json)
 
 - [架构性能基线](ARCHITECTURE_BASELINE.md)

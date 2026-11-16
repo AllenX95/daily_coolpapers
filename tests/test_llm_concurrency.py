@@ -207,12 +207,13 @@ class ProviderAdmissionIntegrationTests(unittest.TestCase):
         def handler(request):
             limiter = next(iter(llm_concurrency._registry.values()))
             prompt = json.loads(request.content)['messages'][-1]['content']
-            is_classification = 'direction_id' in prompt and 'directions' in prompt
+            is_classification = '"targets"' in prompt and '"direction_id"' in prompt
             seen.append(('classification' if is_classification else 'abstract', limiter.limit))
             if len(seen) == 1:
                 return self.response(request, 429, 'concurrent request limit exceeded')
             if is_classification:
-                result = {'directions':[{'direction_id':direction, 'decision':'matched', 'reason':'Synthetic evidence'}]}
+                result = {'targets':[{'target_type':'attention_direction', 'target_id':direction,
+                    'decision':'matched', 'reason':'Synthetic evidence'}]}
                 return httpx.Response(200, json={'choices':[{'message':{'content':json.dumps(result)}}]}, request=request)
             return self.response(request)
         plan = services.build_daily_pipeline_plan('manual_latest')

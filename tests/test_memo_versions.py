@@ -132,6 +132,7 @@ class MemoVersionWorkflowTests(unittest.TestCase):
         self.assertEqual(memo_db.list_series()[0]['source_name'],'Frozen source')
         with db.connect() as conn:
             conn.execute('DELETE FROM paper_investment_themes WHERE theme_id=?',(theme,))
+            conn.execute('DELETE FROM paper_investment_theme_results WHERE theme_id=?',(theme,))
             conn.execute('DELETE FROM investment_themes WHERE id=?',(theme,))
         self.assertIn('Frozen source',self.client.get('/investment-memos?archived=1').get_data(as_text=True))
 

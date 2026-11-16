@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='job_center.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='personal_library.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='pending_classifications.css') }}">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -19,11 +20,12 @@
       </a>
       <nav class="main-nav" aria-label="主导航">
         <a class="nav-link {% if request.endpoint == 'index' %}active{% endif %}" {% if request.endpoint == 'index' %}aria-current="page"{% endif %} href="{{ url_for('index') }}">论文</a>
+        <a class="nav-link {% if request.endpoint in ['pending_classifications', 'bulk_pending_classification_decision', 'classification_refinement_preview', 'enqueue_classification_refinement'] %}active{% endif %}" {% if request.endpoint in ['pending_classifications', 'bulk_pending_classification_decision', 'classification_refinement_preview', 'enqueue_classification_refinement'] %}aria-current="page"{% endif %} href="{{ url_for('pending_classifications') }}">待分类</a>
         <a class="nav-link {% if request.endpoint == 'favorites' %}active{% endif %}" {% if request.endpoint == 'favorites' %}aria-current="page"{% endif %} href="{{ url_for('favorites') }}">收藏</a>
         <a class="nav-link {% if request.endpoint == 'reviewed_papers' %}active{% endif %}" {% if request.endpoint == 'reviewed_papers' %}aria-current="page"{% endif %} href="{{ url_for('reviewed_papers') }}">全文库</a>
-        <a class="nav-link {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}active{% endif %}" {% if request.endpoint in ['investment_themes','investment_theme_papers'] %}aria-current="page"{% endif %} href="{{ url_for('investment_themes') }}">投资主题</a>
+        <a class="nav-link {% if request.endpoint in ['investment_themes','investment_theme_papers'] or (request.endpoint == 'classification_target_page' and request.view_args and request.view_args.get('target_type') == 'investment_theme') %}active{% endif %}" {% if request.endpoint in ['investment_themes','investment_theme_papers'] or (request.endpoint == 'classification_target_page' and request.view_args and request.view_args.get('target_type') == 'investment_theme') %}aria-current="page"{% endif %} href="{{ url_for('investment_themes') }}">投资主题</a>
         <a class="nav-link {% if request.endpoint == 'research_entities' %}active{% endif %}" {% if request.endpoint == 'research_entities' %}aria-current="page"{% endif %} href="{{ url_for('research_entities') }}">研究对象</a>
-        <a class="nav-link {% if request.endpoint == 'attention_directions' %}active{% endif %}" href="{{ url_for('attention_directions') }}">关注方向</a>
+        <a class="nav-link {% if request.endpoint == 'attention_directions' or (request.endpoint == 'classification_target_page' and request.view_args and request.view_args.get('target_type') == 'attention_direction') %}active{% endif %}" {% if request.endpoint == 'attention_directions' or (request.endpoint == 'classification_target_page' and request.view_args and request.view_args.get('target_type') == 'attention_direction') %}aria-current="page"{% endif %} href="{{ url_for('attention_directions') }}">关注方向</a>
         <a class="nav-link {% if request.endpoint and request.endpoint.startswith('exploration_') %}active{% endif %}" href="{{ url_for('exploration_list') }}">新方向探索</a>
         <a class="nav-link {% if request.endpoint and request.endpoint.startswith('memo_') %}active{% endif %}" href="{{ url_for('memo_list') }}">备忘录</a>
         <a class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}" {% if request.endpoint == 'categories' %}aria-current="page"{% endif %} href="{{ url_for('categories') }}">类目</a>

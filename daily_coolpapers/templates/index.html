@@ -55,8 +55,12 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit">抓取并摘要评估</button>
       </form>
-      <form method="post" action="{{ url_for('run_crawl_catch_up') }}">
+      <form method="post" action="{{ url_for('run_crawl_catch_up') }}" class="catch-up-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="catch-up-start-date">补抓开始日期
+          <input id="catch-up-start-date" name="start_date" type="date" aria-describedby="catch-up-date-hint">
+        </label>
+        <span id="catch-up-date-hint" class="catch-up-date-hint">留空则按缺失日期补抓</span>
         <button type="submit" class="secondary">补抓并摘要评估</button>
       </form>
       <form method="post" action="{{ url_for('run_abstract_evaluations') }}">

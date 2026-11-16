@@ -1,19 +1,35 @@
 {% extends 'base.html' %}
 {% block title %}历史补分类预览{% endblock %}
 {% block content %}
-<section class="result-panel"><span class="eyebrow">History / 显式补分类</span><h1>确认历史补分类</h1>
-  <h2>{{ preview.direction.name }} · #{{ preview.direction.id }}</h2><p class="theme-description">{{ preview.direction.scope_text }}</p>
-  <p>抓取日期：{{ preview.date_from }} 至 {{ preview.date_to }}（包含两端）。类目取该范围内的并集；不会使用已有中文摘要或全文结果做分类。</p>
+{% if preview.target is defined %}
+  {% set target = preview.target %}
+{% else %}
+  {% set target = preview.direction %}
+{% endif %}
+{% set target_id = target.target_id if target.target_id is defined else target.id %}
+{% set target_type = target.target_type if target.target_type is defined else 'attention_direction' %}
+{% set target_definition = target.definition if target.definition is defined else target.scope_text %}
+<section class="result-panel classification-backfill-preview"><span class="eyebrow">History / 按日期补分类</span><h1>确认历史补分类</h1>
+  <h2>{{ target.name }} · #{{ target_id }}</h2><p class="theme-description">{{ target_definition }}</p>
+  <p>论文抓取日期：{{ preview.date_from }} 至 {{ preview.date_to }}（包含首尾两天）。类目取该范围内的并集；不会使用已有中文摘要或全文结果判断分类。</p>
   <div class="run-scoreboard">
-    <div><span>去重论文总数</span><strong>{{ preview.counts.total }}</strong><p>可执行分类 {{ preview.counts.executable }} · 输入不完整 {{ preview.counts.input_incomplete }}</p></div>
-    <div><span>已有本方向成功分类</span><strong>{{ preview.counts.already_classified }}</strong><p>幂等跳过，不覆盖原结果</p></div>
+    <div><span>日期范围内论文</span><strong>{{ preview.counts.total }}</strong><p>可执行分类 {{ preview.counts.executable }} · 输入不完整 {{ preview.counts.input_incomplete }}</p></div>
+    <div><span>已有成功分类</span><strong>{{ preview.counts.already_classified }}</strong><p>跳过，不覆盖原判断</p></div>
     <div><span>最多新增摘要评估</span><strong>{{ preview.counts.max_additional_abstract }}</strong><p>已有成功摘要 {{ preview.counts.already_abstract }}</p></div>
   </div>
-  <p class="run-notice">这是成本上限预览，不保证匹配。每篇分类初次调用 + 最多 2 次重试；匹配或可能匹配后自动继续缺失摘要评估。分类与摘要分开计费，已有成功摘要或正在运行的评估会跳过。提交时重新计算并冻结候选。</p>
-  <form method="post" action="{{ url_for('direction_backfill',direction_id=preview.direction.id) }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="confirmed" value="1">
-    <input type="hidden" name="date_from" value="{{ preview.date_from }}"><input type="hidden" name="date_to" value="{{ preview.date_to }}">
-    <button type="submit">确认执行分类并自动补评</button><a class="button secondary" href="{{ url_for('attention_directions') }}">返回修改范围</a>
-  </form>
+  <p class="run-notice">这是调用上限预览，不代表最终会匹配。确认后按所选范围创建后台任务；分类成功后只为入选论文补齐缺失摘要评估，已有成功评估会复用。</p>
+  {% if target_type == 'investment_theme' %}
+    <form method="post" action="{{ url_for('classification_target_backfill',target_id=target_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="confirmed" value="1">
+      <input type="hidden" name="date_from" value="{{ preview.date_from }}"><input type="hidden" name="date_to" value="{{ preview.date_to }}">
+      <button type="submit">确认补分类</button><a class="button secondary" href="{{ url_for('classification_target_page',target_type=target_type,target_id=target_id,view='pending') }}">返回投资主题</a>
+    </form>
+  {% else %}
+    <form method="post" action="{{ url_for('direction_backfill',direction_id=target_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="confirmed" value="1">
+      <input type="hidden" name="date_from" value="{{ preview.date_from }}"><input type="hidden" name="date_to" value="{{ preview.date_to }}">
+      <button type="submit">确认补分类</button><a class="button secondary" href="{{ url_for('classification_target_page',target_type=target_type,target_id=target_id,view='pending') }}">返回关注方向</a>
+    </form>
+  {% endif %}
 </section>
 {% endblock %}

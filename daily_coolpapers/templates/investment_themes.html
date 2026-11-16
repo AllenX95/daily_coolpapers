@@ -3,7 +3,7 @@
 {% block content %}
 <section class="favorites-head">
   <div><span class="eyebrow">Research folders / 研究归档</span><h1>投资主题</h1>
-    <p class="muted">记录你阅读后形成的投资主题。手动归档论文，不承担阅读前的自动筛选。</p>
+    <p class="muted">主题说明会参与分类初筛；未填写说明的主题仍可手动加入论文，但不会自动分类。</p>
     {% if return_paper %}<a href="{{ url_for('paper_detail', paper_id=return_paper.id, _anchor='fulltext-result') }}">返回论文选择主题：{{ return_paper.title }}</a>{% endif %}
   </div>
   <div class="theme-totals"><strong>{{ themes|selectattr('status','equalto','active')|list|length }}</strong> 活跃主题 <span class="muted">/ {{ themes|selectattr('status','equalto','archived')|list|length }} 已归档</span></div>
@@ -23,12 +23,26 @@
   <section class="theme-catalog" aria-label="投资主题目录">
     {% for theme in themes %}
       <article class="theme-record {{ theme.status }}" id="theme-{{ theme.id }}" data-testid="theme-record">
-        <header><div><span class="decision-badge">{{ '活跃' if theme.status == 'active' else '已归档' }}</span><h2>{{ theme.name }}</h2></div>
-          <a href="{{ url_for('investment_theme_papers', theme_id=theme.id) }}">查看 {{ theme.paper_count }} 篇论文 →</a>
-        </header>
+        <header><div><span class="decision-badge">{{ '活跃' if theme.status == 'active' else '已归档' }}</span><h2>{{ theme.name }}</h2></div></header>
+        <div class="classification-counts">
+          <a href="{{ url_for('classification_target_page',target_type='investment_theme',target_id=theme.id,view='selected') }}">已入选 {{ theme.selected_count }} 篇</a>
+          <a href="{{ url_for('classification_target_page',target_type='investment_theme',target_id=theme.id,view='pending') }}">待处理 {{ theme.pending_count }} 篇</a>
+          <a href="{{ url_for('classification_target_page',target_type='investment_theme',target_id=theme.id,view='removed') }}">已移出 {{ theme.removed_count }} 篇</a>
+        </div>
         {% if theme.description %}<p class="theme-description">{{ theme.description }}</p>{% endif %}
+        {% if theme.status == 'active' and not theme.description %}<p class="small muted">添加主题说明后会参与自动分类。</p>{% endif %}
         {% if theme.status == 'archived' %}<p class="small muted">不再出现在论文选择器中，历史关系与同名占用保留。</p>{% endif %}
         <div class="theme-maintenance">
+          {% if theme.status == 'active' and theme.description %}
+          <details><summary>按日期补分类历史论文</summary>
+            <p class="small muted">选择论文抓取日期范围；运行前预览候选与逻辑模型调用数。</p>
+            <form method="post" action="{{ url_for('classification_target_backfill',target_type='investment_theme',target_id=theme.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <label>开始日期<input name="date_from" type="date" required></label><label>结束日期<input name="date_to" type="date" required></label>
+              <button type="submit">预览历史补分类</button>
+            </form>
+          </details>
+          {% endif %}
           <details><summary>编辑名称与说明</summary>
             <form method="post" action="{{ url_for('update_investment_theme', theme_id=theme.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="update">
@@ -45,7 +59,7 @@
           </form>
         </div>
       </article>
-    {% else %}<p class="empty">还没有投资主题。先创建主题，再到论文全文结果下方选择加入。</p>{% endfor %}
+    {% else %}<p class="empty">还没有投资主题。创建后可在任意论文详情中手动加入，无需先完成全文评估。</p>{% endfor %}
   </section>
 </div>
 {% endblock %}

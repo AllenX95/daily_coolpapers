@@ -53,13 +53,14 @@ class DirectionPipelineTests(unittest.TestCase):
         summary = job['progress_details']['classification']
         self.assertEqual((summary['calls'],summary['input_tokens'],summary['abstract_new']),(1,10,1))
 
-    def test_possible_enters_abstract_without_effective_category(self):
+    def test_possible_waits_for_refinement_or_manual_confirmation_without_abstract_review(self):
         key = self.direction()
-        with patch.object(services,'_fetch_category_from_config',side_effect=self.fetch), patch.object(services,'call_llm',side_effect=[self.classified((key,'possible')),self.response]):
+        with patch.object(services,'_fetch_category_from_config',side_effect=self.fetch), patch.object(services,'call_llm',return_value=self.classified((key,'possible'))) as call:
             job = self.run_pipeline()
-        self.assertEqual(job['progress_details']['abstract']['success'],1)
+        self.assertEqual(job['progress_details']['abstract']['success'],0)
         row = db.paper_direction_results([1])[1][0]
         self.assertEqual((row['pending'],row['effective']),(True,False))
+        call.assert_called_once()
 
     def test_unmatched_retains_metadata_and_never_auto_abstract(self):
         key = self.direction()
@@ -161,7 +162,7 @@ class DirectionPipelineTests(unittest.TestCase):
         self.assertEqual(db.get_job(job_id)['status'],'success')
         self.assertNotIn('Changed prompt',call.call_args_list[0].args[1])
         self.assertNotIn('Later',call.call_args_list[0].args[1])
-        self.assertEqual(json.loads(db.get_latest_evaluation(1,'direction_classification')['direction_snapshot_json']),original['directions'])
+        self.assertEqual(json.loads(db.get_latest_evaluation(1,'direction_classification')['direction_snapshot_json']),original['classification_targets'])
 
     def test_missing_input_no_model_and_counted(self):
         self.direction()

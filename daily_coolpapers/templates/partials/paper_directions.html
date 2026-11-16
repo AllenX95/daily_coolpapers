@@ -1,29 +1,73 @@
-<section class="result-panel" id="paper-directions" aria-labelledby="paper-directions-title">
-  <span class="eyebrow">Reading focus / 阅读前筛选</span><h2 id="paper-directions-title">关注方向与人工分类</h2>
-  <p class="muted">possible 只进入摘要评估，尚不属于正式分类。你的确认／否决优先于模型；投资主题仍需在全文结果下方另行归档。</p>
-  {% for direction in direction_results %}
-  <article class="theme-record" data-testid="direction-result">
-    <header><h3>{{ direction.name }} · #{{ direction.direction_id }}</h3><span class="decision-badge">{{ '已归档 · 历史记录' if direction.direction_status == 'archived' else ('有效分类' if direction.effective else ('待确认分类' if direction.pending else '非有效分类')) }}</span></header>
-    <p>模型原始判断：<strong>{{ direction.model_decision or '尚无模型判断' }}</strong></p>
-    <p class="theme-description">{{ direction.model_reason }}</p>
-    <p>人工判断：{{ {'confirmed':'已确认','rejected':'已否决'}.get(direction.manual_decision,'尚未处理') }}{% if direction.manual_updated_at %} · {{ direction.manual_updated_at }}{% endif %}</p>
-    <details><summary>定义与审计信息</summary><p class="theme-description">{{ direction.scope_text }}</p>
-      <p class="small muted">分类 evaluation #{{ direction.classification_evaluation_id or '—' }} · {{ direction.classified_at or '—' }} · {{ direction.classification_source or '仅人工分类' }}<br>Prompt #{{ direction.prompt_id or '—' }} v{{ direction.prompt_version or '—' }} · Profile #{{ direction.llm_profile_id or '—' }} · {{ direction.model or '—' }}</p>
-    </details>
-    {% if direction.direction_status == 'active' %}
-    <form method="post" action="{{ url_for('save_direction_decision',paper_id=paper.id) }}" class="inline-actions">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="direction_id" value="{{ direction.direction_id }}">
-      <button name="decision" value="confirmed" type="submit">确认属于此方向</button><button class="secondary" name="decision" value="rejected" type="submit">否决此方向／不相关</button>
-    </form>
+{% set classification_rows = paper_classifications if paper_classifications is defined else direction_results %}
+<section class="result-panel paper-classification-panel" id="paper-directions" aria-labelledby="paper-directions-title">
+  <span class="eyebrow">Reading focus / 阅读前分类</span>
+  <h2 id="paper-directions-title">关注方向</h2>
+  <p class="muted">每个方向独立记录初筛、精筛和人工判断。Pro 复核结果只作建议；确认移出后才会从已入选列表移除。</p>
+  {% for direction in classification_rows if direction.target_type == 'attention_direction' or direction.target_type is not defined %}
+    {% if direction.target_id is defined %}{% set direction_id = direction.target_id %}{% else %}{% set direction_id = direction.direction_id %}{% endif %}
+    {% if direction.manual_removed %}{% set status_label = '已移出' %}{% elif direction.effective %}{% set status_label = '已入选' %}{% elif direction.manual_decision == 'rejected' %}{% set status_label = '人工排除' %}{% elif direction.pending and direction.model_decision == 'possible' and direction.pro_decision in [none, 'failed'] and direction.pro_confidence != 'low' %}{% set status_label = '等待精筛' %}{% elif direction.pending or direction.pro_confidence == 'low' %}{% set status_label = '需人工确认' %}{% elif direction.pro_decision == 'unmatched' %}{% set status_label = '精筛已排除' %}{% else %}{% set status_label = '未入选' %}{% endif %}
+    {% set review_proposal = namespace(item=none) %}
+    {% if latest_classification_refinement_review is defined and latest_classification_refinement_review and latest_classification_refinement_review.proposed %}
+      {% for proposed in latest_classification_refinement_review.proposed if proposed.target_type == 'attention_direction' and proposed.target_id == direction_id %}{% set review_proposal.item = proposed %}{% endfor %}
     {% endif %}
-  </article>
-  {% else %}<p class="empty">暂无分类结果。新方向对历史论文不会自动重跑，可在关注方向设置中手动补分类。</p>{% endfor %}
+    <article class="theme-record paper-classification-record" data-testid="direction-result">
+      <header><div><h3>{{ direction.name }} · #{{ direction_id }}</h3><p class="small muted">{{ direction.effective_source or ('人工移出' if direction.manual_removed else '人工排除' if direction.manual_decision == 'rejected' else '需人工确认' if direction.pending or direction.pro_confidence == 'low' else 'Pro 精筛排除' if direction.pro_decision == 'unmatched' else '尚未入选') }}</p></div><span class="decision-badge {{ 'favorite' if direction.effective else 'skipped' if direction.manual_removed or (direction.pro_decision == 'unmatched' and direction.pro_confidence != 'low') or direction.manual_decision == 'rejected' else '' }}">{{ status_label }}</span></header>
+      <p>初筛：<strong>{{ {'matched':'明确匹配','possible':'有具体关联，仍需判断','unmatched':'未匹配','failed':'初筛失败'}.get(direction.model_decision,direction.model_decision or '尚无结果') }}</strong></p>
+      {% if direction.model_reason %}<p class="theme-description">{{ direction.model_reason }}</p>{% endif %}
+      {% if direction.pro_decision %}<p>精筛：<strong>{% if direction.pro_confidence == 'low' %}{{ {'matched':'入选判断','possible':'待确认判断','unmatched':'排除判断','failed':'失败'}.get(direction.pro_decision,direction.pro_decision) }}（低把握，需人工确认）{% else %}{{ {'matched':'入选','possible':'仍待确认','unmatched':'排除','failed':'失败'}.get(direction.pro_decision,direction.pro_decision) }}{% endif %}</strong>{% if direction.pro_confidence and direction.pro_confidence != 'low' %} · 把握{{ {'medium':'中','high':'高','low':'低'}.get(direction.pro_confidence,direction.pro_confidence) }}{% endif %}</p>{% endif %}
+      {% if direction.pro_reason %}<p class="theme-description">{{ direction.pro_reason }}</p>{% endif %}
+      {% if direction.pro_uncertainty %}<p><strong>待核对问题：</strong>{{ direction.pro_uncertainty }}</p>{% endif %}
+      {% if direction.manual_decision %}<p>人工处理：{{ {'confirmed':'已确认加入','rejected':'已排除'}.get(direction.manual_decision,direction.manual_decision) }}{% if direction.manual_updated_at %} · {{ direction.manual_updated_at }}{% endif %}</p>{% endif %}
+      {% if direction.manual_removed or direction.removal_reason or direction.removal_note or direction.removed_at %}<p><strong>{{ '移出理由：' if direction.manual_removed else '最近移出记录：' }}</strong>{{ {'scope_mismatch':'范围不符','weak_relevance':'仅弱相关','incorrect':'判断错误','other':'其他'}.get(direction.removal_reason,direction.removal_reason or '未填写') }}{% if direction.removal_note %} · {{ direction.removal_note }}{% endif %}{% if direction.removed_at %} · {{ direction.removed_at }}{% endif %}</p>{% endif %}
+      {% if review_proposal.item %}
+        <div class="classification-review-suggestion" role="status"><strong>最近一次 Pro 复核建议：{{ {'matched':'建议保留','unmatched':'建议移出','possible':'仍需人工确认'}.get(review_proposal.item.decision,review_proposal.item.decision) }}</strong>{% if review_proposal.item.confidence %} · 把握{{ {'medium':'中','high':'高','low':'低'}.get(review_proposal.item.confidence,review_proposal.item.confidence) }}{% endif %}{% if review_proposal.item.reason %}<p>{{ review_proposal.item.reason }}</p>{% endif %}</div>
+      {% elif latest_classification_refinement_review is defined and latest_classification_refinement_review and latest_classification_refinement_review.status == 'failed' and direction.effective %}
+        <p class="small danger">最近一次 Pro 复核失败；现有入选状态保留。</p>
+      {% endif %}
+      {% if direction.definition or direction.scope_text %}<details><summary>查看方向定义与记录</summary><p class="theme-description">{{ direction.definition or direction.scope_text }}</p>
+        {% if direction.classification_evaluation_id or direction.classified_at or direction.classification_source %}<p class="small muted">初筛记录 #{{ direction.classification_evaluation_id or '—' }} · {{ direction.classified_at or '—' }} · {{ direction.classification_source or '仅人工分类' }}<br>Prompt #{{ direction.prompt_id or '—' }} v{{ direction.prompt_version or '—' }} · Profile #{{ direction.llm_profile_id or '—' }} · {{ direction.model or '—' }}</p>{% endif %}
+      </details>{% endif %}
+      {% if direction.target_status != 'archived' and direction.direction_status != 'archived' %}
+        {% if direction.effective %}
+          <div class="classification-detail-actions">
+            <form method="post" action="{{ url_for('classification_refinement_review',paper_id=paper.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="target_type" value="attention_direction"><input type="hidden" name="target_id" value="{{ direction_id }}">
+              <button type="submit" class="secondary">Pro 复核此方向</button>
+            </form>
+            <form method="post" action="{{ url_for('remove_classification_targets',target_type='attention_direction',target_id=direction_id) }}" class="classification-remove-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="paper_id" value="{{ paper.id }}">
+              <label>移出理由<select name="reason"><option value="scope_mismatch">范围不符</option><option value="weak_relevance">仅弱相关</option><option value="incorrect">判断错误</option><option value="other">其他</option></select></label>
+              <label>备注<input name="note" maxlength="300" placeholder="可选"></label>
+              <button type="submit" class="secondary">确认移出</button>
+            </form>
+          </div>
+          {% if direction.pending and direction.pro_confidence == 'low' %}
+            <form method="post" action="{{ url_for('save_classification_decision',paper_id=paper.id) }}" class="inline-actions">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="target_type" value="attention_direction"><input type="hidden" name="target_id" value="{{ direction_id }}">
+              <button name="decision" value="confirmed" type="submit">人工确认保留</button><button class="secondary" name="decision" value="rejected" type="submit">人工排除</button>
+            </form>
+            <p class="small muted">精筛把握较低，请确认是否保留。</p>
+          {% else %}<p class="small muted">Pro 复核的排除建议不会自动改变归类；由你确认后移出。</p>{% endif %}
+        {% elif direction.manual_removed or direction.manual_decision == 'rejected' or (direction.pro_decision == 'unmatched' and direction.pro_confidence != 'low') %}
+          <form method="post" action="{{ url_for('restore_classification_target',target_type='attention_direction',target_id=direction_id,paper_id=paper.id) }}" class="inline-actions">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">恢复入选</button>
+          </form>
+          {% if direction.manual_removed %}<p class="small muted">恢复会撤销这次人工移出，并保留原始模型结果。</p>{% elif direction.pro_decision == 'unmatched' %}<p class="small muted">恢复后将记录为人工确认，原始精筛结果保留。</p>{% endif %}
+        {% else %}
+          <form method="post" action="{{ url_for('save_classification_decision',paper_id=paper.id) }}" class="inline-actions">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="target_type" value="attention_direction"><input type="hidden" name="target_id" value="{{ direction_id }}">
+            <button name="decision" value="confirmed" type="submit">人工确认加入</button><button class="secondary" name="decision" value="rejected" type="submit">人工排除</button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </article>
+  {% else %}<p class="empty">这篇论文暂无关注方向分类。历史论文不会自动重跑，可在 <a href="{{ url_for('attention_directions') }}">关注方向目录</a>中按日期补分类。</p>{% endfor %}
   {% if attention_directions %}
-  <form method="post" action="{{ url_for('save_direction_decision',paper_id=paper.id) }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="decision" value="confirmed">
-    <label>手动选择其他关注方向（可逐个确认多个方向）<select name="direction_id" required><option value="">请选择</option>{% for direction in attention_directions %}<option value="{{ direction.id }}">{{ direction.name }}</option>{% endfor %}</select></label>
-    <button type="submit">确认加入关注方向</button>
+  <form method="post" action="{{ url_for('save_classification_decision',paper_id=paper.id) }}" class="inline-actions paper-manual-add">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="decision" value="confirmed"><input type="hidden" name="target_type" value="attention_direction">
+    <label>手动加入其他关注方向<select name="target_id" required><option value="">选择方向</option>{% for direction in attention_directions %}<option value="{{ direction.id }}">{{ direction.name }}</option>{% endfor %}</select></label>
+    <button type="submit">确认加入方向</button>
   </form>
   {% endif %}
-  <p class="small muted">未匹配或分类失败也可使用上方“手动摘要评估”，不会覆盖分类结果。<a href="{{ url_for('attention_directions') }}">管理关注方向 →</a></p>
+  <p class="small muted">无论分类状态如何，都可以手动运行摘要或全文评估。<a href="{{ url_for('attention_directions') }}">管理关注方向 →</a></p>
 </section>

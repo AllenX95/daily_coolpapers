@@ -31,6 +31,10 @@ git diff --check
 
 最终全量回归执行 528 项，527 通过、1 跳过，耗时 98.035 秒。跳过的是 S6 的 S4 兼容回退演练，环境缺少与基线匹配的 `db_before.py`，可通过 `S6_S4_DB_PATH` 指定该夹具。本轮热度与候选模拟旧格式迁移已单独通过。工作树的 `git diff --check` 通过。
 
+### 合并两阶段分类后的复验
+
+将探索修复与 `origin/main` 的两阶段分类（`9e73fe7`）合并后，复验 `test_exploration_respects_refinement_and_manual_removal` 通过。用例覆盖精筛确认、排除、低置信度、人工移出与精筛失败后沿用初筛匹配的选样资格。全量 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v` 执行 540 项，539 通过、1 跳过，耗时 92.736 秒。S6 跳过原因仍是缺少匹配 S4 的回退夹具。
+
 ## 部署备份和回退
 
 1. 正式发布前停止应用及调度，确认工作进程退出。使用 SQLite Backup API 为主库和 Profile 库各生成一份一致备份，并备份当前 Flask 密钥和本地配置。对备份执行 `PRAGMA integrity_check`、`PRAGMA foreign_key_check`，记录配套代码版本。

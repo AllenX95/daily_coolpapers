@@ -357,6 +357,33 @@ class ExplorationTests(unittest.TestCase):
                 self.assertEqual((sampled[pid]['state'],sampled[pid]['classification_complete']),(state,complete))
                 self.assertEqual(sampled[pid]['sample_group'],'heat' if state=='unmatched' else 'edge')
 
+    def test_exploration_respects_refinement_and_manual_removal(self):
+        first=db.create_attention_direction('First','scope')
+        second=db.create_attention_direction('Second','scope')
+        refined, excluded, low_confidence, removed, fallback = self.papers(5)
+        now = db.now_iso()
+        with db.connect() as conn:
+            conn.executemany('''INSERT INTO paper_direction_results(
+                paper_id,direction_id,model_decision,pro_decision,pro_confidence,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?)''', [
+                (refined,first,'possible','matched','high',now,now),
+                (excluded,first,'matched','unmatched','high',now,now),
+                (excluded,second,'unmatched',None,None,now,now),
+                (low_confidence,first,'matched','matched','low',now,now),
+                (low_confidence,second,'unmatched',None,None,now,now),
+                (removed,first,'matched',None,None,now,now),
+                (fallback,first,'matched','failed',None,now,now),
+            ])
+        db.remove_classification_targets([(removed,'attention_direction',first)])
+
+        plan = explore.build_plan(NOW)
+        self.assertEqual(plan['counts']['classification_pending'],1)
+        self.assertEqual(plan['counts']['classification_incomplete'],3)
+        self.assertEqual({p['id']:(p['state'],p['sample_group'],p['classification_complete']) for p in plan['papers']},{
+            refined:('matched','edge',False), excluded:('unmatched','heat',True),
+            low_confidence:('possible','edge',True), fallback:('matched','edge',False),
+        })
+
     def test_heat_counts_zero_failed_and_recapture(self):
         for value, expected in [('PDF 0',0),('NoPDF 0',None),('PDF ',None),('PDF -1',None),
                                 ('PDF loading',None),('PDF 1.2',None),('PDF 10',10)]:
