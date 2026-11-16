@@ -33,6 +33,7 @@ JOB_STATUSES = frozenset(
 JOB_ACTIVE_STATUSES = frozenset({"pending", "running"})
 JOB_TERMINAL_STATUSES = JOB_STATUSES - JOB_ACTIVE_STATUSES
 JOB_EVENT_LEVELS = frozenset({"info", "warning", "error"})
+PAPER_LEGACY_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
 PAPER_DECISIONS = frozenset({'favorite', 'skipped', 'clear'})
 PAPER_DECISION_FILTERS = frozenset({'all', 'undecided', 'favorite', 'skipped'})
 JOB_STATUS_TRANSITIONS = {
@@ -104,6 +105,35 @@ def today_iso() -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def paper_created_timestamp(value: str) -> float | None:
+    """Interpret the application's historic local timestamps as Beijing time."""
+    if not isinstance(value, str) or len(value) < 16:
+        return None
+    try:
+        point = datetime.fromisoformat(value)
+        return (point if point.tzinfo else point.replace(tzinfo=PAPER_LEGACY_TIMEZONE)).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+PAPER_CATEGORIES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS {table} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+        category TEXT NOT NULL,
+        crawl_date TEXT NOT NULL,
+        rank INTEGER,
+        reading_stars INTEGER,
+        pdf_clicks INTEGER,
+        kimi_clicks INTEGER,
+        created_at TEXT NOT NULL,
+        heat_captured_at TEXT,
+        legacy_heat_json TEXT,
+        UNIQUE(paper_id, category, crawl_date)
+    )
+"""
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -316,19 +346,6 @@ def _init_db_once() -> None:
                 updated_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS paper_categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-                category TEXT NOT NULL,
-                crawl_date TEXT NOT NULL,
-                rank INTEGER,
-                reading_stars INTEGER NOT NULL DEFAULT 0,
-                pdf_clicks INTEGER NOT NULL DEFAULT 0,
-                kimi_clicks INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(paper_id, category, crawl_date)
-            );
-
             CREATE TABLE IF NOT EXISTS paper_dispositions (
                 paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
                 decision TEXT NOT NULL CHECK(decision IN ('favorite', 'skipped')),
@@ -477,6 +494,7 @@ def _init_db_once() -> None:
             );
             """
         )
+        conn.execute(PAPER_CATEGORIES_SCHEMA.format(table="paper_categories"))
         ensure_schema_migrations(conn)
         ensure_indexes(conn)
         seed_defaults(conn)
@@ -634,8 +652,32 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     if 'collection_mode' not in category_columns:
         conn.execute("ALTER TABLE categories ADD COLUMN collection_mode TEXT NOT NULL DEFAULT 'top_n' CHECK(collection_mode IN ('top_n','full'))")
     cache_db.init_schema(conn)
+    _migrate_paper_heat(conn)
     from .exploration_db import init_schema as init_exploration_schema
     init_exploration_schema(conn)
+
+
+def _migrate_paper_heat(conn: sqlite3.Connection) -> None:
+    with_savepoint = "paper_heat_observations_v1"
+    conn.execute(f"SAVEPOINT {with_savepoint}")
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(paper_categories)")}
+        if "heat_captured_at" not in columns:
+            conn.execute(PAPER_CATEGORIES_SCHEMA.format(table="paper_categories_next"))
+            # Preserve the raw legacy counts separately because they lack observation provenance.
+            conn.execute("""INSERT INTO paper_categories_next(id,paper_id,category,crawl_date,rank,created_at,legacy_heat_json)
+                SELECT id,paper_id,category,crawl_date,rank,created_at,
+                    json_object('reading_stars',reading_stars,'pdf_clicks',pdf_clicks,'kimi_clicks',kimi_clicks)
+                FROM paper_categories""")
+            conn.execute("DROP TABLE paper_categories")
+            conn.execute("ALTER TABLE paper_categories_next RENAME TO paper_categories")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                     (with_savepoint, now_iso()))
+        conn.execute(f"RELEASE SAVEPOINT {with_savepoint}")
+    except BaseException:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {with_savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {with_savepoint}")
+        raise
 
 
 FULLTEXT_EVALUATION_PROJECTION_MIGRATION = "fulltext_evaluation_projection_v1"
@@ -1141,6 +1183,7 @@ def upsert_papers_with_stats(
     if not paper_items:
         return PaperUpsertResult([], 0, 0, 0, 0, 0, 0, 0, 0)
     now = now_iso()
+    observed_now = utc_now_iso()
     # Serialize every item before opening a transaction so invalid input cannot
     # leave a partially written batch. The last occurrence remains canonical.
     serialized_by_arxiv: dict[str, tuple[Any, ...]] = {}
@@ -1149,7 +1192,7 @@ def upsert_papers_with_stats(
     for paper in paper_items:
         arxiv_id = str(paper["arxiv_id"])
         input_arxiv_ids.append(arxiv_id)
-        serialized_by_arxiv[arxiv_id] = _paper_upsert_values(paper, now)
+        serialized_by_arxiv[arxiv_id] = _paper_upsert_values(paper, now, observed_now)
         paper_by_arxiv[arxiv_id] = paper
     arxiv_ids = list(paper_by_arxiv)
     with connect() as conn:
@@ -1231,14 +1274,17 @@ def upsert_papers_with_stats(
             """
             INSERT INTO paper_categories(
                 paper_id, category, crawl_date, rank, reading_stars,
-                pdf_clicks, kimi_clicks, created_at
+                pdf_clicks, kimi_clicks, created_at, heat_captured_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(paper_id, category, crawl_date) DO UPDATE SET
                 rank = excluded.rank,
                 reading_stars = excluded.reading_stars,
                 pdf_clicks = excluded.pdf_clicks,
-                kimi_clicks = excluded.kimi_clicks
+                kimi_clicks = excluded.kimi_clicks,
+                heat_captured_at = excluded.heat_captured_at
+            WHERE paper_categories.heat_captured_at IS NULL
+                OR excluded.heat_captured_at >= paper_categories.heat_captured_at
             """,
             [
                 (
@@ -1246,10 +1292,9 @@ def upsert_papers_with_stats(
                     category,
                     crawl_date,
                     paper.get("rank"),
-                    int(paper.get("reading_stars") or 0),
-                    int(paper.get("pdf_clicks") or 0),
-                    int(paper.get("kimi_clicks") or 0),
+                    *_paper_heat_counts(paper),
                     now,
+                    paper.get("heat_captured_at") or observed_now,
                 )
                 for arxiv_id in arxiv_ids
                 for paper_id, paper in [(ids_by_arxiv[arxiv_id], paper_by_arxiv[arxiv_id])]
@@ -1279,7 +1324,17 @@ def upsert_papers_with_stats(
     )
 
 
-def _paper_upsert_values(paper: dict[str, Any], now: str) -> tuple[Any, ...]:
+def _paper_heat_counts(paper: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    def count(value):
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 19:
+            value = int(value)
+        return value if type(value) is int and 0 <= value <= (2**63-1)//2 else None
+
+    pdf, kimi = count(paper.get("pdf_clicks")), count(paper.get("kimi_clicks"))
+    return (pdf + kimi if pdf is not None and kimi is not None else None, pdf, kimi)
+
+
+def _paper_upsert_values(paper: dict[str, Any], now: str, created_at: str) -> tuple[Any, ...]:
     return (
         paper["arxiv_id"],
         paper["title"],
@@ -1290,7 +1345,7 @@ def _paper_upsert_values(paper: dict[str, Any], now: str) -> tuple[Any, ...]:
         paper.get("pdf_url"),
         paper.get("abs_url"),
         paper.get("papers_cool_url"),
-        now,
+        created_at,
         now,
     )
 
@@ -1736,9 +1791,9 @@ def _category_memberships(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "category": row.get("category") or "",
                 "crawl_date": row.get("crawl_date") or "",
                 "rank": row.get("rank"),
-                "reading_stars": int(row.get("reading_stars") or 0),
-                "pdf_clicks": int(row.get("pdf_clicks") or 0),
-                "kimi_clicks": int(row.get("kimi_clicks") or 0),
+                "reading_stars": row.get("reading_stars"),
+                "pdf_clicks": row.get("pdf_clicks"),
+                "kimi_clicks": row.get("kimi_clicks"),
             }
         )
     return memberships
@@ -2925,8 +2980,22 @@ def paper_direction_results(paper_ids: Iterable[int]) -> dict[int, list[dict]]:
                 item['effective_source'] = ('人工确认' if item['manual_decision'] == 'confirmed' else
                                             'Pro 精筛' if item.get('pro_decision') == 'matched' else
                                             'Flash 初筛' if item['effective'] else '')
+                item['determined'] = (item['effective'] or item['pending'] or bool(item['manual_decision'])
+                    or bool(item.get('manual_removed')) or item.get('pro_decision') == 'unmatched'
+                    or item['model_decision'] == 'unmatched')
                 results.setdefault(item['paper_id'], []).append(item)
     return results
+
+
+def aggregate_paper_direction_results(results, active_ids):
+    """Return the research decision and whether every enabled direction has a result."""
+    active_results = [result for result in results if result['direction_id'] in active_ids]
+    complete = active_ids <= {result['direction_id'] for result in active_results if result['determined']}
+    if any(result['effective'] for result in active_results):
+        return 'matched', complete
+    if not complete:
+        return 'pending', False
+    return ('possible' if any(result['pending'] for result in active_results) else 'unmatched'), True
 
 
 def classification_targets(active_only: bool = True) -> list[dict[str, Any]]:

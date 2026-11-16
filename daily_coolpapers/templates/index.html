@@ -150,13 +150,13 @@
                   {% if use_date_range %}<span class="category-chip-date">{{ item.crawl_date }}</span>{% endif %}
                   <span>{{ item.category }}</span>
                   {% if item.rank %}<span class="muted">#{{ item.rank }}</span>{% endif %}
-                  <span class="muted">S{{ item.reading_stars }}</span>
+                  <span class="muted">S{{ item.reading_stars if item.reading_stars is not none else '未知' }}</span>
                 </span>
               {% endfor %}
             </div>
           </td>
           <td class="rank-cell">{{ paper.rank }}</td>
-          <td class="stars-cell">{{ paper.reading_stars }} <span class="muted">P{{ paper.pdf_clicks }}/K{{ paper.kimi_clicks }}</span></td>
+          <td class="stars-cell">{{ paper.reading_stars if paper.reading_stars is not none else '未知' }} <span class="muted">P{{ paper.pdf_clicks if paper.pdf_clicks is not none else '未知' }}/K{{ paper.kimi_clicks if paper.kimi_clicks is not none else '未知' }}</span></td>
           <td class="paper-main">
             <a class="paper-title" href="{{ url_for('paper_detail', paper_id=paper.id) }}">{{ paper.title }}</a>
             <div class="muted small">{{ paper.authors_list|join(", ")|truncate_text(160) }}</div>

@@ -2,6 +2,31 @@
 import json
 from . import db
 from .form_commands import FormValidationError, research_text
+from .llm import LLMResultError
+
+
+MODEL_FIELDS = (
+    'name','scope_text','signal_type','paper_ids','why_now','difference_from_existing','evidence_gaps',
+    'prior_candidate_ref','relation_to_prior','new_evidence','new_paper_ids','evidence_snapshot',
+)
+
+
+def model_candidate(candidate):
+    return {key:candidate[key] for key in MODEL_FIELDS if key in candidate}
+
+
+def _fingerprint(candidate):
+    content = model_candidate(candidate)
+    for field in ('paper_ids','new_paper_ids'):
+        if field in content:
+            content[field] = sorted(content[field])
+    if 'evidence_snapshot' in content:
+        content['evidence_snapshot'] = sorted(content['evidence_snapshot'],key=lambda paper:paper['id'])
+    return json.dumps(content,ensure_ascii=False,sort_keys=True)
+
+
+def published_candidates(run):
+    return [{**candidate,'ref':f"{run['id']}:{candidate['id']}"} for candidate in run['candidates']]
 
 
 def init_schema(conn):
@@ -68,13 +93,16 @@ def prior_candidates():
     return [{**json.loads(r['candidate']), 'ref': f"{r['run_id']}:{json.loads(r['candidate'])['id']}"} for r in rows]
 
 
-def create(plan):
+def create(plan, *, require_sample=False):
     key = f"{plan['date_from']}:{plan['date_to']}"
     with db.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         existing = conn.execute('SELECT id,job_id FROM direction_exploration_runs WHERE window_key=?', (key,)).fetchone()
         if existing:
             return existing['id'], existing['job_id'], False
+        error = plan.get('capacity_error') or (plan.get('config_error') if plan['papers'] else None)
+        if error or (require_sample and not plan['papers']):
+            raise FormValidationError({'plan':error or '此时间窗没有符合条件且未探索的论文'})
         return _insert(conn, plan, key)
 
 
@@ -93,7 +121,8 @@ def _insert(conn, plan, key, retry_of=None, execution=None):
     return run_id, job_id, True
 
 
-def retry(run_id, *, synthesis_only=False, acknowledged=False):
+def retry(run_id, *, synthesis_only=False, acknowledged=False, profile_id=None):
+    from .exploration import original_retry_error, synthesis_retry_plan
     with db.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         run = decode(conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(run_id,)).fetchone())
@@ -108,17 +137,23 @@ def retry(run_id, *, synthesis_only=False, acknowledged=False):
         if unknown and not acknowledged:
             raise FormValidationError({'run':'存在结果未知的外部请求；请确认可能产生额外费用后重试'})
         if synthesis_only:
-            if not execution.get('batches') or not any(b.get('status') == 'success' for b in execution['batches'].values()):
-                raise FormValidationError({'run':'没有可复用的成功提取结果'})
+            if run['plan'].get('synthesis_only'):
+                raise FormValidationError({'run':'请在本次汇总重试中恢复剩余请求预算'})
             if execution.get('synthesis',{}).get('status') == 'success':
                 raise FormValidationError({'run':'汇总已成功，请使用失败批次恢复入口'})
             key = f"synthesis:{run_id}"
             child = conn.execute('SELECT id,job_id FROM direction_exploration_runs WHERE window_key=?',(key,)).fetchone()
             if child:
                 return child['id'],child['job_id'],False
-            plan = {**run['plan'], 'request_limit':2, 'synthesis_only':True}
+            try:
+                plan = synthesis_retry_plan(run,profile_id)
+            except ValueError as exc:
+                raise FormValidationError({'profile':str(exc)}) from None
             reused = {'batches':execution['batches'], 'consumed':execution.get('consumed',[])}
             return _insert(conn,plan,key,run_id,reused)
+        error = original_retry_error(run)
+        if error:
+            raise FormValidationError({'profile':error})
         if execution.get('requests',0) >= run['plan']['request_limit']:
             raise FormValidationError({'run':'本次探索预算已耗尽，可显式重试汇总（最多新增两次请求）'})
         # A stage's consumed physical budget never resets on process or job retry.
@@ -132,35 +167,87 @@ def retry(run_id, *, synthesis_only=False, acknowledged=False):
 def save_execution(run_id, execution, status=None, candidates=None):
     with db.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
+        current = decode(conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(run_id,)).fetchone())
+        execution = dict(execution)
+        for key in ('candidate_history','candidate_versions','previous_candidates','review_minutes'):
+            if key in current['execution']:
+                execution[key] = current['execution'][key]
         fields = ['execution_json=?','updated_at=?']
-        args = [json.dumps(execution,ensure_ascii=False),db.now_iso()]
+        now = db.now_iso()
+        args = [None,now]
         if status:
             fields.append('status=?');args.append(status)
         if candidates is not None:
-            current = decode(conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(run_id,)).fetchone())
-            old_by_name = {db.normalized_research_name(c['name']):c for c in current['candidates']}
-            # Preserve human decisions for the same candidate after recovering a partial report.
-            for c in candidates:
-                old = old_by_name.get(db.normalized_research_name(c['name']))
-                if old:
-                    for key in ('status','reason','decisions','direction_id'):
-                        if key in old:c[key]=old[key]
-                ref = c.get('prior_candidate_ref')
-                if ref and c.get('relation_to_prior')=='observing_update':
-                    previous_id,previous_cid=map(int,ref.split(':'))
-                    previous=decode(conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(previous_id,)).fetchone())
-                    previous_c=next((item for item in previous['candidates'] if item['id']==previous_cid),None)
-                    if previous_c and previous_c['status']=='observing' and not previous_c.get('superseded_by'):
-                        c.update(status='observing',reason=previous_c.get('reason',''),decisions=previous_c.get('decisions',[]))
-                        previous_c['superseded_by']=f"{run_id}:{c['id']}"
-                        conn.execute('UPDATE direction_exploration_runs SET candidates_json=?,version=version+1 WHERE id=?',
-                            (json.dumps(previous['candidates'],ensure_ascii=False),previous_id))
-            if current['candidates'] and current['candidates']!=candidates:
-                execution.setdefault('previous_candidates',[]).append(current['candidates'])
-                args[0]=json.dumps(execution,ensure_ascii=False)
-            fields.extend(['candidates_json=?','version=version+1'])
-            args.append(json.dumps(candidates,ensure_ascii=False))
+            candidates = _save_candidates(conn,current,execution,candidates,now)
+            if candidates != current['candidates']:
+                fields.extend(['candidates_json=?','version=version+1'])
+                args.append(json.dumps(candidates,ensure_ascii=False))
+        args[0] = json.dumps(execution,ensure_ascii=False)
         conn.execute(f"UPDATE direction_exploration_runs SET {','.join(fields)} WHERE id=?",[*args,run_id])
+
+
+def _save_candidates(conn, run, execution, candidates, now):
+    if len(candidates) > 3:
+        raise LLMResultError('exploration_schema_invalid','当前候选最多三个')
+    old = {f"{run['id']}:{c['id']}":c for c in run['candidates']}
+    explicit = [c.get('continuation_ref') for c in candidates if c.get('continuation_ref') is not None]
+    if any(not isinstance(ref,str) or ref not in old for ref in explicit) or len(set(explicit)) != len(explicit):
+        raise LLMResultError('exploration_evidence_invalid','周报延续候选引用无效或重复')
+    remaining = dict(old)
+    archived = execution.get('candidate_history',[])
+    legacy_ids = [c['id'] for batch in execution.get('previous_candidates',[]) for c in batch]
+    next_id = max([0,*legacy_ids,*(c['id'] for c in [*archived,*old.values()])])+1
+    output = []
+    seen_contents = set()
+    for candidate in candidates:
+        value = model_candidate(candidate)
+        ref = candidate.get('continuation_ref')
+        fingerprint = _fingerprint(value)
+        if ref is None and fingerprint in seen_contents:
+            continue
+        seen_contents.add(fingerprint)
+        if ref is None:
+            matches = [key for key,item in remaining.items()
+                       if key not in explicit and _fingerprint(item) == fingerprint]
+            ref = matches[0] if len(matches) == 1 else None
+        if ref is not None:
+            previous = remaining.pop(ref)
+            if _fingerprint(previous) == fingerprint:
+                output.append(previous)
+                continue
+            execution.setdefault('candidate_versions',{}).setdefault(str(previous['id']),[]).append({
+                'saved_at':previous.get('content_saved_at',run['created_at']), **model_candidate(previous)})
+            output.append({**previous,**value,'content_saved_at':now})
+            continue
+        value.update(id=next_id,status='pending',reason='',decisions=[],updated_at=now,content_saved_at=now)
+        next_id += 1
+        _advance_prior_observation(conn,run['id'],value)
+        output.append(value)
+    if remaining:
+        execution['candidate_history'] = [*archived,*({**c,'retired_at':now} for c in remaining.values())]
+    return output
+
+
+def _advance_prior_observation(conn, run_id, candidate):
+    ref = candidate.get('prior_candidate_ref')
+    if not ref or candidate.get('relation_to_prior') != 'observing_update':
+        return
+    try:
+        previous_id, cid = map(int,ref.split(':'))
+    except (AttributeError, ValueError):
+        raise LLMResultError('exploration_evidence_invalid','历史观察引用无效') from None
+    if not 0 < previous_id <= 2**63-1 or previous_id == run_id:
+        raise LLMResultError('exploration_evidence_invalid','历史观察引用无效')
+    row = conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(previous_id,)).fetchone()
+    if not row:
+        raise LLMResultError('exploration_evidence_invalid','历史观察引用无效')
+    previous = decode(row)
+    item = next((c for c in previous['candidates'] if c['id']==cid),None)
+    if item and item['status']=='observing' and not item.get('superseded_by'):
+        candidate.update(status='observing',reason=item.get('reason',''),decisions=item.get('decisions',[]))
+        item['superseded_by'] = f"{run_id}:{candidate['id']}"
+        conn.execute('UPDATE direction_exploration_runs SET candidates_json=?,version=version+1 WHERE id=?',
+                     (json.dumps(previous['candidates'],ensure_ascii=False),previous_id))
 
 
 def reserve_request(run_id, stage):
@@ -180,7 +267,7 @@ def reserve_request(run_id, stage):
 
 def candidate(run_id, candidate_id):
     run = get(run_id)
-    item = next((c for c in run['candidates'] if c['id']==candidate_id),None)
+    item = next((c for c in [*run['candidates'],*run['execution'].get('candidate_history',[])] if c['id']==candidate_id),None)
     if item is None:
         raise db.DirectionNotFoundError('候选方向不存在')
     return run, item
@@ -193,15 +280,20 @@ def decide(run_id, candidate_id, status, reason, version, *, name=None, scope_te
     with db.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         run = decode(conn.execute('SELECT * FROM direction_exploration_runs WHERE id=?',(run_id,)).fetchone())
+        if run['version'] != version:
+            c = next((c for c in run['candidates'] if c['id']==candidate_id),None)
+            if status=='added' and c and c['status']=='added':
+                return c.get('direction_id')
+            raise FormValidationError({'version':'此周报已更新，请刷新后再处理'})
         c = next((c for c in run['candidates'] if c['id']==candidate_id),None)
         if c is None:
+            if any(c['id']==candidate_id for c in run['execution'].get('candidate_history',[])):
+                raise FormValidationError({'candidate':'此候选已转为历史，请刷新周报'})
             raise db.DirectionNotFoundError('候选方向不存在')
         if c.get('superseded_by'):
             raise FormValidationError({'candidate':'此观察候选已更新，请打开后续周报处理'})
         if c['status']=='added':
             return c.get('direction_id')  # Duplicate submit cannot create another direction.
-        if run['version'] != version:
-            raise FormValidationError({'version':'此周报已更新，请刷新后再处理'})
         direction_id = None
         if status=='added':
             name = research_text(name,'name',required=True)

@@ -572,7 +572,8 @@ def _fulltext_reviewed_evaluation(row: dict[str, Any]) -> dict[str, Any]:
 def _favorite_category_view(category: dict[str, Any]) -> dict[str, str]:
     name = str(category.get("category") or "")
     rank = str(category.get("rank") or "-")
-    stars = str(category.get("reading_stars") or 0)
+    value = category.get("reading_stars")
+    stars = str(value) if value is not None else "未知"
     return {
         "category": name,
         "rank": rank,

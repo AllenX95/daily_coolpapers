@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -21,6 +22,29 @@ from .security import secret_store
 logger = logging.getLogger(__name__)
 
 _request_reservation = contextvars.ContextVar('llm_request_reservation', default=None)
+_DEEPSEEK_MODELS = {'deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'}
+_MIMO_MODELS = {'mimo-v2.6-flash', 'mimo-v2.6-pro', 'mimo-v2.6-pro-ultraspeed'}
+_MIMO_API_HOSTS = {
+    'api.xiaomimimo.com',
+    'token-plan-cn.xiaomimimo.com',
+    'token-plan-sgp.xiaomimimo.com',
+    'token-plan-ams.xiaomimimo.com',
+}
+
+
+def _official_mimo(profile: dict[str, Any]) -> bool:
+    return (urlsplit(profile.get('base_url') or '').hostname in _MIMO_API_HOSTS
+            and profile.get('model') in _MIMO_MODELS)
+
+
+def official_model_token_limits(profile: dict[str, Any]) -> tuple[int, int] | None:
+    """Return documented total context and maximum completion for official endpoints."""
+    if (urlsplit(profile.get('base_url') or '').hostname == 'api.deepseek.com'
+            and profile.get('model') in _DEEPSEEK_MODELS):
+        return 1_048_576, 393_216
+    if _official_mimo(profile):
+        return 1_048_576, 131_072
+    return None
 
 
 @contextmanager
@@ -216,6 +240,7 @@ def _call_openai_compatible(
         "Content-Type": "application/json",
     }
     headers.update(_headers(profile))
+    output_parameter = 'max_completion_tokens' if _official_mimo(profile) else 'max_tokens'
     payload = {
         "model": profile["model"],
         "messages": [
@@ -226,7 +251,7 @@ def _call_openai_compatible(
             {"role": "user", "content": prompt},
         ],
         "temperature": float(profile['temperature'] if profile.get('temperature') is not None else 0.2),
-        "max_tokens": int(profile.get("max_output_tokens") or 2000),
+        output_parameter: int(profile.get("max_output_tokens") or 2000),
         "response_format": {"type": "json_object"},
     }
     owns_client = client is None
