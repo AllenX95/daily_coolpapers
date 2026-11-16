@@ -5,12 +5,15 @@
 <div class="theme-workspace">
 <section class="theme-create"><h2>本周预览</h2><p>{{ plan.date_from }} 至 {{ plan.date_to }} · 北京时间，最近七个完整自然日</p>
 <p>热度 {{ plan.sample_counts.get('heat',0) }} / 随机 {{ plan.sample_counts.get('random',0) }} / 边缘 {{ plan.sample_counts.get('edge',0) }} 篇</p>
-<p>候选池 {{ plan.counts.total }} 篇；输入不完整 {{ plan.counts.get('incomplete',0) }}；分类待完成 {{ plan.counts.get('classification_pending',0) }}；已探索 {{ plan.counts.get('explored',0) }}；上下文超限 {{ plan.counts.get('context_excluded',0) }}。</p>
+<p>合格 {{ plan.eligible_count }} 篇 · 最终选样 {{ plan.papers|length }} 篇 · 因容量跳过 {{ plan.counts.get('context_excluded',0) }} 篇</p>
+<p class="small">窗内 {{ plan.counts.total }} 篇 · 时间异常 {{ plan.counts.get('time_invalid',0) }} · 输入不完整 {{ plan.counts.get('incomplete',0) }} · 分类待完成 {{ plan.counts.get('classification_pending',0) }} · 已探索 {{ plan.counts.get('explored',0) }}</p>
 {% if not plan.directions %}<p>未设关注方向，使用未设方向探索池。</p>{% endif %}
-<p>预计 {{ plan.logical_calls }} 次逻辑调用；本次最多 {{ 10 if plan.papers else 0 }} 次实际请求（含重试）。入队时重新固化实际样本。</p>
-{% for kind,config in plan.configs.items() %}<p class="small">{{ '提取' if kind.endswith('extract') else '汇总' }}：{{ config.profile.model }} · Prompt v{{ config.prompt.version }} · 输出上限 {{ config.profile.max_output_tokens }} tokens</p>{% endfor %}
+<p>{{ plan.batch_count }} 批提取 · 预计 {{ plan.logical_calls }} 次逻辑调用 · 最多 {{ plan.request_limit if plan.papers and not plan.config_error else 0 }} 次实际请求（含重试）</p>
+{% for kind,config in plan.configs.items() %}{% set capacity = plan.get('capacity',{}).get(kind) %}<p class="small">{{ '提取' if kind.endswith('extract') else '汇总' }}：{{ config.profile.model }} · Prompt v{{ config.prompt.version }}{% if capacity %} · {{ '空输入固定开销估算' if not plan.papers else '估算' }} {{ capacity.required }} / {{ capacity.limit }} tokens{% endif %} · 本次输出预算 {{ config.get('request_output_tokens',config.profile.max_output_tokens) }} tokens{% if 'request_output_tokens' in config %} · Profile 输出上限 {{ config.profile.max_output_tokens }} tokens{% endif %}</p>{% endfor %}
+{% if plan.capacity_note %}<p>已按容量裁减。{{ plan.capacity_note }}</p>{% endif %}
+{% if plan.capacity_error %}<p role="alert">{{ plan.capacity_error }} 没有可执行的样本，无法生成。</p>{% endif %}
 {% if plan.config_error %}<p role="alert">{{ plan.config_error }}</p>{% endif %}
-<form method="post" action="{{ url_for('exploration_generate') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button {% if plan.papers and plan.config_error %}disabled{% endif %}>生成探索周报</button></form>
+<form method="post" action="{{ url_for('exploration_generate') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="fingerprint" value="{{ plan.fingerprint }}"><button {% if not plan.papers or plan.config_error %}disabled{% endif %}>生成探索周报</button></form>
 <h3>独立探索模型</h3><form method="post" action="{{ url_for('exploration_profile') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>探索模型<select name="profile_id" required><option value="">请选择</option>{% for profile in profiles %}<option value="{{ profile.id }}" {% if profile.id==profile_id %}selected{% endif %}>{{ profile.name }} · {{ profile.model }}</option>{% endfor %}</select></label><button class="secondary">保存模型</button></form>
 <p class="small muted">也可在 <a href="{{ url_for('prompts') }}">Prompt 管理</a>分别绑定探索提取与汇总模型；绑定优先于此选择。</p>
 </section>

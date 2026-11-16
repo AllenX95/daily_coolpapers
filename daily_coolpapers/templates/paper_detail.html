@@ -50,7 +50,7 @@
       <thead><tr><th>日期</th><th>类目</th><th>Rank</th><th>Stars</th></tr></thead>
       <tbody>
         {% for item in categories %}
-          <tr><td>{{ item.crawl_date }}</td><td class="mono">{{ item.category }}</td><td>{{ item.rank }}</td><td>{{ item.reading_stars }}</td></tr>
+          <tr><td>{{ item.crawl_date }}</td><td class="mono">{{ item.category }}</td><td>{{ item.rank }}</td><td>{{ item.reading_stars if item.reading_stars is not none else '未知' }}</td></tr>
         {% endfor %}
       </tbody>
     </table>

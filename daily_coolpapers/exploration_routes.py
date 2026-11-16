@@ -27,26 +27,47 @@ def register_exploration_routes(app):
     def exploration_generate():
         run_id,job_id,created=current_app.extensions['daily_coolpapers.job_runner'].enqueue_exploration()
         flash(f"{'已创建' if created else '已存在'}探索任务 #{job_id}，只处理论文摘要。")
+        preview = request.form.get('fingerprint')
+        if preview and preview != store.get(run_id)['plan'].get('fingerprint'):
+            flash('入队计划与此前预览不同，请以下方固化计划为准。')
         return redirect(url_for('exploration_detail',run_id=run_id))
 
-    @app.get('/direction-exploration/<int:run_id>')
-    def exploration_detail(run_id):
-        run=store.get(run_id)
+    def render_detail(run, focus=None):
         papers={p['id']:p for p in run['plan']['papers']}
         for prior in run['plan']['prior']:
             for paper in prior.get('evidence_snapshot',[]):papers.setdefault(paper['id'],paper)
-        for candidate in run['candidates']:
-            evidence=[papers[i] for i in candidate['paper_ids'] if i in papers]
+        retired = run['execution'].get('candidate_history',[])
+        for candidate in [*run['candidates'],*retired]:
+            candidate_papers = {**papers,**{p['id']:p for p in candidate.get('evidence_snapshot',[])}}
+            candidate['papers'] = candidate_papers
+            evidence=[candidate_papers[i] for i in candidate['paper_ids'] if i in candidate_papers]
             overlaps=sorted({a for p in evidence for a in p.get('authors',[]) if sum(a in q.get('authors',[]) for q in evidence)>1})
             candidate['author_overlap']=overlaps
-        return render_template('exploration_detail.html',run=run,job=db.get_job(run['job_id']),papers=papers,
+            versions = run['execution'].get('candidate_versions',{}).get(str(candidate['id']),[])
+            candidate['versions'] = [{**version,'papers':{p['id']:p for p in version.get('evidence_snapshot',[])}}
+                                     for version in versions]
+        extracted,_ = exploration._successful_extraction(run)
+        return render_template('exploration_detail.html',run=run,job=db.get_job(run['job_id']),retired=retired,focus=focus,
+            extracted_count=len(extracted),retry_error=exploration.original_retry_error(run),
+            profiles=db.list_llm_profiles(enabled_only=True),
             backfill_from=(datetime.fromisoformat(run['date_to'])-timedelta(days=29)).date().isoformat(),
             backfill_to=run['date_to'],directions={d['id']:d for d in db.list_attention_directions()})
 
+    @app.get('/direction-exploration/<int:run_id>')
+    def exploration_detail(run_id):
+        return render_detail(store.get(run_id))
+
+    @app.get('/direction-exploration/<int:run_id>/candidates/<int:candidate_id>')
+    def exploration_candidate(run_id,candidate_id):
+        run,candidate = store.candidate(run_id,candidate_id)
+        return render_detail(run,focus=candidate['id'])
+
     @app.post('/direction-exploration/<int:run_id>/retry')
     def exploration_retry(run_id):
+        synthesis_only = parse_bool(request.form.get('synthesis_only'),'synthesis_only')
+        profile = parse_int(request.form.get('profile_id'),'profile',minimum=1,maximum=2**63-1) if synthesis_only else None
         target,job_id,_=current_app.extensions['daily_coolpapers.job_runner'].enqueue_exploration(
-            run_id=run_id,synthesis_only=parse_bool(request.form.get('synthesis_only'),'synthesis_only'),
+            run_id=run_id,synthesis_only=synthesis_only,profile_id=profile,
             acknowledged=parse_bool(request.form.get('acknowledged'),'acknowledged'))
         flash(f'关联恢复任务 #{job_id} 已就绪；成功批次不会重发。')
         return redirect(url_for('exploration_detail',run_id=target))

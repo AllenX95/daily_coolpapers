@@ -63,9 +63,9 @@ class CrawledPaper:
     abs_url: str | None
     papers_cool_url: str | None
     rank: int | None
-    reading_stars: int
-    pdf_clicks: int
-    kimi_clicks: int
+    reading_stars: int | None
+    pdf_clicks: int | None
+    kimi_clicks: int | None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -218,6 +218,7 @@ def fetch_category_report(
         try:
             logger.info("Fetching %s attempt=%s", _safe_url(url), attempt_number)
             response = client.get(url, headers={"User-Agent": user_agent})
+            observed_at = datetime.now(timezone.utc).isoformat()
             elapsed_ms = max(0, int(round((time.perf_counter() - started) * 1000)))
             status_code = int(getattr(response, "status_code", 200) or 200)
             final_url = _safe_url(str(getattr(response, "url", url) or url))
@@ -230,6 +231,7 @@ def fetch_category_report(
                 "response_bytes": len(response_bytes),
                 "content_sha256": hashlib.sha256(response_bytes).hexdigest(),
                 "retry_count": attempt,
+                "heat_captured_at": observed_at,
             }
             response.raise_for_status()
             if not _is_allowed_category_url(final_url, category):
@@ -509,6 +511,8 @@ def _analyze_category_response(
     if effective_date:
         for paper in papers:
             paper["_crawl_date"] = effective_date
+    for paper in papers:
+        paper["heat_captured_at"] = request_metrics.get("heat_captured_at")
 
     expected_count = min(max(0, int(top_n)), declared_total) if declared_total is not None else None
     candidate_count = max(1, int(parsed.metrics["heading_count"]))
@@ -672,7 +676,7 @@ def _parse_heading_block(heading: Tag, source_url: str) -> CrawledPaper | None:
     papers_cool_url = _extract_papers_cool_url(links, source_url) or f"{PAPERS_COOL_BASE}/arxiv/{arxiv_id}"
     pdf_clicks = _extract_label_count(heading_text, "PDF")
     kimi_clicks = _extract_label_count(heading_text, "Kimi")
-    reading_stars = pdf_clicks + kimi_clicks
+    reading_stars = pdf_clicks + kimi_clicks if pdf_clicks is not None and kimi_clicks is not None else None
 
     blocks = _blocks_until_next_heading(heading)
     authors = _extract_metadata_items(blocks, "authors")
@@ -779,9 +783,12 @@ def _extract_arxiv_id(text: str | None) -> str | None:
     return re.sub(r"v\d+$", "", match.group("id"), flags=re.I)
 
 
-def _extract_label_count(text: str, label: str) -> int:
-    match = re.search(rf"{re.escape(label)}\s*(\d+)", text, flags=re.I)
-    return int(match.group(1)) if match else 0
+def _extract_label_count(text: str, label: str) -> int | None:
+    match = re.search(rf"\b{re.escape(label)}\s*([0-9]{{1,19}}(?:,[0-9]{{3}})*)(?![\w.,])", text, flags=re.I)
+    if not match:
+        return None
+    digits = match.group(1).replace(",", "")
+    return int(digits) if len(digits) <= 19 else None
 
 
 def _blocks_until_next_heading(heading: Tag) -> list[_PaperBlock]:

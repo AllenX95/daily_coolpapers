@@ -205,18 +205,16 @@ class JobRunner:
                 self.queue.put(created['job_id'])
         return created
 
-    def enqueue_exploration(self, *, run_id=None, synthesis_only=False, acknowledged=False):
+    def enqueue_exploration(self, *, run_id=None, synthesis_only=False, acknowledged=False, profile_id=None):
         from . import exploration, exploration_db
         with self._state_lock:
             self._require_accepting_locked()
             if run_id is None:
                 plan = exploration.build_plan()
-                if plan['papers'] and plan['config_error']:
-                    from .form_commands import FormValidationError
-                    raise FormValidationError({'profile':plan['config_error']})
-                created = exploration_db.create(plan)
+                created = exploration_db.create(plan,require_sample=True)
             else:
-                created = exploration_db.retry(run_id,synthesis_only=synthesis_only,acknowledged=acknowledged)
+                created = exploration_db.retry(run_id,synthesis_only=synthesis_only,acknowledged=acknowledged,
+                                               profile_id=profile_id)
             _, job_id, is_new = created
             if is_new:
                 self._queued_job_ids.add(job_id)

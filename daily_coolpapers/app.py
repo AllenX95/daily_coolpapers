@@ -160,7 +160,7 @@ def create_app(
     @app.errorhandler(FormValidationError)
     def handle_form_validation(error: FormValidationError):
         if request.endpoint and request.endpoint.startswith('exploration_'):
-            return render_template('exploration_error.html',errors=error.errors),400
+            return render_template('exploration_error.html',errors=error.errors),409 if 'version' in error.errors else 400
         if request.endpoint and request.endpoint.startswith('memo_'):
             return _memo_error_response({'errors':error.errors},400)
         if request.endpoint in DIRECTION_ENDPOINTS:
@@ -1325,8 +1325,10 @@ def register_routes(app: Flask) -> None:
         if request.args.get('exploration_run'):
             from . import exploration_db
             run_id = parse_int(request.args.get('exploration_run'),'run',minimum=1,maximum=2**63-1)
-            candidate_id = parse_int(request.args.get('candidate_id'),'candidate',minimum=1,maximum=3)
+            candidate_id = parse_int(request.args.get('candidate_id'),'candidate',minimum=1,maximum=2**63-1)
             run,candidate = exploration_db.candidate(run_id,candidate_id)
+            if candidate.get('retired_at') or candidate.get('superseded_by'):
+                return redirect(url_for('exploration_candidate',run_id=run_id,candidate_id=candidate_id))
             prefill = {'run_id':run_id,'candidate_id':candidate_id,'version':run['version'],**candidate}
         return render_template('attention_directions.html', directions=db.list_attention_directions(),
                                show_archived=request.args.get('archived') == '1',prefill=prefill)
@@ -1337,7 +1339,7 @@ def register_routes(app: Flask) -> None:
             from . import exploration_db
             direction_id = exploration_db.decide(
                 parse_int(request.form.get('exploration_run'),'run',minimum=1,maximum=2**63-1),
-                parse_int(request.form.get('candidate_id'),'candidate',minimum=1,maximum=3),
+                parse_int(request.form.get('candidate_id'),'candidate',minimum=1,maximum=2**63-1),
                 'added','',parse_int(request.form.get('version'),'version',minimum=0,maximum=2**63-1),
                 name=request.form.get('name'),scope_text=request.form.get('scope_text'))
         else:
